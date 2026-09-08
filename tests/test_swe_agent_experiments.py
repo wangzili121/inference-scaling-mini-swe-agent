@@ -28,7 +28,7 @@ from inference_scaling.swe_agent.runtime_tune import (
     select_arms,
 )
 from inference_scaling.swe_agent.topology import capability_matrix, native_topologies
-from inference_scaling.swe_agent.swebench import select_instances
+from inference_scaling.swe_agent.swebench import apply_image_template, select_instances
 from inference_scaling.swe_agent.profile_analysis import (
     analyze_algorithm_trace,
     analyze_ascend_profile,
@@ -357,6 +357,12 @@ def test_swebench_launcher_selects_canonical_or_explicit_order() -> None:
         "task-2",
     ]
     assert [item["instance_id"] for item in explicit] == ["task-4", "task-1"]
+
+    mapped = apply_image_template(
+        explicit, "greynewell/swe-bench-arm64:{instance_id_dash}"
+    )
+    assert mapped[0]["image_name"] == "greynewell/swe-bench-arm64:task-4"
+    assert "image_name" not in explicit[0]
 
 
 def test_evaluator_uses_pinned_local_dataset_snapshot(tmp_path: Path) -> None:

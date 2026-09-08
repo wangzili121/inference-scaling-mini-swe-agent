@@ -57,6 +57,21 @@ def select_instances(
     return [by_id[value] for value in instance_ids]
 
 
+def apply_image_template(
+    instances: Sequence[dict], template: str | None
+) -> list[dict]:
+    selected = [dict(item) for item in instances]
+    if not template:
+        return selected
+    for item in selected:
+        instance_id = str(item["instance_id"])
+        item["image_name"] = template.format(
+            instance_id=instance_id,
+            instance_id_dash=instance_id.replace("__", "-"),
+        )
+    return selected
+
+
 def _run_batch(
     instances: Sequence[dict],
     *,
@@ -157,6 +172,13 @@ def main() -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--count", type=int, default=1)
     parser.add_argument("--instance-id", action="append", default=[])
+    parser.add_argument(
+        "--image-template",
+        help=(
+            "optional Docker image template with {instance_id} and "
+            "{instance_id_dash} fields"
+        ),
+    )
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--service-timeout", type=float, default=30.0)
     parser.add_argument("--redo-existing", action="store_true")
@@ -183,8 +205,11 @@ def main() -> None:
         revision=VERIFIED_REVISION,
         split="test",
     )
-    instances = select_instances(
-        list(dataset), count=args.count, instance_ids=args.instance_id
+    instances = apply_image_template(
+        select_instances(
+            list(dataset), count=args.count, instance_ids=args.instance_id
+        ),
+        args.image_template,
     )
     selected_ids = [str(item["instance_id"]) for item in instances]
     manifest = {
@@ -196,6 +221,10 @@ def main() -> None:
         "mini_swe_agent_version": installed,
         "conditional_is_endpoint": args.endpoint.rstrip("/"),
         "instance_ids": selected_ids,
+        "images": {
+            str(item["instance_id"]): item.get("image_name")
+            for item in instances
+        },
         "count": len(selected_ids),
         "workers": args.workers,
         "argv": sys.argv,
