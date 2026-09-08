@@ -10,7 +10,7 @@ import statistics
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from inference_scaling.swe_agent.service import BASH_TOOL, _public_messages
+from inference_scaling.swe_agent.messages import BASH_TOOL, public_messages
 
 
 def _load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -55,7 +55,7 @@ def _trajectory_messages(
         raise ValueError(f"{source} has no supported messages array")
     if not all(isinstance(item, dict) and item.get("role") for item in messages):
         raise ValueError(f"{source} contains an invalid message")
-    return _public_messages(messages)
+    return public_messages(messages)
 
 
 def extract_call_snapshots(

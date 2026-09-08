@@ -23,30 +23,13 @@ from inference_scaling.arllm.rewards import (
 )
 from inference_scaling.shared.metrics import importance_effective_sample_size
 from inference_scaling.shared.rng import SeedStream
+from inference_scaling.swe_agent.messages import BASH_TOOL, public_messages
 from inference_scaling.swe_agent.tool_calls import (
     ParsedAssistant,
     ToolCallParseError,
     parse_assistant_text,
 )
 
-
-BASH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "bash",
-        "description": "Execute a bash command",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The bash command to execute",
-                }
-            },
-            "required": ["command"],
-        },
-    },
-}
 
 _ENVIRONMENT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -115,12 +98,7 @@ def load_service_config(
     return config
 
 
-def _public_messages(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    allowed = {"role", "content", "tool_calls", "tool_call_id", "name"}
-    return [
-        {key: value for key, value in message.items() if key in allowed}
-        for message in messages
-    ]
+_public_messages = public_messages
 
 
 def _snapshot(backend: Any) -> dict[str, Any]:
