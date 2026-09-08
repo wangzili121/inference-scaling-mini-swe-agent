@@ -7,6 +7,7 @@ import pytest
 
 from inference_scaling.arllm.backends import TabularAutoregressiveBackend
 from inference_scaling.swe_agent.model import ConditionalISModel
+from inference_scaling.swe_agent.messages import public_messages
 from inference_scaling.swe_agent.service import (
     ConditionalISRunner,
     load_service_config,
@@ -28,6 +29,32 @@ def test_qwen_tool_call_is_converted_to_one_bash_action() -> None:
     assert json.loads(parsed.tool_calls[0]["function"]["arguments"]) == {
         "command": "pwd"
     }
+
+
+def test_public_messages_normalizes_openai_argument_json_for_qwen_template() -> None:
+    original = {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": '{"command":"pwd"}',
+                },
+            }
+        ],
+        "extra": {"private": True},
+    }
+
+    normalized = public_messages([original])
+
+    assert normalized[0]["tool_calls"][0]["function"]["arguments"] == {
+        "command": "pwd"
+    }
+    assert "extra" not in normalized[0]
+    assert original["tool_calls"][0]["function"]["arguments"] == '{"command":"pwd"}'
 
 
 def test_qwen_tool_call_rejects_non_bash_tool() -> None:
