@@ -17,6 +17,8 @@ from inference_scaling.swe_agent.calibration import (
 from inference_scaling.swe_agent.workload import freeze_workload
 from inference_scaling.swe_agent.reward_screen import _screen_temperature
 from inference_scaling.swe_agent.runtime_tune import select_arms
+from inference_scaling.swe_agent.topology import capability_matrix, native_topologies
+from inference_scaling.swe_agent.swebench import build_swebench_command
 from tests.test_swe_agent import _AgentBackend, _runner_config
 
 
@@ -85,6 +87,15 @@ def test_burst_routes_whole_jobs_across_endpoints(monkeypatch) -> None:
         }
 
     monkeypatch.setattr(benchmark, "_post", fake_post)
+    snapshots = iter(
+        (
+            {"generation_forward_token_slots": 10},
+            {"generation_forward_token_slots": 20},
+            {"generation_forward_token_slots": 16},
+            {"generation_forward_token_slots": 27},
+        )
+    )
+    monkeypatch.setattr(benchmark, "_backend_snapshot", lambda endpoint: next(snapshots))
     records = [_trace_record(index) for index in range(4)]
 
     result = benchmark.run_burst(
@@ -98,6 +109,7 @@ def test_burst_routes_whole_jobs_across_endpoints(monkeypatch) -> None:
     assert result["success_rate"] == 1.0
     assert result["jobs_per_second"] > 0
     assert result["conditional_is"]["candidate_count"] == 8
+    assert result["backend_delta"]["generation_forward_token_slots"] == 13
     assert all(call[1]["conditional_is"]["rollout_count"] == 2 for call in calls)
     assert sorted(call[0] for call in calls) == [
         "http://one",
@@ -118,8 +130,8 @@ def test_reward_screen_uses_one_pool_for_both_reward_families(
     )
     backend.tokenizer.eos_token_id = 6
     config = _runner_config(tmp_path / "unused.jsonl")
-    config["generation"]["max_new_tokens"] = 128
-    config["vllm"]["max_model_len"] = 256
+    config["generation"]["max_new_tokens"] = 256
+    config["vllm"]["max_model_len"] = 512
     record = _trace_record(1)
 
     result = _screen_temperature(
@@ -132,7 +144,7 @@ def test_reward_screen_uses_one_pool_for_both_reward_families(
 
     assert result["temperature"] == 0.7
     assert result["blocks"] == 1
-    assert result["rollout_sequences"] == 8
+    assert result["rollout_sequences"] == 16
     assert len(result["reward_blocks"]["sequence_logprob"]) == 1
     assert len(result["reward_blocks"]["consilience"]) == 1
 
@@ -189,3 +201,34 @@ def test_runtime_gate_and_algorithm_pareto_are_deterministic() -> None:
 
     assert [result["arm_id"] for result in selected] == ["fast", "balanced"]
     assert set(_pareto([fast, balanced])) == {"fast", "balanced"}
+
+
+def test_four_card_topology_matrix_is_explicit_about_capability_gates() -> None:
+    topologies = {item.topology_id: item for item in native_topologies(19000)}
+
+    assert len(topologies["2xtp2-whole-job"].services) == 2
+    assert topologies["tp2-dp2-shared-queue"].services[0].data_parallel_size == 2
+    assert topologies["tp4"].services[0].tensor_parallel_size == 4
+    assert topologies["tp2-pp2"].services[0].pipeline_parallel_size == 2
+    matrix = capability_matrix()
+    assert all(
+        item["verification_status"] for item in matrix["configurable"]
+    )
+    gated = matrix["gated"]
+    assert "pd-2-plus-2" in gated
+    assert "candidate-rollout-stage-pipeline" in gated
+
+
+def test_swebench_launcher_fixes_verified_test_split(tmp_path: Path) -> None:
+    command = build_swebench_command(
+        overlay_config=tmp_path / "conditional.yaml",
+        output=tmp_path / "output",
+        endpoint="http://service:8123/",
+        count=3,
+        workers=2,
+    )
+
+    assert command[command.index("--subset") + 1] == "verified"
+    assert command[command.index("--split") + 1] == "test"
+    assert command[command.index("--slice") + 1] == "0:3"
+    assert "model.endpoint=http://service:8123" in command

@@ -20,11 +20,9 @@ Run one SWE-bench Verified task using mini-SWE-agent's standard Docker runner
 and the Conditional IS model overlay:
 
 ```bash
-mini-extra swebench-single \
-  -c swebench \
-  -c configs/mini_swe_agent/conditional_is.yaml \
-  --subset verified \
-  --instance django__django-11099
+conditional-is-swebench \
+  --instance-id django__django-11099 \
+  --output artifacts/swebench/smoke-1
 ```
 
 Before any quality or performance sweep, verify:
@@ -35,6 +33,13 @@ Before any quality or performance sweep, verify:
 - EOS, output-limit, timeout, malformed tool-call, and service errors are saved;
 - `artifacts/traces/model_calls.jsonl` contains prompt lengths and CIS diagnostics.
 
-The exact mini-SWE-agent CLI flags can change across releases. This repository
-pins v2.4.6; use `mini-extra swebench-single --help` on the execution host to
-confirm the local invocation before launching a batch.
+Then run the first three deterministic Verified tasks with the same service:
+
+```bash
+conditional-is-swebench --count 3 --output artifacts/swebench/smoke-3
+```
+
+The launcher rejects any mini-SWE-agent version other than v2.4.6, fixes the
+Verified `test` split, checks the Conditional IS service and Docker daemon, and
+records its resolved command in the output directory. Use `--dry-run` to inspect
+that manifest without contacting the service or dataset.

@@ -58,6 +58,8 @@ conditional-is-benchmark = "inference_scaling.swe_agent.benchmark:main"
 conditional-is-reward-screen = "inference_scaling.swe_agent.reward_screen:main"
 conditional-is-algorithm-grid = "inference_scaling.swe_agent.algorithm_grid:main"
 conditional-is-runtime-tune = "inference_scaling.swe_agent.runtime_tune:main"
+conditional-is-topology = "inference_scaling.swe_agent.topology:main"
+conditional-is-swebench = "inference_scaling.swe_agent.swebench:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

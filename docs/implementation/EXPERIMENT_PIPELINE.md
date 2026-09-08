@@ -28,9 +28,12 @@ PyTorch `record_function`, so they are visible in an Ascend/PyTorch profile.
 
 ## Reward screen
 
-The reward screen creates one rollout pool for each proposal temperature and
-computes sequence-logprob and Consilience values from compact generation-time
-statistics. It does not run a second generation for the second reward.
+The reward screen creates one `C8/R2/B128` first-step rollout pool for each
+proposal temperature and computes sequence-logprob and Consilience values from
+the same compact generation-time statistics. It deliberately stops after this
+reward-neutral first decision, so a sequence-logprob selection cannot bias later
+blocks before Consilience is evaluated. It does not run a second generation for
+the second reward.
 
 ```bash
 conditional-is-reward-screen \

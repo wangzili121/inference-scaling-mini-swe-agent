@@ -51,6 +51,14 @@ def engine_grid(
 
 
 def _preemptions(result: dict[str, Any]) -> int:
+    aggregate = result.get("backend_delta") or {}
+    aggregate_total = sum(
+        int(value)
+        for key, value in aggregate.items()
+        if "preempt" in str(key).lower() and isinstance(value, (int, float))
+    )
+    if aggregate_total:
+        return aggregate_total
     total = 0
     for measurement in result.get("measurements", ()):
         counters = (measurement.get("diagnostics") or {}).get("backend_delta") or {}

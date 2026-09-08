@@ -32,6 +32,8 @@ trust_remote_code = true
 [vllm]
 asynchronous = true
 tensor_parallel_size = 2
+pipeline_parallel_size = 1
+data_parallel_size = 1
 gpu_memory_utilization = 0.90
 max_model_len = 32768
 max_num_seqs = 128
@@ -47,3 +49,4 @@ seed = 20260908
 
 [service]
 trace_path = "artifacts/traces/model_calls.jsonl"
+idempotency_cache_size = 256

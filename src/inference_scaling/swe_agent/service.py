@@ -8,10 +8,11 @@ import re
 import threading
 import time
 import tomllib
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from dataclasses import asdict, dataclass, is_dataclass, replace
+from hashlib import sha256
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from inference_scaling.arllm.algorithms import run_conditional_is
 from inference_scaling.arllm.backends import close_backend, load_backend_from_config
@@ -158,6 +159,80 @@ class CISExecution:
     conditional: dict[str, int]
 
 
+@dataclass(slots=True)
+class _PendingQuery:
+    fingerprint: str
+    ready: threading.Event
+    result: QueryResult | None = None
+    error: BaseException | None = None
+
+
+class IdempotentQueryCache:
+    """Coalesce retry-equivalent jobs and retain a bounded completed-result cache."""
+
+    def __init__(self, maximum_entries: int = 256) -> None:
+        if maximum_entries < 0:
+            raise ValueError("idempotency cache size must be non-negative")
+        self.maximum_entries = maximum_entries
+        self._lock = threading.Lock()
+        self._pending: dict[str, _PendingQuery] = {}
+        self._completed: OrderedDict[str, tuple[str, QueryResult]] = OrderedDict()
+
+    def execute(
+        self,
+        request_id: str,
+        fingerprint: str,
+        callback: Callable[[], QueryResult],
+    ) -> QueryResult:
+        with self._lock:
+            cached = self._completed.get(request_id)
+            if cached is not None:
+                if cached[0] != fingerprint:
+                    raise ValueError(
+                        "request_id was already used with a different payload"
+                    )
+                self._completed.move_to_end(request_id)
+                return cached[1]
+            pending = self._pending.get(request_id)
+            if pending is not None:
+                if pending.fingerprint != fingerprint:
+                    raise ValueError(
+                        "request_id is in flight with a different payload"
+                    )
+                owner = False
+            else:
+                pending = _PendingQuery(fingerprint, threading.Event())
+                self._pending[request_id] = pending
+                owner = True
+
+        if not owner:
+            pending.ready.wait()
+            if pending.error is not None:
+                raise pending.error
+            if pending.result is None:
+                raise RuntimeError("coalesced Conditional IS request produced no result")
+            return pending.result
+
+        try:
+            result = callback()
+        except BaseException as error:
+            pending.error = error
+            raise
+        else:
+            pending.result = result
+            with self._lock:
+                if self.maximum_entries:
+                    self._completed[request_id] = (fingerprint, result)
+                    self._completed.move_to_end(request_id)
+                    while len(self._completed) > self.maximum_entries:
+                        self._completed.popitem(last=False)
+            return result
+        finally:
+            with self._lock:
+                self._pending.pop(request_id, None)
+                pending.ready.set()
+
+
 class JsonlTraceWriter:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -220,6 +295,9 @@ class ConditionalISRunner:
         )
         trace_path = service.get("trace_path")
         self.trace_writer = JsonlTraceWriter(trace_path) if trace_path else None
+        self.query_cache = IdempotentQueryCache(
+            int(service.get("idempotency_cache_size", 256))
+        )
 
     @classmethod
     def from_toml(
@@ -240,6 +318,37 @@ class ConditionalISRunner:
         return tuple(self.backend.encode(str(rendered), add_special_tokens=False))
 
     def query(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        request_id: str,
+        seed: int,
+        conditional_overrides: Mapping[str, int] | None = None,
+    ) -> QueryResult:
+        fingerprint = sha256(
+            json.dumps(
+                {
+                    "messages": list(messages),
+                    "seed": seed,
+                    "conditional_is": dict(conditional_overrides or {}),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return self.query_cache.execute(
+            request_id,
+            fingerprint,
+            lambda: self._query_uncached(
+                messages,
+                request_id=request_id,
+                seed=seed,
+                conditional_overrides=conditional_overrides,
+            ),
+        )
+
+    def _query_uncached(
         self,
         messages: Sequence[Mapping[str, Any]],
         *,
@@ -278,6 +387,7 @@ class ConditionalISRunner:
             "instance_id": self.instance_id,
             "stage_seconds": dict(stage_seconds),
             "backend_delta": execution.backend_delta,
+            "backend_delta_scope": "process_window_not_concurrency_safe",
             "finish_reason": (
                 "eos" if self.sampling.eos_token_id in result.token_ids else "length"
             ),
@@ -307,6 +417,9 @@ class ConditionalISRunner:
                 }
             )
         return QueryResult(message=message, diagnostics=diagnostics)
+
+    def backend_snapshot(self) -> dict[str, Any]:
+        return _snapshot(self.backend)
 
     def execute(
         self,

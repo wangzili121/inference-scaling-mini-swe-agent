@@ -51,6 +51,32 @@ def _post(endpoint: str, payload: dict[str, Any], timeout: float) -> dict[str, A
     return value
 
 
+def _backend_snapshot(endpoint: str, timeout: float = 10.0) -> dict[str, Any] | None:
+    try:
+        with urllib.request.urlopen(
+            endpoint.rstrip("/") + "/v1/diagnostics", timeout=timeout
+        ) as response:
+            value = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    backend = value.get("backend") if isinstance(value, dict) else None
+    return dict(backend) if isinstance(backend, dict) else None
+
+
+def _snapshot_delta(
+    before: dict[str, Any] | None, after: dict[str, Any] | None
+) -> dict[str, float]:
+    if before is None or after is None:
+        return {}
+    return {
+        key: float(value) - float(before[key])
+        for key, value in after.items()
+        if key in before
+        and isinstance(value, (int, float))
+        and isinstance(before[key], (int, float))
+    }
+
+
 def run_burst(
     records: Sequence[dict[str, Any]],
     endpoints: Sequence[str],
@@ -65,6 +91,9 @@ def run_burst(
     if workers <= 0:
         raise ValueError("workers must be positive")
     release = threading.Event()
+    before_snapshots = {
+        endpoint: _backend_snapshot(endpoint) for endpoint in endpoints
+    }
 
     def execute(index: int, record: dict[str, Any]) -> RequestMeasurement:
         endpoint = endpoints[index % len(endpoints)]
@@ -110,6 +139,18 @@ def run_burst(
         release.set()
         measurements = [future.result() for future in futures]
     wall_seconds = time.perf_counter() - wall_started
+    after_snapshots = {endpoint: _backend_snapshot(endpoint) for endpoint in endpoints}
+    endpoint_backend_delta = {
+        endpoint: _snapshot_delta(before_snapshots[endpoint], after_snapshots[endpoint])
+        for endpoint in endpoints
+    }
+    backend_keys = {
+        key for delta in endpoint_backend_delta.values() for key in delta
+    }
+    backend_delta = {
+        key: sum(delta.get(key, 0.0) for delta in endpoint_backend_delta.values())
+        for key in backend_keys
+    }
     latencies = [item.seconds for item in measurements]
     successes = sum(item.success for item in measurements)
     return {
@@ -118,6 +159,8 @@ def run_burst(
         "workers": workers,
         "endpoints": list(endpoints),
         "conditional_is": dict(conditional_overrides or {}),
+        "backend_delta": backend_delta,
+        "endpoint_backend_delta": endpoint_backend_delta,
         "wall_seconds": wall_seconds,
         "jobs_per_second": successes / wall_seconds if wall_seconds else 0.0,
         "successes": successes,

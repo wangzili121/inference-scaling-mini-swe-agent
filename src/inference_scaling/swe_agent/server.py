@@ -26,6 +26,14 @@ def _handler(runner: ConditionalISRunner) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:
             if self.path == "/healthz":
                 self._json(HTTPStatus.OK, {"status": "ok"})
+            elif self.path == "/v1/diagnostics":
+                self._json(
+                    HTTPStatus.OK,
+                    {
+                        "instance_id": runner.instance_id,
+                        "backend": runner.backend_snapshot(),
+                    },
+                )
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 

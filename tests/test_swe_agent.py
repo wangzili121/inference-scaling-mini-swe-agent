@@ -105,6 +105,21 @@ def test_runner_executes_one_complete_cis_job_and_records_trace(tmp_path: Path) 
     assert record["messages"][0]["extra"] == {"private": True}
 
 
+def test_runner_coalesces_retry_equivalent_request_ids(tmp_path: Path) -> None:
+    trace = tmp_path / "calls.jsonl"
+    backend = _AgentBackend()
+    runner = ConditionalISRunner(backend, _runner_config(trace))
+    messages = [{"role": "user", "content": "fix it"}]
+
+    first = runner.query(messages, request_id="retry-1", seed=17)
+    second = runner.query(messages, request_id="retry-1", seed=17)
+
+    assert first == second
+    assert len(trace.read_text().splitlines()) == 1
+    with pytest.raises(ValueError, match="different payload"):
+        runner.query(messages, request_id="retry-1", seed=18)
+
+
 def test_model_client_uses_stable_request_identity() -> None:
     class StubModel(ConditionalISModel):
         def __init__(self):
@@ -130,6 +145,7 @@ def test_model_client_uses_stable_request_identity() -> None:
     model.query(messages)
     model.query(messages)
 
+    assert model.config.model_name.startswith("conditional-is/")
     assert model.payloads[0]["request_id"] == model.payloads[1]["request_id"]
     assert model.payloads[0]["seed"] == model.payloads[1]["seed"]
 

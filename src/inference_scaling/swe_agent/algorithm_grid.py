@@ -12,13 +12,10 @@ from inference_scaling.swe_agent.benchmark import _load_records, run_burst
 
 
 def _forward_tokens(result: dict[str, Any]) -> int:
-    total = 0
-    for measurement in result["measurements"]:
-        diagnostics = measurement.get("diagnostics") or {}
-        counters = diagnostics.get("backend_delta") or {}
-        total += int(counters.get("generation_forward_token_slots", 0))
-        total += int(counters.get("score_forward_token_slots", 0))
-    return total
+    counters = result.get("backend_delta") or {}
+    return int(counters.get("generation_forward_token_slots", 0)) + int(
+        counters.get("score_forward_token_slots", 0)
+    )
 
 
 def _median_ess_ratio(result: dict[str, Any], candidate_count: int) -> float:

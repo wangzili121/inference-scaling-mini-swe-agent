@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import statistics
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -15,6 +16,7 @@ from inference_scaling.arllm.rewards import (
     ConsilienceReward,
     SequenceLogProbabilityReward,
 )
+from inference_scaling.arllm.algorithms import conditional_is_step
 from inference_scaling.arllm.types import GeneratedSequenceStatistics
 from inference_scaling.shared.rng import SeedStream
 from inference_scaling.swe_agent.calibration import (
@@ -114,23 +116,48 @@ def _screen_temperature(
     valid_actions = 0
     jobs: list[dict[str, Any]] = []
     for index, record in enumerate(records):
-        execution = runner.execute(
-            record["messages"],
-            seed=SeedStream(root_seed).derive("reward-screen", temperature, index),
+        started = runner.backend_snapshot()
+        wall_started = time.perf_counter()
+        prompt = runner._prompt_tokens(record["messages"])
+        if len(prompt) + runner.maximum > int(
+            config.get("vllm", {}).get("max_model_len", 1 << 62)
+        ):
+            raise ValueError("reward-screen request exceeds max_model_len")
+        step = conditional_is_step(
+            base_backend=backend,
+            rollout_backend=backend,
+            prompt=prompt,
+            generated_prefix=(),
+            config=runner.conditional,
+            base_sampling=runner.sampling,
+            rollout_sampling=runner.sampling,
+            reward=runner.reward,
+            seeds=SeedStream(
+                SeedStream(root_seed).derive("reward-screen", temperature, index)
+            ),
+            step_index=0,
             request_namespace=(
                 f"reward-screen:{temperature}:{record.get('request_id', index)}"
             ),
         )
+        seconds = time.perf_counter() - wall_started
+        ended = runner.backend_snapshot()
+        backend_delta = {
+            key: value - started[key]
+            for key, value in ended.items()
+            if key in started
+            and isinstance(value, (int, float))
+            and isinstance(started[key], (int, float))
+        }
         jobs.append(
             {
                 "request_id": record.get("request_id", str(index)),
-                "prompt_tokens": len(execution.prompt),
-                "completion_tokens": len(execution.result.token_ids),
-                "seconds": execution.total_seconds,
-                "backend_delta": execution.backend_delta,
+                "prompt_tokens": len(prompt),
+                "seconds": seconds,
+                "backend_delta": backend_delta,
             }
         )
-        for step in execution.result.steps:
+        for step in (step,):
             candidate_statistics: list[list[GeneratedSequenceStatistics]] = []
             for candidate in step.candidates:
                 values = [
@@ -144,8 +171,8 @@ def _screen_temperature(
                     [value for value in values if value is not None]
                 )
             flat = [value for candidate in candidate_statistics for value in candidate]
-            logprob_flat = logprob.batch_statistics(execution.prompt, flat)
-            consilience_flat = consilience.batch_statistics(execution.prompt, flat)
+            logprob_flat = logprob.batch_statistics(prompt, flat)
+            consilience_flat = consilience.batch_statistics(prompt, flat)
             offset = 0
             logprob_block: list[list[float]] = []
             consilience_block: list[list[float]] = []
