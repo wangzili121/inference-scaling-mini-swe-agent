@@ -425,6 +425,9 @@ def test_deployer_rejects_busy_cards_and_mounts_native_categorical(
     )
 
     assert command.count("--device") == 5
+    assert "/dev/davinci0:/dev/davinci0" in command
+    assert "/dev/davinci1:/dev/davinci1" in command
+    assert "ASCEND_RT_VISIBLE_DEVICES=0,1" in command
     assert "--rm" not in command
     assert "VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE=1" in command
     assert any(value.startswith("ASCEND_CUSTOM_OPP_PATH=") for value in command)
@@ -434,6 +437,21 @@ def test_deployer_rejects_busy_cards_and_mounts_native_categorical(
     assert any("runtime/sampler.py" in value for value in command)
     assert f"{artifacts}:/artifacts" in command
     assert all(asset["sha256"] for asset in assets)
+
+    remapped, _ = build_docker_command(
+        image="vllm:0.18",
+        name="cis-remapped",
+        repository=repository,
+        model=model,
+        config=config,
+        categorical_root=categorical,
+        cache_root=cache,
+        devices=(4, 7),
+        port=8124,
+    )
+    assert "/dev/davinci4:/dev/davinci0" in remapped
+    assert "/dev/davinci7:/dev/davinci1" in remapped
+    assert "ASCEND_RT_VISIBLE_DEVICES=0,1" in remapped
 
 
 def test_profile_analysis_combines_algorithm_runtime_and_npu_evidence(

@@ -110,8 +110,13 @@ def build_docker_command(
         "--name",
         name,
     ]
-    for device in devices:
-        command.extend(("--device", f"/dev/davinci{device}"))
+    for logical_device, physical_device in enumerate(devices):
+        command.extend(
+            (
+                "--device",
+                f"/dev/davinci{physical_device}:/dev/davinci{logical_device}",
+            )
+        )
     for path in (
         "/dev/davinci_manager",
         "/dev/devmm_svm",
@@ -142,7 +147,7 @@ def build_docker_command(
     command.extend(
         (
             "--env",
-            "ASCEND_RT_VISIBLE_DEVICES=" + ",".join(map(str, devices)),
+            "ASCEND_RT_VISIBLE_DEVICES=" + ",".join(map(str, range(len(devices)))),
             "--env",
             "CIS_MODEL_PATH=/models/conditional-is",
             "--env",
