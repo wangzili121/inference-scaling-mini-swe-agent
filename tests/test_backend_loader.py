@@ -135,6 +135,7 @@ def test_async_vllm_loader_merges_role_settings_and_exact_scorer(monkeypatch) ->
     assert vllm_calls[0][1]["pipeline_parallel_size"] == 2
     assert vllm_calls[0][1]["dtype"] == "bfloat16"
     assert vllm_calls[0][1]["seed"] == 17
+    assert "enable_mh_fused_logprobs" not in vllm_calls[0][1]
     assert vllm_calls[0][1]["engine_kwargs"] == {
         "enable_chunked_prefill": True,
         "cpu_offload_gb": 1,
@@ -154,6 +155,7 @@ def test_vllm_sync_override_and_unknown_setting(monkeypatch) -> None:
     )
     assert loader.load_backend_from_config("base-model", config) == "sync-vllm"
     assert calls[0][1]["enable_prefix_caching"] is True
+    assert calls[0][1]["enable_mh_fused_logprobs"] is False
     assert calls[0][1]["engine_kwargs"]["max_logprobs"] == 32
 
     config["vllm"] = {"gpu_memroy_utilization": 0.5}

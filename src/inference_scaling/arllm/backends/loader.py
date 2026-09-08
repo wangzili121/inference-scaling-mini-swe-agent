@@ -275,6 +275,8 @@ def load_backend_from_config(
             "speculation": speculation,
             "dynamic_speculation": dynamic_vllm_speculation,
         }
+    if not asynchronous:
+        acceleration_kwargs["enable_mh_fused_logprobs"] = mh_fused_logprobs
     try:
         return loader.from_pretrained(
             model_name_or_path,
@@ -300,7 +302,6 @@ def load_backend_from_config(
             enable_prefix_caching=bool(settings.pop("enable_prefix_caching", True)),
             async_scheduling=settings.pop("async_scheduling", None),
             max_lora_rank=int(settings.pop("max_lora_rank", 16)),
-            enable_mh_fused_logprobs=mh_fused_logprobs,
             engine_kwargs=engine_kwargs,
             **acceleration_kwargs,
         )
