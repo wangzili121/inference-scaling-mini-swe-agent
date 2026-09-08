@@ -36,6 +36,7 @@ trust_remote_code = true
 [vllm]
 asynchronous = true
 async_scheduling = false
+enforce_eager = false
 tensor_parallel_size = 2
 pipeline_parallel_size = 1
 data_parallel_size = 1

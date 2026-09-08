@@ -107,6 +107,14 @@ def test_tuning_arm_trace_is_derived_from_its_service_log(tmp_path: Path) -> Non
     assert arm_trace_path(log) == log.with_suffix(".trace.jsonl")
 
 
+def test_runtime_config_declares_every_feature_ablation_key() -> None:
+    config = Path(__file__).parents[1] / "configs" / "swebench" / "conditional_is_smoke.toml"
+    text = config.read_text(encoding="utf-8")
+    assert "async_scheduling = false" in text
+    assert "enforce_eager = false" in text
+    assert "enable_cpu_binding = true" in text
+
+
 def test_burst_routes_whole_jobs_across_endpoints(monkeypatch) -> None:
     calls = []
 
