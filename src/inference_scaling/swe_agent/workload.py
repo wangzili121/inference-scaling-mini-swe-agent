@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import random
 import statistics
 from pathlib import Path
@@ -97,6 +98,9 @@ def extract_call_snapshots(
 
 
 def _token_counter(model: str) -> Callable[[Sequence[dict[str, Any]]], int]:
+    # Tokenization is an offline CPU task. Ascend images otherwise auto-load
+    # torch_npu while importing transformers and require mounted driver libs.
+    os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
     try:
         from transformers import AutoTokenizer
     except ImportError as error:
