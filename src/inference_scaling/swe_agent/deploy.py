@@ -143,8 +143,6 @@ def build_docker_command(
             "--env",
             "CIS_MODEL_PATH=/models/conditional-is",
             "--env",
-            "PYTHONPATH=/workspace/src:/workspace",
-            "--env",
             "VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE=1",
             "--env",
             f"ASCEND_CUSTOM_OPP_PATH={custom_opp}",
@@ -153,10 +151,15 @@ def build_docker_command(
             "--workdir",
             "/workspace",
             "--entrypoint",
-            "python",
+            "bash",
             image,
-            "-m",
-            "inference_scaling.swe_agent.server",
+            "-lc",
+            (
+                "export PYTHONPATH=/workspace/src:/workspace"
+                "${PYTHONPATH:+:${PYTHONPATH}}; "
+                'exec python -m inference_scaling.swe_agent.server "$@"'
+            ),
+            "conditional-is-server",
             "--config",
             "/workspace/" + str(config.relative_to(repository)),
             "--host",

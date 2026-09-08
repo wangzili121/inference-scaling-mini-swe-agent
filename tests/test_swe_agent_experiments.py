@@ -422,6 +422,7 @@ def test_deployer_rejects_busy_cards_and_mounts_native_categorical(
     assert any(value.startswith("ASCEND_CUSTOM_OPP_PATH=") for value in command)
     assert any(value.startswith("LD_PRELOAD=") for value in command)
     assert not any(value.startswith("LD_LIBRARY_PATH=") for value in command)
+    assert any("${PYTHONPATH:+:${PYTHONPATH}}" in value for value in command)
     assert any("runtime/sampler.py" in value for value in command)
     assert all(asset["sha256"] for asset in assets)
 
