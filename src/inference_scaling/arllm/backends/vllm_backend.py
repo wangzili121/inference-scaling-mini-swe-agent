@@ -149,6 +149,7 @@ class VLLMBackendSnapshot:
     native_draft_tokens: int = 0
     native_accepted_draft_tokens: int = 0
     rejected_verification_token_slots: int = 0
+    num_preemptions: int = 0
 
 
 class _AsyncLoopRunner:
@@ -716,11 +717,12 @@ class VLLMBackend:
     @staticmethod
     def _sum_metric_values(
         metrics: Any, *, model_name: str | None = None
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int, int, int]:
         totals = {
             "vllm:spec_decode_num_drafts": 0.0,
             "vllm:spec_decode_num_draft_tokens": 0.0,
             "vllm:spec_decode_num_accepted_tokens": 0.0,
+            "vllm:num_preemptions": 0.0,
         }
         for metric in metrics or ():
             labels = getattr(metric, "labels", {}) or {}
@@ -731,6 +733,8 @@ class VLLMBackend:
             ):
                 continue
             name = str(getattr(metric, "name", ""))
+            if name == "vllm:num_preemptions_total":
+                name = "vllm:num_preemptions"
             if name not in totals:
                 continue
             value = getattr(metric, "value", 0.0)
@@ -742,16 +746,17 @@ class VLLMBackend:
             int(totals["vllm:spec_decode_num_drafts"]),
             int(totals["vllm:spec_decode_num_draft_tokens"]),
             int(totals["vllm:spec_decode_num_accepted_tokens"]),
+            int(totals["vllm:num_preemptions"]),
         )
 
-    def _native_speculation_totals(self) -> tuple[int, int, int]:
+    def _engine_metric_totals(self) -> tuple[int, int, int, int]:
         callback = getattr(self._engine, "get_metrics", None)
         if callback is None or self._closed:
-            return 0, 0, 0
+            return 0, 0, 0, 0
         try:
             metrics = callback()
         except (AssertionError, RuntimeError):
-            return 0, 0, 0
+            return 0, 0, 0, 0
         if inspect.isawaitable(metrics):
             raise RuntimeError("an asynchronous metrics API requires AsyncVLLMBackend")
         return self._sum_metric_values(metrics, model_name=self._metric_model_name)
@@ -1152,7 +1157,7 @@ class VLLMBackend:
         return list(outputs)
 
     def snapshot(self) -> VLLMBackendSnapshot:
-        drafts, draft_tokens, accepted = self._native_speculation_totals()
+        drafts, draft_tokens, accepted, preemptions = self._engine_metric_totals()
         rejected = max(0, draft_tokens - accepted)
         with self._statistics_lock:
             return VLLMBackendSnapshot(
@@ -1190,6 +1195,7 @@ class VLLMBackend:
                 native_draft_tokens=draft_tokens,
                 native_accepted_draft_tokens=accepted,
                 rejected_verification_token_slots=rejected,
+                num_preemptions=preemptions,
             )
 
     def encode(self, text: str, *, add_special_tokens: bool = True) -> TokenSequence:
@@ -1518,11 +1524,11 @@ class AsyncVLLMBackend(VLLMBackend):
 
         self._runner.run(stop())
 
-    def _native_speculation_totals(self) -> tuple[int, int, int]:
+    def _engine_metric_totals(self) -> tuple[int, int, int, int]:
         if self._closed:
-            return 0, 0, 0
+            return 0, 0, 0, 0
 
-        async def read() -> tuple[int, int, int]:
+        async def read() -> tuple[int, int, int, int]:
             callback = getattr(self._engine, "get_metrics", None)
             try:
                 if callback is None:
@@ -1536,7 +1542,7 @@ class AsyncVLLMBackend(VLLMBackend):
                     if inspect.isawaitable(metrics):
                         metrics = await metrics
             except (AssertionError, ImportError, RuntimeError):
-                return 0, 0, 0
+                return 0, 0, 0, 0
             return self._sum_metric_values(metrics, model_name=self._metric_model_name)
 
         return self._runner.run(read())

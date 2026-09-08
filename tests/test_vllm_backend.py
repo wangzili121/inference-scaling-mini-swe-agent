@@ -199,6 +199,7 @@ class _MetricEngine(_Engine):
                 100,
                 {"model_name": "another-model"},
             ),
+            _Metric("vllm:num_preemptions", 4, {"model_name": "fake"}),
         ]
 
 
@@ -478,6 +479,7 @@ def test_vllm_snapshot_accounts_rejected_native_draft_slots() -> None:
     assert snapshot.native_draft_tokens == 7
     assert snapshot.native_accepted_draft_tokens == 2
     assert snapshot.rejected_verification_token_slots == 5
+    assert snapshot.num_preemptions == 4
     assert snapshot.generation_forward_token_slots == 5
     assert snapshot.estimated_dense_forward_flops == 1000
 

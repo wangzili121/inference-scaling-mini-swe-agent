@@ -26,6 +26,10 @@ from inference_scaling.swe_agent.profile_analysis import (
     recommendations,
 )
 from inference_scaling.swe_agent.evaluate import build_evaluation_command
+from inference_scaling.swe_agent.deploy import (
+    build_docker_command,
+    parse_npu_processes,
+)
 from tests.test_swe_agent import _AgentBackend, _runner_config
 
 
@@ -263,6 +267,52 @@ def test_evaluator_uses_pinned_local_dataset_snapshot(tmp_path: Path) -> None:
 
     assert command[command.index("--dataset_name") + 1] == str(snapshot)
     assert command[-2:] == ["task-1", "task-2"]
+
+
+def test_deployer_rejects_busy_cards_and_mounts_native_categorical(
+    tmp_path: Path,
+) -> None:
+    npu_output = """
+| NPU     Chip              | Process id    | Process name             | Process memory(MB) |
+| 0       0                 | 1234          | python                    | 100                |
+| 2       0                 | 5678          | VLLMWorker_TP             | 40000              |
+"""
+    assert parse_npu_processes(npu_output) == {0: [1234], 2: [5678]}
+
+    repository = tmp_path / "repo"
+    config = repository / "configs" / "service.toml"
+    model = tmp_path / "model"
+    categorical = tmp_path / "categorical"
+    cache = tmp_path / "cache"
+    config.parent.mkdir(parents=True)
+    config.write_text("config")
+    model.mkdir()
+    for relative in (
+        "runtime/sampler.py",
+        "vllm_ascend/vllm_ascend_C.cpython-311-aarch64-linux-gnu.so",
+        "vllm_ascend/libvllm_ascend_kernels.so",
+        "vllm_ascend/_cann_ops_custom/metadata.json",
+    ):
+        path = categorical / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(relative)
+
+    command, assets = build_docker_command(
+        image="vllm:0.18",
+        name="cis",
+        repository=repository,
+        model=model,
+        config=config,
+        categorical_root=categorical,
+        cache_root=cache,
+        devices=(0, 1),
+        port=8123,
+    )
+
+    assert command.count("--device") == 5
+    assert "VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE=1" in command
+    assert any("runtime/sampler.py" in value for value in command)
+    assert all(asset["sha256"] for asset in assets)
 
 
 def test_profile_analysis_combines_algorithm_runtime_and_npu_evidence(

@@ -64,6 +64,7 @@ conditional-is-swebench = "inference_scaling.swe_agent.swebench:main"
 conditional-is-profile = "inference_scaling.swe_agent.profile:main"
 conditional-is-analyze-profile = "inference_scaling.swe_agent.profile_analysis:main"
 conditional-is-evaluate = "inference_scaling.swe_agent.evaluate:main"
+conditional-is-deploy = "inference_scaling.swe_agent.deploy:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
