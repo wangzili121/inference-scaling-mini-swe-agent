@@ -280,6 +280,12 @@ def _stop(process: subprocess.Popen) -> None:
         process.wait(timeout=30)
 
 
+def arm_trace_path(log_path: Path) -> Path:
+    """Keep each arm's algorithm events beside its immutable service log."""
+
+    return log_path.with_suffix(".trace.jsonl")
+
+
 def _run_arm(
     *,
     config: EngineConfig,
@@ -298,6 +304,7 @@ def _run_arm(
     routing: str = "round_robin",
     conditional_overrides: dict[str, int] | None = None,
 ) -> dict[str, Any]:
+    trace_path = arm_trace_path(log_path)
     command = [
         sys.executable,
         "-m",
@@ -306,6 +313,8 @@ def _run_arm(
         str(service_config),
         "--port",
         str(port),
+        "--set",
+        f"service.trace_path={json.dumps(str(trace_path))}",
     ]
     for override in (*config.overrides(), *feature.overrides):
         command.extend(("--set", override))
@@ -365,6 +374,7 @@ def _run_arm(
             "feature": asdict(feature),
             "workers": workers,
             "service_log": str(log_path),
+            "algorithm_trace": str(trace_path),
             "started_at": started,
         }
     )

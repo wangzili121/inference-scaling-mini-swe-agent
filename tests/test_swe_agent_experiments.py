@@ -23,6 +23,7 @@ from inference_scaling.swe_agent.workload import (
 from inference_scaling.swe_agent.reward_screen import _screen_temperature
 from inference_scaling.swe_agent.runtime_tune import (
     adaptive_search_plan,
+    arm_trace_path,
     engine_grid,
     select_max_model_len,
     select_arms,
@@ -99,6 +100,11 @@ def test_freeze_workload_is_deterministic_disjoint_and_filters_failures(
     }
     assert len(tune) == len(holdout) == 4
     assert tune.isdisjoint(holdout)
+
+
+def test_tuning_arm_trace_is_derived_from_its_service_log(tmp_path: Path) -> None:
+    log = tmp_path / "logs" / "coarse-1" / "tp2-mns128.log"
+    assert arm_trace_path(log) == log.with_suffix(".trace.jsonl")
 
 
 def test_burst_routes_whole_jobs_across_endpoints(monkeypatch) -> None:
