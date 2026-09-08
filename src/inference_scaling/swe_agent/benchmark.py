@@ -253,6 +253,11 @@ def main() -> None:
     parser.add_argument("--workload", required=True)
     parser.add_argument("--endpoint", action="append", required=True)
     parser.add_argument("--workers", type=int, required=True)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="run only the first N workload records after loading the fixed manifest",
+    )
     parser.add_argument("--timeout", type=float, default=7200.0)
     parser.add_argument("--seed", type=int, default=20260908)
     parser.add_argument("--candidate-count", type=int)
@@ -274,8 +279,13 @@ def main() -> None:
         }.items()
         if value is not None
     }
+    records = _load_records(Path(args.workload))
+    if args.limit is not None:
+        if args.limit <= 0:
+            parser.error("--limit must be positive")
+        records = records[: args.limit]
     result = run_burst(
-        _load_records(Path(args.workload)),
+        records,
         args.endpoint,
         workers=args.workers,
         timeout=args.timeout,
