@@ -157,6 +157,8 @@ class CISExecution:
     backend_delta: dict[str, Any]
     stage_events: tuple[dict[str, Any], ...]
     conditional: dict[str, int]
+    started_at: float
+    finished_at: float
 
 
 @dataclass(slots=True)
@@ -381,6 +383,8 @@ class ConditionalISRunner:
             "completion_tokens": len(result.token_ids),
             "algorithm_seconds": execution.algorithm_seconds,
             "total_seconds": execution.total_seconds,
+            "started_at": execution.started_at,
+            "finished_at": execution.finished_at,
             "steps": len(result.steps),
             **execution.conditional,
             "candidate_ess": candidate_ess,
@@ -421,6 +425,18 @@ class ConditionalISRunner:
     def backend_snapshot(self) -> dict[str, Any]:
         return _snapshot(self.backend)
 
+    def start_profile(self, profile_prefix: str | None = None) -> None:
+        callback = getattr(self.backend, "start_profile", None)
+        if callback is None:
+            raise RuntimeError("configured backend does not support profiling")
+        callback(profile_prefix)
+
+    def stop_profile(self) -> None:
+        callback = getattr(self.backend, "stop_profile", None)
+        if callback is None:
+            raise RuntimeError("configured backend does not support profiling")
+        callback()
+
     def execute(
         self,
         messages: Sequence[Mapping[str, Any]],
@@ -432,6 +448,7 @@ class ConditionalISRunner:
         """Run one complete CIS job without parsing its selected assistant text."""
 
         started = time.perf_counter()
+        started_at = time.time()
         started_ns = time.perf_counter_ns()
         stage_events: list[dict[str, Any]] = []
 
@@ -491,6 +508,7 @@ class ConditionalISRunner:
         )
         algorithm_seconds = time.perf_counter() - algorithm_started
         after = _snapshot(self.backend)
+        finished_at = time.time()
         return CISExecution(
             prompt=prompt,
             result=result,
@@ -503,6 +521,8 @@ class ConditionalISRunner:
                 "rollout_count": conditional.rollout_count,
                 "block_size": conditional.block_size,
             },
+            started_at=started_at,
+            finished_at=finished_at,
         )
 
     def close(self) -> None:

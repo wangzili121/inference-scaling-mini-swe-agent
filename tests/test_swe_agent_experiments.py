@@ -19,6 +19,12 @@ from inference_scaling.swe_agent.reward_screen import _screen_temperature
 from inference_scaling.swe_agent.runtime_tune import select_arms
 from inference_scaling.swe_agent.topology import capability_matrix, native_topologies
 from inference_scaling.swe_agent.swebench import build_swebench_command
+from inference_scaling.swe_agent.profile_analysis import (
+    analyze_algorithm_trace,
+    analyze_ascend_profile,
+    analyze_benchmark,
+    recommendations,
+)
 from tests.test_swe_agent import _AgentBackend, _runner_config
 
 
@@ -232,3 +238,77 @@ def test_swebench_launcher_fixes_verified_test_split(tmp_path: Path) -> None:
     assert command[command.index("--split") + 1] == "test"
     assert command[command.index("--slice") + 1] == "0:3"
     assert "model.endpoint=http://service:8123" in command
+
+
+def test_profile_analysis_combines_algorithm_runtime_and_npu_evidence(
+    tmp_path: Path,
+) -> None:
+    trace = tmp_path / "trace.jsonl"
+    trace.write_text(
+        json.dumps(
+            {
+                "diagnostics": {"algorithm_seconds": 10.0},
+                "stage_events": [
+                    {"name": "candidate", "step": 0, "duration_us": 4_000_000},
+                    {"name": "rollout", "step": 0, "duration_us": 4_000_000},
+                    {"name": "reward", "step": 0, "duration_us": 1_000_000},
+                    {"name": "weight", "step": 0, "duration_us": 200_000},
+                    {"name": "resample", "step": 0, "duration_us": 100_000},
+                    {"name": "block", "step": 0, "duration_us": 10_000_000},
+                ],
+            }
+        )
+        + "\n"
+    )
+    benchmark_path = tmp_path / "benchmark.json"
+    benchmark_path.write_text(
+        json.dumps(
+            {
+                "requests": 1,
+                "success_rate": 1.0,
+                "jobs_per_second": 0.1,
+                "latency_seconds": {"p95": 10.0},
+                "backend_delta": {
+                    "prefill_tokens": 20,
+                    "shared_prefill_tokens_saved": 80,
+                },
+                "measurements": [
+                    {"success": True, "endpoint": "http://one", "seconds": 10.0}
+                ],
+            }
+        )
+    )
+    rank = tmp_path / "npu" / "rank0" / "ASCEND_PROFILER_OUTPUT"
+    rank.mkdir(parents=True)
+    (rank / "kernel_details.csv").write_text(
+        "Start Time(us),Duration(us),Type,Name\n"
+        "0,10,MatMul,matmul\n"
+        "5,10,hcom_allReduce_,AivKernel\n"
+    )
+    (rank / "communication.json").write_text(
+        json.dumps(
+            {
+                "step": {
+                    "collective": {
+                        "one": {
+                            "Communication Time Info": {
+                                "Elapse Time(ms)": 0.01,
+                                "Transit Time(ms)": 0.005,
+                            }
+                        }
+                    }
+                }
+            }
+        )
+    )
+
+    benchmark = analyze_benchmark(benchmark_path)
+    algorithm = analyze_algorithm_trace(trace)
+    ascend = analyze_ascend_profile(tmp_path / "npu")
+    actions = recommendations(benchmark, algorithm, ascend)
+
+    assert benchmark["apc_token_hit_ratio"] == pytest.approx(0.8)
+    assert algorithm["block_gap_share"] == pytest.approx(0.07)
+    assert ascend["rank_count"] == 1
+    assert ascend["ranks"][0]["exposed_communication_ratio"] == pytest.approx(0.5)
+    assert any(item["trigger"] == "exposed_hccl_above_15_percent" for item in actions)

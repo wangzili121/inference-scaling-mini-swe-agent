@@ -102,6 +102,7 @@ class _Engine:
     def __init__(self):
         self.calls = []
         self.closed = False
+        self.profile_events = []
 
     @staticmethod
     def _ids(prompt):
@@ -144,6 +145,12 @@ class _Engine:
 
     def shutdown(self):
         self.closed = True
+
+    def start_profile(self, prefix=None):
+        self.profile_events.append(("start", prefix))
+
+    def stop_profile(self):
+        self.profile_events.append(("stop", None))
 
 
 class _TopKEngine(_Engine):
@@ -450,6 +457,9 @@ def test_vllm_direct_greedy_and_sync_beam_generation() -> None:
     beam_call = engine.calls[-1]
     assert beam_call["params"].beam_width == 4
     assert beam_call["use_tqdm"] is False
+    backend.start_profile("sync")
+    backend.stop_profile()
+    assert engine.profile_events == [("start", "sync"), ("stop", None)]
 
 
 def test_vllm_snapshot_accounts_rejected_native_draft_slots() -> None:
@@ -492,6 +502,12 @@ class _AsyncEngine(_Engine):
     async def shutdown(self):
         self.closed = True
 
+    async def start_profile(self, prefix=None):
+        self.profile_events.append(("start", prefix))
+
+    async def stop_profile(self):
+        self.profile_events.append(("stop", None))
+
 
 def test_async_vllm_overlaps_requests_from_independent_callers() -> None:
     engine = _AsyncEngine()
@@ -518,6 +534,9 @@ def test_async_vllm_overlaps_requests_from_independent_callers() -> None:
     assert engine.maximum_active == 2
     assert backend.snapshot().maximum_in_flight_requests == 2
     assert backend.direct_generate((1,), max_new_tokens=2, num_beams=2) == (3, 3)
+    backend.start_profile("async")
+    backend.stop_profile()
+    assert engine.profile_events == [("start", "async"), ("stop", None)]
     backend.close()
     assert engine.closed
 

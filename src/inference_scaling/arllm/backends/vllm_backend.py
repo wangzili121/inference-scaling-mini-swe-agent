@@ -1270,6 +1270,26 @@ class VLLMBackend:
             raise RuntimeError("vLLM beam-search output did not preserve the prompt")
         return full_tokens[len(model_prefix) :]
 
+    def start_profile(self, profile_prefix: str | None = None) -> None:
+        callback = getattr(self._engine, "start_profile", None)
+        if callback is None:
+            raise RuntimeError("this vLLM frontend does not expose start_profile")
+        result = callback(profile_prefix)
+        if inspect.isawaitable(result):
+            raise RuntimeError(
+                "an asynchronous vLLM engine requires AsyncVLLMBackend profiling"
+            )
+
+    def stop_profile(self) -> None:
+        callback = getattr(self._engine, "stop_profile", None)
+        if callback is None:
+            raise RuntimeError("this vLLM frontend does not expose stop_profile")
+        result = callback()
+        if inspect.isawaitable(result):
+            raise RuntimeError(
+                "an asynchronous vLLM engine requires AsyncVLLMBackend profiling"
+            )
+
     def close(self) -> None:
         if self._closed:
             return
@@ -1475,6 +1495,28 @@ class AsyncVLLMBackend(VLLMBackend):
         with self._request_counter_lock:
             value = next(self._request_counter)
         return f"inference-scaling:{self.model_id}:{value}"
+
+    def start_profile(self, profile_prefix: str | None = None) -> None:
+        async def start() -> None:
+            callback = getattr(self._engine, "start_profile", None)
+            if callback is None:
+                raise RuntimeError("this AsyncLLM frontend does not expose start_profile")
+            result = callback(profile_prefix)
+            if inspect.isawaitable(result):
+                await result
+
+        self._runner.run(start())
+
+    def stop_profile(self) -> None:
+        async def stop() -> None:
+            callback = getattr(self._engine, "stop_profile", None)
+            if callback is None:
+                raise RuntimeError("this AsyncLLM frontend does not expose stop_profile")
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
+
+        self._runner.run(stop())
 
     def _native_speculation_totals(self) -> tuple[int, int, int]:
         if self._closed:

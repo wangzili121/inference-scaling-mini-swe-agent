@@ -60,6 +60,8 @@ conditional-is-algorithm-grid = "inference_scaling.swe_agent.algorithm_grid:main
 conditional-is-runtime-tune = "inference_scaling.swe_agent.runtime_tune:main"
 conditional-is-topology = "inference_scaling.swe_agent.topology:main"
 conditional-is-swebench = "inference_scaling.swe_agent.swebench:main"
+conditional-is-profile = "inference_scaling.swe_agent.profile:main"
+conditional-is-analyze-profile = "inference_scaling.swe_agent.profile_analysis:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

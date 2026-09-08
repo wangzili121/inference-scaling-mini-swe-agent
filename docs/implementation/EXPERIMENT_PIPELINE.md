@@ -90,6 +90,30 @@ Use `--dry-run` first to inspect the exact 36 engine configurations. Hard gates
 are 100% successful requests, no OOM or reported preemption, and P95 no more
 than 1.25 times the round minimum. The final ranking maximizes complete jobs/s.
 
+## NPU profiling
+
+After selecting the best two-card or four-card configuration, capture only the
+measured burst through vLLM-Ascend's worker-aware profiler. The launcher loads
+and warms the persistent engine first, then calls vLLM `start_profile` on every
+TP/PP worker, runs the fixed burst, and calls `stop_profile` before shutdown.
+
+```bash
+conditional-is-profile \
+  --config configs/swebench/conditional_is_smoke.toml \
+  --workload artifacts/workloads/swe-agent-128/holdout-64.jsonl \
+  --warmup-workload artifacts/workloads/warmup.jsonl \
+  --devices 0,1 --workers 64 \
+  --set vllm.max_num_seqs=BEST_MNS \
+  --set vllm.max_num_batched_tokens=BEST_MBT \
+  --output-directory artifacts/profiles/tp2-best
+```
+
+The output contains per-rank CPU/NPU traces from vLLM-Ascend, the fixed-burst
+benchmark, service logs, and the algorithm-level candidate/rollout/reward trace.
+Do not enable `--profile-memory` or `--profile-stack` in the first timeline pass;
+both materially increase profiling overhead and should be separate diagnostic
+runs.
+
 ## Selected-token fallback
 
 `infra/vllm_ascend/selected_token_scoring` contains a hash-guarded vLLM 0.18

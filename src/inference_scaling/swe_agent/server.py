@@ -38,6 +38,28 @@ def _handler(runner: ConditionalISRunner) -> type[BaseHTTPRequestHandler]:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
         def do_POST(self) -> None:
+            if self.path in {"/v1/profile/start", "/v1/profile/stop"}:
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    payload = (
+                        json.loads(self.rfile.read(length).decode("utf-8"))
+                        if length
+                        else {}
+                    )
+                    if not isinstance(payload, dict):
+                        raise TypeError("profile payload must be an object")
+                    if self.path.endswith("/start"):
+                        prefix = payload.get("prefix")
+                        runner.start_profile(None if prefix is None else str(prefix))
+                        status = "started"
+                    else:
+                        runner.stop_profile()
+                        status = "stopped"
+                except (TypeError, ValueError, RuntimeError) as error:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+                    return
+                self._json(HTTPStatus.OK, {"status": status})
+                return
             if self.path != "/v1/query":
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return

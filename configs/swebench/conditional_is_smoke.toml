@@ -43,6 +43,7 @@ enable_prefix_caching = true
 [vllm.engine_kwargs]
 enable_chunked_prefill = true
 compilation_config = { cudagraph_mode = "FULL_DECODE_ONLY" }
+profiler_config = {}
 
 [run]
 seed = 20260908

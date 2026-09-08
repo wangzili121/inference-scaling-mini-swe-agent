@@ -120,6 +120,19 @@ def test_runner_coalesces_retry_equivalent_request_ids(tmp_path: Path) -> None:
         runner.query(messages, request_id="retry-1", seed=18)
 
 
+def test_runner_forwards_profile_control_to_backend(tmp_path: Path) -> None:
+    backend = _AgentBackend()
+    events = []
+    backend.start_profile = lambda prefix=None: events.append(("start", prefix))
+    backend.stop_profile = lambda: events.append(("stop", None))
+    runner = ConditionalISRunner(backend, _runner_config(tmp_path / "trace.jsonl"))
+
+    runner.start_profile("tp2-best")
+    runner.stop_profile()
+
+    assert events == [("start", "tp2-best"), ("stop", None)]
+
+
 def test_model_client_uses_stable_request_identity() -> None:
     class StubModel(ConditionalISModel):
         def __init__(self):
