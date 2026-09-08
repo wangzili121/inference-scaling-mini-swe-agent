@@ -355,7 +355,6 @@ def test_deployer_rejects_busy_cards_and_mounts_native_categorical(
         "runtime/sampler.py",
         "vllm_ascend/vllm_ascend_C.cpython-311-aarch64-linux-gnu.so",
         "vllm_ascend/libvllm_ascend_kernels.so",
-        "vllm_ascend/_cann_ops_custom/metadata.json",
     ):
         path = categorical / relative
         path.parent.mkdir(parents=True, exist_ok=True)

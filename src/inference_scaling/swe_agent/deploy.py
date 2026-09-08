@@ -26,10 +26,6 @@ _CATEGORICAL_MOUNTS = (
         "vllm_ascend/libvllm_ascend_kernels.so",
         "/vllm-workspace/vllm-ascend/vllm_ascend/libvllm_ascend_kernels.so",
     ),
-    (
-        "vllm_ascend/_cann_ops_custom",
-        "/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom",
-    ),
 )
 
 
