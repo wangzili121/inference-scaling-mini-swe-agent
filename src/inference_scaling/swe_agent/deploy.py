@@ -26,6 +26,10 @@ _CATEGORICAL_MOUNTS = (
         "vllm_ascend/libvllm_ascend_kernels.so",
         "/vllm-workspace/vllm-ascend/vllm_ascend/libvllm_ascend_kernels.so",
     ),
+    (
+        "vllm_ascend/_cann_ops_custom",
+        "/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom",
+    ),
 )
 
 
@@ -129,15 +133,9 @@ def build_docker_command(
         command.extend(
             ("--volume", f"{asset['source']}:{asset['target']}:ro")
         )
-    library_path = ":".join(
-        (
-            "/vllm-workspace/vllm-ascend/vllm_ascend",
-            "/vllm-workspace/vllm-ascend/vllm_ascend/lib",
-            "/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/"
-            "vendors/vllm-ascend/op_api/lib",
-            "/usr/local/Ascend/ascend-toolkit/latest/lib64",
-            "/usr/local/Ascend/driver/lib64",
-        )
+    custom_opp = (
+        "/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/"
+        "vendors/vllm-ascend"
     )
     command.extend(
         (
@@ -150,7 +148,9 @@ def build_docker_command(
             "--env",
             "VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE=1",
             "--env",
-            f"LD_LIBRARY_PATH={library_path}",
+            f"ASCEND_CUSTOM_OPP_PATH={custom_opp}",
+            "--env",
+            f"LD_PRELOAD={custom_opp}/op_api/lib/libcust_opapi.so",
             "--workdir",
             "/workspace",
             "--entrypoint",

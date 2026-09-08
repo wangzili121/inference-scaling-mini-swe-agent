@@ -398,6 +398,7 @@ def test_deployer_rejects_busy_cards_and_mounts_native_categorical(
         "runtime/sampler.py",
         "vllm_ascend/vllm_ascend_C.cpython-311-aarch64-linux-gnu.so",
         "vllm_ascend/libvllm_ascend_kernels.so",
+        "vllm_ascend/_cann_ops_custom/metadata.json",
     ):
         path = categorical / relative
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -417,6 +418,9 @@ def test_deployer_rejects_busy_cards_and_mounts_native_categorical(
 
     assert command.count("--device") == 5
     assert "VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE=1" in command
+    assert any(value.startswith("ASCEND_CUSTOM_OPP_PATH=") for value in command)
+    assert any(value.startswith("LD_PRELOAD=") for value in command)
+    assert not any(value.startswith("LD_LIBRARY_PATH=") for value in command)
     assert any("runtime/sampler.py" in value for value in command)
     assert all(asset["sha256"] for asset in assets)
 
