@@ -11,7 +11,7 @@ import time
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from inference_scaling.shared.rng import SeedStream
 
@@ -24,6 +24,63 @@ class RequestMeasurement:
     seconds: float
     error: str | None
     diagnostics: dict[str, Any] | None
+    started_at: float
+    finished_at: float
+
+
+class EndpointRouter:
+    """Thread-safe whole-job routing with observable per-instance pressure."""
+
+    def __init__(self, endpoints: Sequence[str], mode: str) -> None:
+        if mode not in {"round_robin", "least_outstanding"}:
+            raise ValueError(f"unknown routing mode: {mode}")
+        self.endpoints = tuple(endpoints)
+        self.mode = mode
+        self._lock = threading.Lock()
+        self._cursor = 0
+        self._outstanding = {endpoint: 0 for endpoint in endpoints}
+        self._assigned = {endpoint: 0 for endpoint in endpoints}
+        self._maximum = {endpoint: 0 for endpoint in endpoints}
+
+    def acquire(self) -> str:
+        with self._lock:
+            if self.mode == "round_robin":
+                index = self._cursor % len(self.endpoints)
+            else:
+                minimum = min(self._outstanding.values())
+                eligible = {
+                    endpoint
+                    for endpoint, count in self._outstanding.items()
+                    if count == minimum
+                }
+                index = next(
+                    offset % len(self.endpoints)
+                    for offset in range(
+                        self._cursor, self._cursor + len(self.endpoints)
+                    )
+                    if self.endpoints[offset % len(self.endpoints)] in eligible
+                )
+            endpoint = self.endpoints[index]
+            self._cursor = index + 1
+            self._outstanding[endpoint] += 1
+            self._assigned[endpoint] += 1
+            self._maximum[endpoint] = max(
+                self._maximum[endpoint], self._outstanding[endpoint]
+            )
+            return endpoint
+
+    def release(self, endpoint: str) -> None:
+        with self._lock:
+            self._outstanding[endpoint] -= 1
+
+    def diagnostics(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "mode": self.mode,
+                "assigned": dict(self._assigned),
+                "maximum_outstanding": dict(self._maximum),
+                "final_outstanding": dict(self._outstanding),
+            }
 
 
 def _percentile(values: Sequence[float], quantile: float) -> float:
@@ -86,6 +143,8 @@ def run_burst(
     seed: int = 20260908,
     conditional_overrides: dict[str, int] | None = None,
     run_namespace: str | None = None,
+    routing: str = "round_robin",
+    after_release: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     if not records or not endpoints:
         raise ValueError("burst requires records and endpoints")
@@ -93,12 +152,10 @@ def run_burst(
         raise ValueError("workers must be positive")
     run_namespace = run_namespace or f"burst:{time.time_ns()}"
     release = threading.Event()
-    before_snapshots = {
-        endpoint: _backend_snapshot(endpoint) for endpoint in endpoints
-    }
+    router = EndpointRouter(endpoints, routing)
+    before_snapshots = {endpoint: _backend_snapshot(endpoint) for endpoint in endpoints}
 
     def execute(index: int, record: dict[str, Any]) -> RequestMeasurement:
-        endpoint = endpoints[index % len(endpoints)]
         request_id = f"{run_namespace}:{index}:{record['request_id']}"
         payload = {
             "messages": record["messages"],
@@ -108,7 +165,9 @@ def run_burst(
         if conditional_overrides:
             payload["conditional_is"] = dict(conditional_overrides)
         release.wait()
+        endpoint = router.acquire()
         started = time.perf_counter()
+        started_at = time.time()
         try:
             response = _post(endpoint, payload, timeout)
             actions = response.get("message", {}).get("extra", {}).get("actions", [])
@@ -121,6 +180,8 @@ def run_burst(
                 time.perf_counter() - started,
                 None,
                 response.get("diagnostics"),
+                started_at,
+                time.time(),
             )
         except Exception as error:
             return RequestMeasurement(
@@ -130,7 +191,11 @@ def run_burst(
                 time.perf_counter() - started,
                 f"{type(error).__name__}: {error}",
                 None,
+                started_at,
+                time.time(),
             )
+        finally:
+            router.release(endpoint)
 
     wall_started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -139,6 +204,8 @@ def run_burst(
             for index, record in enumerate(records)
         ]
         release.set()
+        if after_release is not None:
+            after_release()
         measurements = [future.result() for future in futures]
     wall_seconds = time.perf_counter() - wall_started
     after_snapshots = {endpoint: _backend_snapshot(endpoint) for endpoint in endpoints}
@@ -146,9 +213,7 @@ def run_burst(
         endpoint: _snapshot_delta(before_snapshots[endpoint], after_snapshots[endpoint])
         for endpoint in endpoints
     }
-    backend_keys = {
-        key for delta in endpoint_backend_delta.values() for key in delta
-    }
+    backend_keys = {key for delta in endpoint_backend_delta.values() for key in delta}
     backend_delta = {
         key: sum(delta.get(key, 0.0) for delta in endpoint_backend_delta.values())
         for key in backend_keys
@@ -162,6 +227,7 @@ def run_burst(
         "endpoints": list(endpoints),
         "conditional_is": dict(conditional_overrides or {}),
         "run_namespace": run_namespace,
+        "routing": router.diagnostics(),
         "backend_delta": backend_delta,
         "endpoint_backend_delta": endpoint_backend_delta,
         "wall_seconds": wall_seconds,
@@ -192,6 +258,11 @@ def main() -> None:
     parser.add_argument("--candidate-count", type=int)
     parser.add_argument("--rollout-count", type=int)
     parser.add_argument("--block-size", type=int)
+    parser.add_argument(
+        "--routing",
+        choices=("round_robin", "least_outstanding"),
+        default="round_robin",
+    )
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
     conditional_overrides = {
@@ -210,6 +281,7 @@ def main() -> None:
         timeout=args.timeout,
         seed=args.seed,
         conditional_overrides=conditional_overrides,
+        routing=args.routing,
     )
     Path(args.output).write_text(json.dumps(result, indent=2) + "\n")
     print(

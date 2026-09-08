@@ -9,14 +9,20 @@ from inference_scaling.arllm.backends import TabularAutoregressiveBackend
 from inference_scaling.swe_agent.service import ConditionalISRunner
 from inference_scaling.swe_agent import benchmark
 from inference_scaling.swe_agent.algorithm_grid import _pareto
+from inference_scaling.swe_agent.archive_artifacts import archive_artifacts
 from inference_scaling.swe_agent.calibration import (
     block_ess_ratios,
     calibrate_logprob_alpha,
     calibrate_reward_temperature,
 )
-from inference_scaling.swe_agent.workload import freeze_workload
+from inference_scaling.swe_agent.workload import extract_call_snapshots, freeze_workload
 from inference_scaling.swe_agent.reward_screen import _screen_temperature
-from inference_scaling.swe_agent.runtime_tune import select_arms
+from inference_scaling.swe_agent.runtime_tune import (
+    adaptive_search_plan,
+    engine_grid,
+    select_max_model_len,
+    select_arms,
+)
 from inference_scaling.swe_agent.topology import capability_matrix, native_topologies
 from inference_scaling.swe_agent.swebench import select_instances
 from inference_scaling.swe_agent.profile_analysis import (
@@ -25,11 +31,15 @@ from inference_scaling.swe_agent.profile_analysis import (
     analyze_benchmark,
     recommendations,
 )
+from inference_scaling.swe_agent.profile_report import render_profile_report
+from inference_scaling.swe_agent.graph_capture import graph_capture_candidates
 from inference_scaling.swe_agent.evaluate import build_evaluation_command
 from inference_scaling.swe_agent.deploy import (
     build_docker_command,
     parse_npu_processes,
 )
+from inference_scaling.swe_agent.deployment_manifest import build_deployment_manifest
+from inference_scaling.swe_agent.profile_matrix import load_matrix, profile_commands
 from tests.test_swe_agent import _AgentBackend, _runner_config
 
 
@@ -106,7 +116,9 @@ def test_burst_routes_whole_jobs_across_endpoints(monkeypatch) -> None:
             {"generation_forward_token_slots": 27},
         )
     )
-    monkeypatch.setattr(benchmark, "_backend_snapshot", lambda endpoint: next(snapshots))
+    monkeypatch.setattr(
+        benchmark, "_backend_snapshot", lambda endpoint: next(snapshots)
+    )
     records = [_trace_record(index) for index in range(4)]
 
     result = benchmark.run_burst(
@@ -128,7 +140,9 @@ def test_burst_routes_whole_jobs_across_endpoints(monkeypatch) -> None:
         "http://two",
         "http://two",
     ]
-    assert all(call[1]["request_id"].startswith(result["run_namespace"]) for call in calls)
+    assert all(
+        call[1]["request_id"].startswith(result["run_namespace"]) for call in calls
+    )
 
 
 def test_reward_screen_uses_one_pool_for_both_reward_families(
@@ -188,6 +202,11 @@ def test_runner_namespaces_internal_requests_by_job(tmp_path: Path) -> None:
     names = {event["name"] for event in first_execution.stage_events}
     assert {"candidate", "rollout", "reward", "weight", "resample", "block"} <= names
     assert all(event["duration_us"] >= 0 for event in first_execution.stage_events)
+    assert all(event["job_id"] == "job-one" for event in first_execution.stage_events)
+    assert all(
+        event["block_id"] == event["step"] for event in first_execution.stage_events
+    )
+    assert all(event["start_unix_us"] > 0 for event in first_execution.stage_events)
 
 
 def _arm(arm_id: str, throughput: float, p95: float, *, success: float = 1.0):
@@ -218,17 +237,62 @@ def test_runtime_gate_and_algorithm_pareto_are_deterministic() -> None:
 def test_four_card_topology_matrix_is_explicit_about_capability_gates() -> None:
     topologies = {item.topology_id: item for item in native_topologies(19000)}
 
-    assert len(topologies["2xtp2-whole-job"].services) == 2
-    assert topologies["tp2-dp2-shared-queue"].services[0].data_parallel_size == 2
-    assert topologies["tp4"].services[0].tensor_parallel_size == 4
-    assert topologies["tp2-pp2"].services[0].pipeline_parallel_size == 2
+    assert len(topologies["2xtp2-round-robin"].services) == 2
+    assert topologies["2xtp2-least-outstanding"].routing == "least_outstanding"
+    assert len(topologies["2xpp2-round-robin"].services) == 2
+    assert topologies["2xpp2-round-robin"].services[0].pipeline_parallel_size == 2
     matrix = capability_matrix()
-    assert all(
-        item["verification_status"] for item in matrix["configurable"]
-    )
+    assert all(item["verification_status"] for item in matrix["specified_two_instance"])
+    assert "tp4" in matrix["excluded_from_primary_comparison"]
     gated = matrix["gated"]
     assert "pd-2-plus-2" in gated
     assert "candidate-rollout-stage-pipeline" in gated
+
+
+def test_adaptive_runtime_plan_expands_real_boundaries() -> None:
+    plan = adaptive_search_plan()
+    configs = engine_grid()
+
+    assert len(configs) == 24
+    assert {item.topology for item in configs} == {"tp2", "pp2"}
+    assert max(item.max_num_seqs for item in configs) == 512
+    assert plan["boundary_expansion"]["max_num_seqs"][-1] == 2048
+    assert plan["boundary_expansion"]["max_num_batched_tokens"][-1] == 524288
+    assert plan["partial_prefill"][-1] == [8, 8]
+    assert select_max_model_len([_trace_record(1)]) == 16384
+    long_record = _trace_record(2)
+    long_record["diagnostics"]["prompt_tokens"] = 32001
+    assert select_max_model_len([long_record]) == 65536
+
+
+def test_public_trajectory_extracts_each_model_call_without_mutation(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "task.traj.json"
+    trajectory = {
+        "instance_id": "task-1",
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "fix"},
+            {"role": "assistant", "content": "inspect"},
+            {"role": "tool", "content": "result", "tool_call_id": "call-1"},
+            {"role": "assistant", "content": "finish"},
+        ],
+    }
+
+    snapshots = extract_call_snapshots(
+        trajectory,
+        source=source,
+        token_count=lambda messages: len(messages) * 10,
+    )
+
+    assert [item["request_id"] for item in snapshots] == [
+        "public:task-1:call-0",
+        "public:task-1:call-1",
+    ]
+    assert [item["diagnostics"]["prompt_tokens"] for item in snapshots] == [20, 40]
+    assert snapshots[0]["messages"] == trajectory["messages"][:2]
+    assert snapshots[1]["messages"] == trajectory["messages"][:4]
 
 
 def test_swebench_launcher_selects_canonical_or_explicit_order() -> None:
@@ -387,3 +451,150 @@ def test_profile_analysis_combines_algorithm_runtime_and_npu_evidence(
     assert ascend["rank_count"] == 1
     assert ascend["ranks"][0]["exposed_communication_ratio"] == pytest.approx(0.5)
     assert any(item["trigger"] == "exposed_hccl_above_15_percent" for item in actions)
+
+
+def test_profile_report_keeps_raw_data_and_renders_recomputable_outputs(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "algorithm-traces").mkdir()
+    (tmp_path / "algorithm-traces" / "rank0.jsonl").write_text(
+        json.dumps(
+            {
+                "request_id": "job-1",
+                "diagnostics": {"algorithm_seconds": 0.01},
+                "stage_events": [
+                    {
+                        "name": "candidate",
+                        "duration_us": 10,
+                        "start_unix_us": 1_000_000,
+                        "instance_id": "one",
+                        "step": 0,
+                    }
+                ],
+            }
+        )
+        + "\n"
+    )
+    (tmp_path / "benchmark.json").write_text(
+        json.dumps(
+            {
+                "requests": 1,
+                "success_rate": 1.0,
+                "jobs_per_second": 1.0,
+                "latency_seconds": {"p95": 1.0},
+                "backend_delta": {},
+                "measurements": [],
+                "profile": {"window": {"started_at": 1.0}},
+            }
+        )
+    )
+    rank = tmp_path / "torch" / "rank0" / "ASCEND_PROFILER_OUTPUT"
+    rank.mkdir(parents=True)
+    (rank / "kernel_details.csv").write_text(
+        "Start Time(us),Duration(us),Type,Name\n0,10,MatMul,matmul\n"
+    )
+    service = tmp_path / "service" / "output"
+    service.mkdir(parents=True)
+    (service / "batch.csv").write_text(
+        "timestamp,num_scheduled_tokens,waiting_requests\n1,31,3\n2,63,2\n3,95,1\n"
+    )
+
+    result = render_profile_report(tmp_path)
+
+    assert Path(result["analysis"]).is_file()
+    assert Path(result["report"]).is_file()
+    timeline = json.loads(Path(result["timeline"]["path"]).read_text())
+    assert {item["cat"] for item in timeline["traceEvents"]} == {
+        "conditional-is",
+        "npu-kernel",
+    }
+    assert (tmp_path / "algorithm-traces" / "rank0.jsonl").is_file()
+    analysis = json.loads(Path(result["analysis"]).read_text())
+    capture = graph_capture_candidates(analysis["service"])
+    assert capture["capture_sizes"][-1] == 96
+    assert "cudagraph_capture_sizes" in capture["override"]
+
+
+def test_selected_tuner_result_becomes_two_or_four_instance_profile_manifest(
+    tmp_path: Path,
+) -> None:
+    tuning = tmp_path / "result.json"
+    tuning.write_text(
+        json.dumps(
+            {
+                "winner": {
+                    "engine": {
+                        "max_num_seqs": 384,
+                        "max_num_batched_tokens": 65536,
+                        "gpu_memory_utilization": 0.94,
+                        "topology": "pp2",
+                        "max_num_partial_prefills": 4,
+                        "max_long_partial_prefills": 2,
+                    },
+                    "feature": {
+                        "feature_id": "optimized-baseline",
+                        "overrides": ["vllm.async_scheduling=false"],
+                        "environment": [["VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE", "1"]],
+                    },
+                    "workers": 32,
+                }
+            }
+        )
+    )
+
+    deployment = build_deployment_manifest(
+        tuning,
+        deployment_id="four-card",
+        devices=("0,1", "2,3"),
+        routing="least_outstanding",
+        workers=64,
+    )
+
+    assert deployment["pipeline_parallel_size"] == 2
+    assert deployment["tensor_parallel_size"] == 1
+    assert deployment["workers"] == 64
+    assert deployment["devices"] == ["0,1", "2,3"]
+    assert "vllm.max_num_seqs=384" in deployment["overrides"]
+
+
+def test_profile_matrix_plans_separate_unprofiled_service_and_torch_passes(
+    tmp_path: Path,
+) -> None:
+    algorithms = load_matrix(
+        Path(__file__).parents[1] / "configs" / "swebench" / "profile_matrix.toml"
+    )
+    commands = profile_commands(
+        config=tmp_path / "service.toml",
+        matrix=algorithms,
+        deployments=[
+            {
+                "id": "two-card",
+                "devices": ["0,1"],
+                "tensor_parallel_size": 2,
+                "pipeline_parallel_size": 1,
+                "routing": "round_robin",
+                "workers": 64,
+                "overrides": [],
+            }
+        ],
+        workload=tmp_path / "workload.jsonl",
+        warmup_workload=None,
+        output=tmp_path / "profiles",
+        seed=1,
+    )
+
+    assert len(commands) == 14
+    assert sum(item["profiler"] == "none" for item in commands) == 6
+    assert {item["algorithm"] for item in commands} == {"P0", "P1", "P2", "P3"}
+    assert all("--profiler" in item["command"] for item in commands)
+
+
+def test_profile_archive_has_external_sha256(tmp_path: Path) -> None:
+    source = tmp_path / "profile"
+    source.mkdir()
+    (source / "raw.json").write_text("raw")
+
+    result = archive_artifacts(source, tmp_path / "archives" / "profile.tar.gz")
+
+    assert Path(result["archive"]).is_file()
+    assert Path(result["checksum"]).read_text().startswith(str(result["sha256"]))

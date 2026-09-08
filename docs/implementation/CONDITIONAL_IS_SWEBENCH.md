@@ -50,8 +50,8 @@ The exact command sequence is documented in
    context accumulation, EOS, timeout, recovery, and saved trajectories.
 2. Apply and validate the v0.18 MRV1 categorical sampler and Ascend graph
    settings on the remote NPU host.
-3. Run the reward/temperature screen, then the six C/R combinations.
-4. Collect 128 real calls and freeze the two 64-request manifests.
-5. Tune TP2 and compare the prescribed four-card topologies.
-6. Profile the best two-card and four-card configurations before choosing any
+3. Import 64 public real-call snapshots and collect at least 16 current-stack calls.
+4. Collect 128 current-stack calls when available and freeze tune/holdout manifests.
+5. Tune TP2 versus PP2 and compare the prescribed two-instance four-card deployments.
+6. Profile P0-P3 on the best two-card and four-card configurations before choosing any
    algorithm-aware scheduling, KV-affinity, communication, or kernel work.

@@ -17,6 +17,7 @@ BACKEND_CHOICES = ("transformers", "vllm", "vllm-sync")
 
 _VLLM_SETTINGS = {
     "asynchronous",
+    "async_scheduling",
     "data_parallel_size",
     "download_dir",
     "dtype",
@@ -297,6 +298,7 @@ def load_backend_from_config(
             parameter_count=settings.pop("parameter_count", None),
             scoring_backend=exact_backend,
             enable_prefix_caching=bool(settings.pop("enable_prefix_caching", True)),
+            async_scheduling=settings.pop("async_scheduling", None),
             max_lora_rank=int(settings.pop("max_lora_rank", 16)),
             enable_mh_fused_logprobs=mh_fused_logprobs,
             engine_kwargs=engine_kwargs,

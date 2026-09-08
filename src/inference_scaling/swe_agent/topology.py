@@ -1,4 +1,4 @@
-"""Compare native four-card vLLM topologies on one fixed CIS workload."""
+"""Compare the specified four-card, two-instance CIS deployments."""
 
 from __future__ import annotations
 
@@ -48,42 +48,55 @@ class RunningService:
     log: TextIO
 
 
-def native_topologies(base_port: int = 18123) -> tuple[TopologySpec, ...]:
+def _paired_services(
+    base_port: int,
+    *,
+    topology: str,
+    device_pairs: Sequence[str] = ("0,1", "2,3"),
+) -> tuple[ServiceSpec, ServiceSpec]:
+    if len(device_pairs) != 2:
+        raise ValueError("four-card comparison requires exactly two device pairs")
+    if topology == "tp2":
+        parallel = {"tensor_parallel_size": 2, "pipeline_parallel_size": 1}
+    elif topology == "pp2":
+        parallel = {"tensor_parallel_size": 1, "pipeline_parallel_size": 2}
+    else:
+        raise ValueError(f"unsupported paired topology: {topology}")
     return (
-        TopologySpec(
-            "2xtp2-whole-job",
-            (
-                ServiceSpec("tp2-a", "0,1", base_port, 2),
-                ServiceSpec("tp2-b", "2,3", base_port + 1, 2),
-            ),
-            "round_robin_whole_job",
-            "ready_for_runtime_smoke",
-        ),
-        TopologySpec(
-            "tp2-dp2-shared-queue",
-            (ServiceSpec("tp2-dp2", "0,1,2,3", base_port, 2, data_parallel_size=2),),
-            "vllm_data_parallel_shared_request_queue",
-        ),
-        TopologySpec(
-            "tp4",
-            (ServiceSpec("tp4", "0,1,2,3", base_port, 4),),
-            "single_engine",
-        ),
-        TopologySpec(
-            "tp2-pp2",
-            (
-                ServiceSpec(
-                    "tp2-pp2", "0,1,2,3", base_port, 2, pipeline_parallel_size=2
-                ),
-            ),
-            "single_engine",
-        ),
+        ServiceSpec(f"{topology}-a", str(device_pairs[0]), base_port, **parallel),
+        ServiceSpec(f"{topology}-b", str(device_pairs[1]), base_port + 1, **parallel),
     )
 
 
-def capability_matrix(base_port: int = 18123) -> dict[str, Any]:
+def native_topologies(
+    base_port: int = 18123,
+    device_pairs: Sequence[str] = ("0,1", "2,3"),
+) -> tuple[TopologySpec, ...]:
+    return tuple(
+        TopologySpec(
+            f"2x{parallel}-{routing.replace('_', '-')}",
+            _paired_services(base_port, topology=parallel, device_pairs=device_pairs),
+            routing,
+            "ready_for_runtime_smoke",
+        )
+        for parallel in ("tp2", "pp2")
+        for routing in ("round_robin", "least_outstanding")
+    )
+
+
+def capability_matrix(
+    base_port: int = 18123,
+    device_pairs: Sequence[str] = ("0,1", "2,3"),
+) -> dict[str, Any]:
     return {
-        "configurable": [asdict(spec) for spec in native_topologies(base_port)],
+        "specified_two_instance": [
+            asdict(spec) for spec in native_topologies(base_port, device_pairs)
+        ],
+        "excluded_from_primary_comparison": {
+            "tp4": "single instance; outside the requested four-card comparison",
+            "tp2-pp2": "single instance; outside the requested four-card comparison",
+            "dp2-shared-queue": "not two independently observable service instances",
+        },
         "gated": {
             "pd-2-plus-2": {
                 "status": "requires_v018_ascend_kv_connector_capability_smoke",
@@ -103,6 +116,8 @@ def _start_services(
     config: Path,
     output: Path,
     host: str,
+    overrides: Sequence[str] = (),
+    environment_overrides: Sequence[str] = (),
 ) -> list[RunningService]:
     processes = []
     for service in topology.services:
@@ -122,9 +137,21 @@ def _start_services(
         ]
         for override in service.overrides(trace_path):
             command.extend(("--set", override))
+        for override in overrides:
+            command.extend(("--set", override))
         environment = dict(os.environ)
         environment["ASCEND_RT_VISIBLE_DEVICES"] = service.devices
         environment["CIS_INSTANCE_ID"] = service.instance_id
+        for assignment in environment_overrides:
+            if "=" not in assignment:
+                raise ValueError(
+                    f"environment override requires KEY=VALUE: {assignment}"
+                )
+            key, value = assignment.split("=", 1)
+            if value == "__UNSET__":
+                environment.pop(key, None)
+            else:
+                environment[key] = value
         log_path = output / "logs" / topology.topology_id / f"{service.instance_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log = log_path.open("w", encoding="utf-8")
@@ -158,8 +185,18 @@ def run_topology(
     request_timeout: float,
     seed: int,
     host: str = "0.0.0.0",
+    overrides: Sequence[str] = (),
+    environment_overrides: Sequence[str] = (),
+    conditional_overrides: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    processes = _start_services(topology, config=config, output=output, host=host)
+    processes = _start_services(
+        topology,
+        config=config,
+        output=output,
+        host=host,
+        overrides=overrides,
+        environment_overrides=environment_overrides,
+    )
     try:
         for service in processes:
             _wait_for_health(service.endpoint, service.process, startup_timeout)
@@ -171,6 +208,8 @@ def run_topology(
                 workers=min(workers, len(warmup_records)),
                 timeout=request_timeout,
                 seed=seed,
+                routing=topology.routing,
+                conditional_overrides=conditional_overrides,
             )
             if warmup["success_rate"] != 1.0:
                 raise RuntimeError("topology warmup workload failed")
@@ -180,6 +219,8 @@ def run_topology(
             workers=workers,
             timeout=request_timeout,
             seed=seed,
+            routing=topology.routing,
+            conditional_overrides=conditional_overrides,
         )
     except Exception as error:
         result = {
@@ -217,11 +258,18 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260908)
     parser.add_argument("--output-directory", required=True)
     parser.add_argument("--capabilities-only", action="store_true")
+    parser.add_argument("--set", dest="overrides", action="append", default=[])
+    parser.add_argument("--env", dest="environment", action="append", default=[])
+    parser.add_argument("--instance-devices", action="append")
+    parser.add_argument("--candidate-count", type=int, default=15)
+    parser.add_argument("--rollout-count", type=int, default=3)
+    parser.add_argument("--block-size", type=int, default=128)
     args = parser.parse_args()
 
     output = Path(args.output_directory)
     output.mkdir(parents=True, exist_ok=True)
-    capabilities = capability_matrix(args.base_port)
+    device_pairs = args.instance_devices or ["0,1", "2,3"]
+    capabilities = capability_matrix(args.base_port, device_pairs)
     (output / "capabilities.json").write_text(
         json.dumps(capabilities, indent=2) + "\n", encoding="utf-8"
     )
@@ -230,14 +278,12 @@ def main() -> None:
         return
     records = _load_records(Path(args.workload))[: args.limit]
     warmup_records = (
-        _load_records(Path(args.warmup_workload))
-        if args.warmup_workload
-        else []
+        _load_records(Path(args.warmup_workload)) if args.warmup_workload else []
     )
     requested = set(args.topology or ())
     topologies = [
         topology
-        for topology in native_topologies(args.base_port)
+        for topology in native_topologies(args.base_port, device_pairs)
         if not requested or topology.topology_id in requested
     ]
     if requested - {topology.topology_id for topology in topologies}:
@@ -253,6 +299,13 @@ def main() -> None:
             startup_timeout=args.startup_timeout,
             request_timeout=args.request_timeout,
             seed=args.seed,
+            overrides=args.overrides,
+            environment_overrides=args.environment,
+            conditional_overrides={
+                "candidate_count": args.candidate_count,
+                "rollout_count": args.rollout_count,
+                "block_size": args.block_size,
+            },
         )
         for topology in topologies
     ]

@@ -22,6 +22,10 @@ reward_temperature = 1.0
 [reward]
 kind = "sequence_log_probability"
 scale = 1.0
+top_k = 5
+window_fraction = 0.2
+skip_fraction = 0.05
+initial_penalty = 3.0
 
 [runtime]
 backend = "vllm"
@@ -31,6 +35,7 @@ trust_remote_code = true
 
 [vllm]
 asynchronous = true
+async_scheduling = false
 tensor_parallel_size = 2
 pipeline_parallel_size = 1
 data_parallel_size = 1
@@ -42,7 +47,10 @@ enable_prefix_caching = true
 
 [vllm.engine_kwargs]
 enable_chunked_prefill = true
+max_num_partial_prefills = 1
+max_long_partial_prefills = 1
 compilation_config = { cudagraph_mode = "FULL_DECODE_ONLY" }
+additional_config = { enable_cpu_binding = true, ascend_compilation_config = { enable_npugraph_ex = true } }
 profiler_config = {}
 
 [run]

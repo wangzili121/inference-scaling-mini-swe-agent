@@ -59,8 +59,12 @@ def _intersection_duration(
 
 
 def analyze_algorithm_trace(path: Path) -> dict[str, Any]:
+    paths = sorted(path.rglob("*.jsonl")) if path.is_dir() else [path]
     records = [
-        json.loads(line) for line in path.read_text().splitlines() if line.strip()
+        json.loads(line)
+        for source in paths
+        for line in source.read_text().splitlines()
+        if line.strip()
     ]
     stage_values: dict[str, list[float]] = defaultdict(list)
     algorithm_seconds = 0.0
@@ -85,6 +89,7 @@ def analyze_algorithm_trace(path: Path) -> dict[str, Any]:
     }
     return {
         "jobs": len(records),
+        "trace_files": [str(source) for source in paths],
         "algorithm_seconds": algorithm_seconds,
         "stage_seconds": stage_seconds,
         "stage_share": stage_share,
@@ -242,9 +247,7 @@ def _communication_summary(path: Path) -> dict[str, Any]:
 
 def analyze_ascend_profile(path: Path) -> dict[str, Any]:
     kernels = [_kernel_summary(item) for item in path.rglob("kernel_details.csv")]
-    operators = [
-        _operator_summary(item) for item in path.rglob("operator_details.csv")
-    ]
+    operators = [_operator_summary(item) for item in path.rglob("operator_details.csv")]
     communication = [
         _communication_summary(item) for item in path.rglob("communication.json")
     ]
@@ -254,13 +257,17 @@ def analyze_ascend_profile(path: Path) -> dict[str, Any]:
         "operator_ranks": operators,
         "communication": communication,
         "device_busy_ratio": {
-            "minimum": min((item["device_busy_ratio"] for item in kernels), default=0.0),
+            "minimum": min(
+                (item["device_busy_ratio"] for item in kernels), default=0.0
+            ),
             "median": (
                 statistics.median(item["device_busy_ratio"] for item in kernels)
                 if kernels
                 else 0.0
             ),
-            "maximum": max((item["device_busy_ratio"] for item in kernels), default=0.0),
+            "maximum": max(
+                (item["device_busy_ratio"] for item in kernels), default=0.0
+            ),
         },
         "exposed_communication_ratio": (
             sum(item["exposed_communication_us"] for item in kernels)
@@ -268,6 +275,78 @@ def analyze_ascend_profile(path: Path) -> dict[str, Any]:
             if sum(item["communication_us"] for item in kernels)
             else 0.0
         ),
+    }
+
+
+def _numeric_csv_summary(path: Path) -> dict[str, Any]:
+    columns: dict[str, list[float]] = defaultdict(list)
+    rows = 0
+    with path.open(newline="", encoding="utf-8-sig") as stream:
+        for row in csv.DictReader(stream):
+            rows += 1
+            for name, raw in row.items():
+                try:
+                    columns[str(name)].append(float(str(raw).strip()))
+                except (TypeError, ValueError):
+                    continue
+    return {
+        "path": str(path),
+        "rows": rows,
+        "numeric_columns": {
+            name: {
+                "count": len(values),
+                "minimum": min(values),
+                "mean": statistics.fmean(values),
+                "p50": _percentile(values, 0.50),
+                "p75": _percentile(values, 0.75),
+                "p90": _percentile(values, 0.90),
+                "p95": _percentile(values, 0.95),
+                "p99": _percentile(values, 0.99),
+                "maximum": max(values),
+            }
+            for name, values in columns.items()
+            if values
+        },
+    }
+
+
+def analyze_service_profile(path: Path) -> dict[str, Any]:
+    names = {
+        "request.csv",
+        "request_summary.csv",
+        "kvcache.csv",
+        "batch.csv",
+        "batch_summary.csv",
+        "service_summary.csv",
+    }
+    files = [
+        _numeric_csv_summary(item)
+        for item in sorted(path.rglob("*.csv"))
+        if item.name in names
+    ]
+    batch_quantiles: dict[str, Any] = {}
+    for item in files:
+        if Path(item["path"]).name != "batch.csv":
+            continue
+        for column, summary in item["numeric_columns"].items():
+            lowered = column.lower().replace(" ", "_")
+            if any(
+                marker in lowered
+                for marker in (
+                    "batch_size",
+                    "num_request",
+                    "num_seq",
+                    "scheduled_token",
+                    "batch_token",
+                    "running_request",
+                    "waiting_request",
+                )
+            ):
+                batch_quantiles[column] = summary
+    return {
+        "files": files,
+        "batch_shape_quantiles": batch_quantiles,
+        "has_batch_scheduler_evidence": bool(batch_quantiles),
     }
 
 
@@ -335,16 +414,16 @@ def main() -> None:
     benchmark = analyze_benchmark(Path(args.benchmark))
     algorithm = analyze_algorithm_trace(Path(args.algorithm_trace))
     ascend = analyze_ascend_profile(Path(args.npu_profile))
+    service = analyze_service_profile(Path(args.npu_profile))
     result = {
         "schema_version": 1,
         "benchmark": benchmark,
         "algorithm": algorithm,
         "ascend": ascend,
+        "service": service,
         "recommendations": recommendations(benchmark, algorithm, ascend),
     }
-    Path(args.output).write_text(
-        json.dumps(result, indent=2) + "\n", encoding="utf-8"
-    )
+    Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2))
 
 

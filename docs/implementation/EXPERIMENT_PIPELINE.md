@@ -1,5 +1,8 @@
 # Conditional IS SWE-agent experiment pipeline
 
+The current general-tuning and formal profiling protocol is specified in
+[`GENERAL_TUNING_AND_PROFILE.zh-CN.md`](../profiling/GENERAL_TUNING_AND_PROFILE.zh-CN.md).
+
 ## Implemented entry points
 
 All commands use one persistent Conditional IS service. A model call is one
@@ -26,7 +29,7 @@ The trace records the outer job plus candidate, rollout, scoring, reward,
 weight, resample, and block intervals. The same stage names are emitted through
 PyTorch `record_function`, so they are visible in an Ascend/PyTorch profile.
 
-## Reward screen
+## Historical reward screen
 
 The reward screen creates one `C8/R2/B128` first-step rollout pool for each
 proposal temperature and computes sequence-logprob and Consilience values from
@@ -43,7 +46,7 @@ conditional-is-reward-screen \
   --output artifacts/results/reward-screen.json
 ```
 
-## C/R grid
+## Historical C/R grid
 
 The six `C={4,8,15}`, `R={2,3}`, `B=128` arms run against the same resident
 engine and fixed request order. The result includes throughput, P95, forward
@@ -72,10 +75,10 @@ conditional-is-freeze-workload \
 
 ## Two-card runtime tuning
 
-The tuner first chooses a worker count on the baseline, scans the full
-`MNS x MBT x memory` grid, and applies 16/32/64-request successive halving.
-Each measured arm starts a fresh engine. This is intentional: otherwise later
-arms would inherit exact-prefix APC state and gain an unfair advantage.
+The tuner compares TP2 and PP2, applies feature A/B, scans the coarse MNS/MBT
+grid with 16/32/64-request successive halving, expands a winning upper bound,
+and then refines memory, partial-prefill, and saturation concurrency. Each arm
+starts a fresh engine and is checkpointed independently.
 
 ```bash
 conditional-is-runtime-tune \
@@ -86,9 +89,9 @@ conditional-is-runtime-tune \
   --output-directory artifacts/results/tp2-tuning
 ```
 
-Use `--dry-run` first to inspect the exact 36 engine configurations. Hard gates
-are 100% successful requests, no OOM or reported preemption, and P95 no more
-than 1.25 times the round minimum. The final ranking maximizes complete jobs/s.
+Use `--dry-run` first to inspect the staged search. Hard gates are 100%
+successful requests, no OOM or reported preemption, and P95 no more than 1.25
+times the round minimum. The final ranking maximizes complete jobs/s.
 
 ## NPU profiling
 
@@ -102,7 +105,7 @@ conditional-is-profile \
   --config configs/swebench/conditional_is_smoke.toml \
   --workload artifacts/workloads/swe-agent-128/holdout-64.jsonl \
   --warmup-workload artifacts/workloads/warmup.jsonl \
-  --devices 0,1 --workers 64 \
+  --devices 0,1 --workers 64 --profiler torch \
   --set vllm.max_num_seqs=BEST_MNS \
   --set vllm.max_num_batched_tokens=BEST_MBT \
   --output-directory artifacts/profiles/tp2-best

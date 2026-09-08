@@ -1,0 +1,37 @@
+schema_version = 1
+
+[[algorithm]]
+id = "P0"
+candidate_count = 15
+rollout_count = 3
+block_size = 128
+max_new_tokens = 512
+reward = "sequence_log_probability"
+purpose = "full-high-pressure"
+
+[[algorithm]]
+id = "P1"
+candidate_count = 8
+rollout_count = 3
+block_size = 128
+max_new_tokens = 512
+reward = "sequence_log_probability"
+purpose = "medium-candidate"
+
+[[algorithm]]
+id = "P2"
+candidate_count = 4
+rollout_count = 2
+block_size = 128
+max_new_tokens = 512
+reward = "sequence_log_probability"
+purpose = "quick-low-budget"
+
+[[algorithm]]
+id = "P3"
+candidate_count = 15
+rollout_count = 3
+block_size = 128
+max_new_tokens = 512
+reward = "consilience"
+purpose = "reward-statistics-path"

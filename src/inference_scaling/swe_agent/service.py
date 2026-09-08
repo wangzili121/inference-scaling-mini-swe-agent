@@ -202,9 +202,7 @@ class IdempotentQueryCache:
             pending = self._pending.get(request_id)
             if pending is not None:
                 if pending.fingerprint != fingerprint:
-                    raise ValueError(
-                        "request_id is in flight with a different payload"
-                    )
+                    raise ValueError("request_id is in flight with a different payload")
                 owner = False
             else:
                 pending = _PendingQuery(fingerprint, threading.Event())
@@ -216,7 +214,9 @@ class IdempotentQueryCache:
             if pending.error is not None:
                 raise pending.error
             if pending.result is None:
-                raise RuntimeError("coalesced Conditional IS request produced no result")
+                raise RuntimeError(
+                    "coalesced Conditional IS request produced no result"
+                )
             return pending.result
 
         try:
@@ -474,7 +474,16 @@ class ConditionalISRunner:
                 {
                     "name": name,
                     "step": step_index,
+                    "job_id": request_namespace,
+                    "block_id": step_index,
                     "instance_id": self.instance_id,
+                    "rank": int(
+                        os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+                    ),
+                    "start_unix_us": int(
+                        (started_at + max(0, ended_ns - duration_ns - started_ns) / 1e9)
+                        * 1e6
+                    ),
                     "start_us": max(0, ended_ns - duration_ns - started_ns) / 1000,
                     "duration_us": duration_ns / 1000,
                     **dict(metadata),

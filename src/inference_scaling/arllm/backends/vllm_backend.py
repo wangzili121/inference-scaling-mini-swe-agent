@@ -83,8 +83,7 @@ def _validate_mh_fused_vllm_version() -> None:
     installed = Version(importlib.metadata.version("vllm"))
     if not Version("0.26") <= installed < Version("0.27"):
         raise RuntimeError(
-            "MH fused log-probabilities require vLLM >=0.26,<0.27; "
-            f"found {installed}"
+            f"MH fused log-probabilities require vLLM >=0.26,<0.27; found {installed}"
         )
 
 
@@ -140,6 +139,7 @@ class VLLMBackendSnapshot:
     delegated_score_forward_token_slots: int
     delegated_estimated_dense_forward_flops: int
     maximum_in_flight_requests: int
+    active_engine_requests: int = 0
     mh_fused_logprobs: bool = False
     fused_reference_sequences: int = 0
     fused_reference_tokens: int = 0
@@ -385,6 +385,7 @@ class VLLMBackend:
         parameter_count: int | None = None,
         scoring_backend: AutoregressiveBackend | None = None,
         enable_prefix_caching: bool = True,
+        async_scheduling: bool | None = None,
         max_lora_rank: int = 16,
         draft_tree: RolloutTokenTree | None = None,
         speculation: ActiveBatchSpeculationConfig | None = None,
@@ -396,9 +397,7 @@ class VLLMBackend:
             from transformers import AutoTokenizer
             from vllm import LLM
 
-            SamplingParams, TokensPrompt, BeamSearchParams = (
-                _load_vllm_sampling_api()
-            )
+            SamplingParams, TokensPrompt, BeamSearchParams = _load_vllm_sampling_api()
         except ImportError as error:  # pragma: no cover - optional GPU installation
             raise ModuleNotFoundError(
                 "VLLMBackend.from_pretrained requires the project's vllm extra"
@@ -453,6 +452,7 @@ class VLLMBackend:
             "max_model_len": max_model_len,
             "max_num_seqs": max_num_seqs,
             "max_num_batched_tokens": max_num_batched_tokens,
+            "async_scheduling": async_scheduling,
         }
         kwargs.update(
             {name: value for name, value in optional.items() if value is not None}
@@ -476,12 +476,16 @@ class VLLMBackend:
             kwargs.update(engine_kwargs)
         previous_v2_runner = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
         if enable_mh_fused_logprobs:
-            if previous_v2_runner is not None and previous_v2_runner.strip().lower() in {
+            if (
+                previous_v2_runner is not None
+                and previous_v2_runner.strip().lower()
+                in {
                     "1",
                     "true",
                     "yes",
                     "on",
-            }:
+                }
+            ):
                 raise ValueError(
                     "MH fused log-probabilities conflict with "
                     "VLLM_USE_V2_MODEL_RUNNER=1"
@@ -793,7 +797,10 @@ class VLLMBackend:
                 if not isinstance(position, Mapping):
                     raise RuntimeError("vLLM top-K log-probabilities must be a mapping")
                 logprobs = sorted(
-                    (float(getattr(value, "logprob", value)) for value in position.values()),
+                    (
+                        float(getattr(value, "logprob", value))
+                        for value in position.values()
+                    ),
                     reverse=True,
                 )
                 effective = request.confidence_top_k
@@ -825,9 +832,7 @@ class VLLMBackend:
                         )
                 reference_values = tuple(parsed_reference)
 
-        reference_sampling = SamplingConfig(
-            eos_token_id=request.sampling.eos_token_id
-        )
+        reference_sampling = SamplingConfig(eos_token_id=request.sampling.eos_token_id)
         if reference_values is None and request.sampling == reference_sampling:
             reference_values = token_logprobs
         if reference_values is not None:
@@ -1186,6 +1191,7 @@ class VLLMBackend:
                     self._delegated_estimated_dense_forward_flops
                 ),
                 maximum_in_flight_requests=self._maximum_in_flight_requests,
+                active_engine_requests=self._active_engine_requests,
                 mh_fused_logprobs=self._mh_fused_logprobs,
                 fused_reference_sequences=self._fused_reference_sequences,
                 fused_reference_tokens=self._fused_reference_tokens,
@@ -1386,6 +1392,7 @@ class AsyncVLLMBackend(VLLMBackend):
         parameter_count: int | None = None,
         scoring_backend: AutoregressiveBackend | None = None,
         enable_prefix_caching: bool = True,
+        async_scheduling: bool | None = None,
         max_lora_rank: int = 16,
         draft_tree: RolloutTokenTree | None = None,
         speculation: ActiveBatchSpeculationConfig | None = None,
@@ -1397,9 +1404,7 @@ class AsyncVLLMBackend(VLLMBackend):
             from vllm.engine.arg_utils import AsyncEngineArgs
             from vllm.v1.engine.async_llm import AsyncLLM
 
-            SamplingParams, TokensPrompt, BeamSearchParams = (
-                _load_vllm_sampling_api()
-            )
+            SamplingParams, TokensPrompt, BeamSearchParams = _load_vllm_sampling_api()
         except ImportError as error:  # pragma: no cover - optional GPU installation
             raise ModuleNotFoundError(
                 "AsyncVLLMBackend.from_pretrained requires the project's vllm extra"
@@ -1439,6 +1444,7 @@ class AsyncVLLMBackend(VLLMBackend):
             "max_model_len": max_model_len,
             "max_num_seqs": max_num_seqs,
             "max_num_batched_tokens": max_num_batched_tokens,
+            "async_scheduling": async_scheduling,
         }
         kwargs.update(
             {name: value for name, value in optional.items() if value is not None}
@@ -1506,7 +1512,9 @@ class AsyncVLLMBackend(VLLMBackend):
         async def start() -> None:
             callback = getattr(self._engine, "start_profile", None)
             if callback is None:
-                raise RuntimeError("this AsyncLLM frontend does not expose start_profile")
+                raise RuntimeError(
+                    "this AsyncLLM frontend does not expose start_profile"
+                )
             result = callback(profile_prefix)
             if inspect.isawaitable(result):
                 await result
@@ -1517,7 +1525,9 @@ class AsyncVLLMBackend(VLLMBackend):
         async def stop() -> None:
             callback = getattr(self._engine, "stop_profile", None)
             if callback is None:
-                raise RuntimeError("this AsyncLLM frontend does not expose stop_profile")
+                raise RuntimeError(
+                    "this AsyncLLM frontend does not expose stop_profile"
+                )
             result = callback()
             if inspect.isawaitable(result):
                 await result
