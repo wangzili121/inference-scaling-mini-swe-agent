@@ -38,6 +38,11 @@ are merely runnable starting values.
 5. Sample-aware sequence-logprob and Consilience rewards. They reuse the
    generation forward only when model and policy identities match; otherwise
    they fall back to exact scoring.
+6. Fixed-workload reward, C/R, burst, and two-card successive-halving tools,
+   plus stage-level trace annotations and TP/PP engine configuration support.
+
+The exact command sequence is documented in
+[`EXPERIMENT_PIPELINE.md`](EXPERIMENT_PIPELINE.md).
 
 ## Remaining experiment gates
 

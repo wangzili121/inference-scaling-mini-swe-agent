@@ -48,6 +48,7 @@ from inference_scaling.arllm.types import (
 _PROTECTED_ENGINE_KWARGS = frozenset(
     {
         "model",
+        "pipeline_parallel_size",
         "dtype",
         "tensor_parallel_size",
         "data_parallel_size",
@@ -368,6 +369,7 @@ class VLLMBackend:
         adapter_name_or_path: str | None = None,
         dtype: str = "bfloat16",
         tensor_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
         data_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         max_model_len: int | None = None,
@@ -425,6 +427,7 @@ class VLLMBackend:
             "model": base_model,
             "dtype": dtype,
             "tensor_parallel_size": int(tensor_parallel_size),
+            "pipeline_parallel_size": int(pipeline_parallel_size),
             "data_parallel_size": int(data_parallel_size),
             "gpu_memory_utilization": float(gpu_memory_utilization),
             "quantization": quantization,
@@ -473,10 +476,10 @@ class VLLMBackend:
         previous_v2_runner = os.environ.get("VLLM_USE_V2_MODEL_RUNNER")
         if enable_mh_fused_logprobs:
             if previous_v2_runner is not None and previous_v2_runner.strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
             }:
                 raise ValueError(
                     "MH fused log-probabilities conflict with "
@@ -1342,6 +1345,7 @@ class AsyncVLLMBackend(VLLMBackend):
         adapter_name_or_path: str | None = None,
         dtype: str = "bfloat16",
         tensor_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
         data_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.9,
         max_model_len: int | None = None,
@@ -1390,6 +1394,7 @@ class AsyncVLLMBackend(VLLMBackend):
             "model": model_name_or_path,
             "dtype": dtype,
             "tensor_parallel_size": int(tensor_parallel_size),
+            "pipeline_parallel_size": int(pipeline_parallel_size),
             "data_parallel_size": int(data_parallel_size),
             "gpu_memory_utilization": float(gpu_memory_utilization),
             "quantization": quantization,

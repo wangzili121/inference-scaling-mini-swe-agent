@@ -7,7 +7,10 @@ import pytest
 
 from inference_scaling.arllm.backends import TabularAutoregressiveBackend
 from inference_scaling.swe_agent.model import ConditionalISModel
-from inference_scaling.swe_agent.service import ConditionalISRunner, load_service_config
+from inference_scaling.swe_agent.service import (
+    ConditionalISRunner,
+    load_service_config,
+)
 from inference_scaling.swe_agent.tool_calls import (
     ToolCallParseError,
     parse_assistant_text,
@@ -154,3 +157,36 @@ def test_service_config_expands_required_model_path(
     monkeypatch.setenv("MODEL_ROOT", "/models")
 
     assert load_service_config(source)["models"]["base"] == "/models/model"
+
+
+def test_service_config_applies_existing_typed_overrides(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "service.toml"
+    source.write_text(
+        """
+[models]
+base = "${MODEL_ROOT}/model"
+[generation]
+max_new_tokens = 2
+[sampling]
+temperature = 1.0
+[conditional_is]
+candidate_count = 2
+[reward]
+kind = "sequence_log_probability"
+[vllm]
+max_num_seqs = 128
+""".strip()
+    )
+    monkeypatch.setenv("MODEL_ROOT", "/models")
+
+    config = load_service_config(
+        source,
+        overrides=("vllm.max_num_seqs=256", "sampling.temperature=0.7"),
+    )
+
+    assert config["vllm"]["max_num_seqs"] == 256
+    assert config["sampling"]["temperature"] == 0.7
+    with pytest.raises(ValueError, match="does not exist"):
+        load_service_config(source, overrides=("vllm.unknown=1",))

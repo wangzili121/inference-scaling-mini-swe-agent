@@ -8,7 +8,8 @@ import re
 import threading
 import time
 import tomllib
-from dataclasses import asdict, dataclass, is_dataclass
+from collections import defaultdict
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -62,10 +63,45 @@ def _expand_environment(value: Any) -> Any:
     return value
 
 
-def load_service_config(path: str | Path) -> dict[str, Any]:
+def _apply_config_overrides(
+    config: dict[str, Any], overrides: Sequence[str]
+) -> dict[str, Any]:
+    for override in overrides:
+        if "=" not in override:
+            raise ValueError(
+                f"configuration override requires path=value: {override!r}"
+            )
+        path, raw_value = override.split("=", 1)
+        keys = path.split(".")
+        if not keys or any(not key for key in keys):
+            raise ValueError(f"invalid configuration path: {path!r}")
+        try:
+            value = json.loads(raw_value)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"configuration override values must be JSON: {override!r}"
+            ) from error
+        table: dict[str, Any] = config
+        for key in keys[:-1]:
+            nested = table.get(key)
+            if not isinstance(nested, dict):
+                raise ValueError(
+                    f"configuration override path is not a table: {path!r}"
+                )
+            table = nested
+        if keys[-1] not in table:
+            raise ValueError(f"configuration override path does not exist: {path!r}")
+        table[keys[-1]] = value
+    return config
+
+
+def load_service_config(
+    path: str | Path, *, overrides: Sequence[str] = ()
+) -> dict[str, Any]:
     source = Path(path)
     with source.open("rb") as stream:
         config = _expand_environment(tomllib.load(stream))
+    _apply_config_overrides(config, overrides)
     if not isinstance(config.get("models", {}).get("base"), str):
         raise ValueError("service config requires models.base")
     for table in ("generation", "sampling", "conditional_is", "reward"):
@@ -109,6 +145,17 @@ def _counter_delta(
 class QueryResult:
     message: dict[str, Any]
     diagnostics: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class CISExecution:
+    prompt: tuple[int, ...]
+    result: Any
+    algorithm_seconds: float
+    total_seconds: float
+    backend_delta: dict[str, Any]
+    stage_events: tuple[dict[str, Any], ...]
+    conditional: dict[str, int]
 
 
 class JsonlTraceWriter:
@@ -168,12 +215,17 @@ class ConditionalISRunner:
         else:
             raise ValueError(f"unsupported agent reward {reward_kind!r}")
         service = dict(config.get("service", {}))
+        self.instance_id = str(
+            service.get("instance_id", os.environ.get("CIS_INSTANCE_ID", "instance-0"))
+        )
         trace_path = service.get("trace_path")
         self.trace_writer = JsonlTraceWriter(trace_path) if trace_path else None
 
     @classmethod
-    def from_toml(cls, path: str | Path) -> "ConditionalISRunner":
-        config = load_service_config(path)
+    def from_toml(
+        cls, path: str | Path, *, overrides: Sequence[str] = ()
+    ) -> "ConditionalISRunner":
+        config = load_service_config(path, overrides=overrides)
         backend = load_backend_from_config(str(config["models"]["base"]), config)
         return cls(backend, config)
 
@@ -193,31 +245,15 @@ class ConditionalISRunner:
         *,
         request_id: str,
         seed: int,
+        conditional_overrides: Mapping[str, int] | None = None,
     ) -> QueryResult:
-        started = time.perf_counter()
-        prompt = self._prompt_tokens(messages)
-        configured_max = self.config.get("vllm", {}).get("max_model_len")
-        if configured_max is not None and len(prompt) + self.maximum > int(
-            configured_max
-        ):
-            raise ValueError(
-                f"prompt ({len(prompt)}) plus generation ({self.maximum}) exceeds "
-                f"max_model_len={configured_max}"
-            )
-        before = _snapshot(self.backend)
-        algorithm_started = time.perf_counter()
-        result = run_conditional_is(
-            self.backend,
-            prompt,
-            self.conditional,
-            self.reward,
-            SeedStream(seed),
-            base_sampling=self.sampling,
-            rollout_backend=self.backend,
-            rollout_sampling=self.sampling,
+        execution = self.execute(
+            messages,
+            seed=seed,
+            request_namespace=request_id,
+            conditional_overrides=conditional_overrides,
         )
-        algorithm_seconds = time.perf_counter() - algorithm_started
-        after = _snapshot(self.backend)
+        result = execution.result
         text = self.backend.decode(result.token_ids, skip_special_tokens=False)
         parsed = parse_assistant_text(text, request_id=request_id)
         candidate_ess = [
@@ -226,19 +262,22 @@ class ConditionalISRunner:
             )
             for step in result.steps
         ]
+        stage_seconds: dict[str, float] = defaultdict(float)
+        for event in execution.stage_events:
+            stage_seconds[str(event["name"])] += float(event["duration_us"]) / 1e6
         diagnostics = {
             "request_id": request_id,
             "seed": seed,
-            "prompt_tokens": len(prompt),
+            "prompt_tokens": len(execution.prompt),
             "completion_tokens": len(result.token_ids),
-            "algorithm_seconds": algorithm_seconds,
-            "total_seconds": time.perf_counter() - started,
+            "algorithm_seconds": execution.algorithm_seconds,
+            "total_seconds": execution.total_seconds,
             "steps": len(result.steps),
-            "candidate_count": self.conditional.candidate_count,
-            "rollout_count": self.conditional.rollout_count,
-            "block_size": self.conditional.block_size,
+            **execution.conditional,
             "candidate_ess": candidate_ess,
-            "backend_delta": _counter_delta(before, after),
+            "instance_id": self.instance_id,
+            "stage_seconds": dict(stage_seconds),
+            "backend_delta": execution.backend_delta,
             "finish_reason": (
                 "eos" if self.sampling.eos_token_id in result.token_ids else "length"
             ),
@@ -261,12 +300,97 @@ class ConditionalISRunner:
                     "schema_version": 1,
                     "request_id": request_id,
                     "messages": list(messages),
-                    "prompt_token_ids": prompt,
+                    "prompt_token_ids": execution.prompt,
                     "message": message,
                     "diagnostics": diagnostics,
+                    "stage_events": list(execution.stage_events),
                 }
             )
         return QueryResult(message=message, diagnostics=diagnostics)
+
+    def execute(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        seed: int,
+        request_namespace: str = "conditional-is",
+        conditional_overrides: Mapping[str, int] | None = None,
+    ) -> CISExecution:
+        """Run one complete CIS job without parsing its selected assistant text."""
+
+        started = time.perf_counter()
+        started_ns = time.perf_counter_ns()
+        stage_events: list[dict[str, Any]] = []
+
+        def observe_stage(
+            name: str,
+            step_index: int,
+            seconds: float,
+            metadata: Mapping[str, Any],
+        ) -> None:
+            ended_ns = time.perf_counter_ns()
+            duration_ns = max(0, int(seconds * 1e9))
+            stage_events.append(
+                {
+                    "name": name,
+                    "step": step_index,
+                    "instance_id": self.instance_id,
+                    "start_us": max(0, ended_ns - duration_ns - started_ns) / 1000,
+                    "duration_us": duration_ns / 1000,
+                    **dict(metadata),
+                }
+            )
+
+        prompt = self._prompt_tokens(messages)
+        configured_max = self.config.get("vllm", {}).get("max_model_len")
+        if configured_max is not None and len(prompt) + self.maximum > int(
+            configured_max
+        ):
+            raise ValueError(
+                f"prompt ({len(prompt)}) plus generation ({self.maximum}) exceeds "
+                f"max_model_len={configured_max}"
+            )
+        before = _snapshot(self.backend)
+        algorithm_started = time.perf_counter()
+        conditional = self.conditional
+        if conditional_overrides:
+            allowed = {"candidate_count", "rollout_count", "block_size"}
+            unknown = sorted(set(conditional_overrides) - allowed)
+            if unknown:
+                raise ValueError(
+                    "unsupported Conditional IS query overrides: " + ", ".join(unknown)
+                )
+            conditional = replace(
+                conditional,
+                **{key: int(value) for key, value in conditional_overrides.items()},
+            )
+        result = run_conditional_is(
+            self.backend,
+            prompt,
+            conditional,
+            self.reward,
+            SeedStream(seed),
+            base_sampling=self.sampling,
+            rollout_backend=self.backend,
+            rollout_sampling=self.sampling,
+            request_namespace=request_namespace,
+            stage_observer=observe_stage,
+        )
+        algorithm_seconds = time.perf_counter() - algorithm_started
+        after = _snapshot(self.backend)
+        return CISExecution(
+            prompt=prompt,
+            result=result,
+            algorithm_seconds=algorithm_seconds,
+            total_seconds=time.perf_counter() - started,
+            backend_delta=_counter_delta(before, after),
+            stage_events=tuple(stage_events),
+            conditional={
+                "candidate_count": conditional.candidate_count,
+                "rollout_count": conditional.rollout_count,
+                "block_size": conditional.block_size,
+            },
+        )
 
     def close(self) -> None:
         close_backend(self.backend)
@@ -274,8 +398,10 @@ class ConditionalISRunner:
 
 __all__ = [
     "BASH_TOOL",
+    "CISExecution",
     "ConditionalISRunner",
     "JsonlTraceWriter",
     "QueryResult",
+    "_apply_config_overrides",
     "load_service_config",
 ]

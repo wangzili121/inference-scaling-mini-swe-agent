@@ -57,7 +57,9 @@ def test_loader_builds_one_active_batch_schedule_for_both_backends(monkeypatch) 
     monkeypatch.setattr(
         loader.TransformersBackend,
         "from_pretrained",
-        lambda model, **kwargs: transformer_calls.append((model, kwargs)) or "transformers",
+        lambda model, **kwargs: (
+            transformer_calls.append((model, kwargs)) or "transformers"
+        ),
     )
     assert loader.load_backend_from_config("base-model", config) == "transformers"
     schedule = transformer_calls[0][1]["speculation"]
@@ -93,6 +95,7 @@ def test_async_vllm_loader_merges_role_settings_and_exact_scorer(monkeypatch) ->
         "dtype": "bfloat16",
         "gpu_memory_utilization": 0.7,
         "max_num_seqs": 32,
+        "pipeline_parallel_size": 2,
         "engine_kwargs": {"enable_chunked_prefill": True},
         "proposal": {
             "gpu_memory_utilization": 0.2,
@@ -114,7 +117,9 @@ def test_async_vllm_loader_merges_role_settings_and_exact_scorer(monkeypatch) ->
         vllm_calls.append((model, kwargs))
         return "async-vllm"
 
-    monkeypatch.setattr(loader.TransformersBackend, "from_pretrained", fake_transformers)
+    monkeypatch.setattr(
+        loader.TransformersBackend, "from_pretrained", fake_transformers
+    )
     monkeypatch.setattr(loader.AsyncVLLMBackend, "from_pretrained", fake_vllm)
 
     result = loader.load_backend_from_config("proposal-model", config)
@@ -125,6 +130,7 @@ def test_async_vllm_loader_merges_role_settings_and_exact_scorer(monkeypatch) ->
     assert vllm_calls[0][1]["scoring_backend"] is exact
     assert vllm_calls[0][1]["gpu_memory_utilization"] == 0.2
     assert vllm_calls[0][1]["max_num_seqs"] == 8
+    assert vllm_calls[0][1]["pipeline_parallel_size"] == 2
     assert vllm_calls[0][1]["dtype"] == "bfloat16"
     assert vllm_calls[0][1]["seed"] == 17
     assert vllm_calls[0][1]["engine_kwargs"] == {

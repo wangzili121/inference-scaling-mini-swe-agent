@@ -39,10 +39,16 @@ def _handler(runner: ConditionalISRunner) -> type[BaseHTTPRequestHandler]:
                 messages = payload["messages"]
                 request_id = str(payload["request_id"])
                 seed = int(payload["seed"])
+                conditional_overrides = payload.get("conditional_is")
+                if conditional_overrides is not None and not isinstance(
+                    conditional_overrides, dict
+                ):
+                    raise TypeError("conditional_is must be an object")
                 result = runner.query(
                     messages,
                     request_id=request_id,
                     seed=seed,
+                    conditional_overrides=conditional_overrides,
                 )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
@@ -69,8 +75,9 @@ def main() -> None:
     parser.add_argument("--config", required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8123)
+    parser.add_argument("--set", dest="overrides", action="append", default=[])
     args = parser.parse_args()
-    runner = ConditionalISRunner.from_toml(args.config)
+    runner = ConditionalISRunner.from_toml(args.config, overrides=args.overrides)
     server = ThreadingHTTPServer((args.host, args.port), _handler(runner))
 
     def stop(_signum: int, _frame: Any) -> None:

@@ -53,6 +53,11 @@ swebench = [
 
 [project.scripts]
 conditional-is-serve = "inference_scaling.swe_agent.server:main"
+conditional-is-freeze-workload = "inference_scaling.swe_agent.workload:main"
+conditional-is-benchmark = "inference_scaling.swe_agent.benchmark:main"
+conditional-is-reward-screen = "inference_scaling.swe_agent.reward_screen:main"
+conditional-is-algorithm-grid = "inference_scaling.swe_agent.algorithm_grid:main"
+conditional-is-runtime-tune = "inference_scaling.swe_agent.runtime_tune:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

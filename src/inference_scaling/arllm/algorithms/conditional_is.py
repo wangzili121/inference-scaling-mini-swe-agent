@@ -13,9 +13,13 @@ each candidate's future reward weighting under the rollout proposal itself.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from math import exp, isfinite, log
+from time import perf_counter
+from typing import Any
 
 from inference_scaling.arllm.config import ConditionalISConfig, SamplingConfig
 from inference_scaling.shared.importance import (
@@ -43,6 +47,37 @@ from inference_scaling.arllm.types import (
 
 RewardFunction = TokenReward
 RewardBatchFunction = TokenBatchReward
+StageObserver = Callable[[str, int, float, Mapping[str, Any]], None]
+
+
+@lru_cache(maxsize=1)
+def _record_function_factory() -> Any | None:
+    try:
+        from torch.autograd.profiler import record_function
+    except (ImportError, ModuleNotFoundError):
+        return None
+    return record_function
+
+
+@contextmanager
+def _profile_range(name: str):
+    factory = _record_function_factory()
+    if factory is None:
+        yield
+        return
+    with factory(f"conditional_is.{name}"):
+        yield
+
+
+def _observe_stage(
+    observer: StageObserver | None,
+    name: str,
+    step_index: int,
+    started: float,
+    **metadata: Any,
+) -> None:
+    if observer is not None:
+        observer(name, step_index, perf_counter() - started, metadata)
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +91,7 @@ class RolloutEvaluation:
     log_weight: float
     proposal_model_id: str
     proposal_policy_id: str
+    generation_statistics: GeneratedSequenceStatistics | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +182,8 @@ def _sample_candidates(
     seeds: SeedStream,
     step_index: int,
     confidence_top_k: int | None = None,
+    request_namespace: str = "conditional-is",
+    stage_observer: StageObserver | None = None,
 ) -> list[SequenceSample]:
     requests = [
         GenerationRequest(
@@ -155,12 +193,25 @@ def _sample_candidates(
             seed=seeds.derive(
                 "conditional_is", step_index, "candidate", candidate_index
             ),
-            request_id=f"conditional-is:step:{step_index}:candidate:{candidate_index}",
+            request_id=(
+                f"{request_namespace}:step:{step_index}:candidate:{candidate_index}"
+            ),
             confidence_top_k=confidence_top_k,
         )
         for candidate_index in range(count)
     ]
-    candidates = base_backend.sample_batch(requests)
+    started = perf_counter()
+    with _profile_range("candidate"):
+        candidates = base_backend.sample_batch(requests)
+    _observe_stage(
+        stage_observer,
+        "candidate",
+        step_index,
+        started,
+        sequence_count=count,
+        block_length=block_length,
+        prefix_tokens=len(prefix),
+    )
     if len(candidates) != count:
         raise RuntimeError("backend returned an invalid number of candidates")
     for candidate in candidates:
@@ -197,6 +248,8 @@ def estimate_conditional_weights(
     rollout_design: str = "iid",
     rollout_index_offset: int = 0,
     generated_prefix_statistics: GeneratedSequenceStatistics | None = None,
+    request_namespace: str = "conditional-is",
+    stage_observer: StageObserver | None = None,
 ) -> tuple[ConditionalCandidate, ...]:
     """Estimate each candidate's conditional weight with on/off-policy rollouts."""
 
@@ -290,7 +343,7 @@ def estimate_conditional_weights(
                         global_rollout_index,
                     ),
                     request_id=(
-                        "conditional-is:"
+                        f"{request_namespace}:"
                         f"step:{step_index}:candidate:{candidate_index}:"
                         f"rollout:{global_rollout_index}"
                     ),
@@ -302,7 +355,18 @@ def estimate_conditional_weights(
             request_candidates.append(candidate_index)
             rollout_prefixes.append(rollout_prefix)
 
-    samples = rollout_backend.sample_batch(requests) if requests else []
+    rollout_started = perf_counter()
+    with _profile_range("rollout"):
+        samples = rollout_backend.sample_batch(requests) if requests else []
+    _observe_stage(
+        stage_observer,
+        "rollout",
+        step_index,
+        rollout_started,
+        sequence_count=len(requests),
+        rollout_length=rollout_length,
+        prefix_tokens=(len(rollout_prefixes[0]) if rollout_prefixes else 0),
+    )
     if len(samples) != len(requests):
         raise RuntimeError("backend returned an invalid number of rollouts")
     if rollout_backend is not base_backend:
@@ -316,15 +380,25 @@ def estimate_conditional_weights(
     if rollout_is_base_policy:
         base_totals: list[float | None] = [sample.logprob for sample in samples]
     elif apply_importance_correction:
-        base_totals = (
-            _score_samples(
-                base_backend,
-                rollout_prefixes,
-                samples,
-                base_sampling,
+        scoring_started = perf_counter()
+        with _profile_range("scoring"):
+            base_totals = (
+                _score_samples(
+                    base_backend,
+                    rollout_prefixes,
+                    samples,
+                    base_sampling,
+                )
+                if samples
+                else []
             )
-            if samples
-            else []
+        _observe_stage(
+            stage_observer,
+            "scoring",
+            step_index,
+            scoring_started,
+            sequence_count=len(samples),
+            token_count=sum(len(sample.token_ids) for sample in samples),
         )
     else:
         # This is a deliberate biased ablation, not an IS estimate of the base
@@ -399,31 +473,43 @@ def estimate_conditional_weights(
     pending = [item for group in pending_by_candidate for item in group]
     generated_statistics = [item[-1] for item in pending]
     generated_sequences = [item.token_ids for item in generated_statistics]
-    if reward_batch is not None:
-        rewards = tuple(
-            float(value) for value in reward_batch(prompt, generated_sequences)
-        )
-        if len(rewards) != len(pending):
-            raise ValueError("reward_batch returned an invalid number of rewards")
-    else:
-        assert reward is not None
-        statistics_batch = getattr(reward, "batch_statistics", None)
-        if callable(statistics_batch):
+    reward_started = perf_counter()
+    with _profile_range("reward"):
+        if reward_batch is not None:
             rewards = tuple(
-                float(value)
-                for value in statistics_batch(prompt, generated_statistics)
+                float(value) for value in reward_batch(prompt, generated_sequences)
             )
             if len(rewards) != len(pending):
-                raise ValueError(
-                    "sample-aware reward returned an invalid number of rewards"
-                )
+                raise ValueError("reward_batch returned an invalid number of rewards")
         else:
-            rewards = tuple(
-                float(reward(prompt, generated)) for generated in generated_sequences
-            )
+            assert reward is not None
+            statistics_batch = getattr(reward, "batch_statistics", None)
+            if callable(statistics_batch):
+                rewards = tuple(
+                    float(value)
+                    for value in statistics_batch(prompt, generated_statistics)
+                )
+                if len(rewards) != len(pending):
+                    raise ValueError(
+                        "sample-aware reward returned an invalid number of rewards"
+                    )
+            else:
+                rewards = tuple(
+                    float(reward(prompt, generated))
+                    for generated in generated_sequences
+                )
+    _observe_stage(
+        stage_observer,
+        "reward",
+        step_index,
+        reward_started,
+        sequence_count=len(pending),
+        fused_statistics=callable(getattr(reward, "batch_statistics", None)),
+    )
     if any(not isfinite(value) for value in rewards):
         raise ValueError("reward must be finite")
 
+    weighting_started = perf_counter()
     importance_weights = MonteCarloRolloutWeightProvider[
         tuple[TokenSequence, str, str]
     ](
@@ -447,7 +533,7 @@ def estimate_conditional_weights(
             model_id,
             policy_id,
             _,
-            _,
+            statistics,
         ) in group:
             reward_value = rewards[reward_index]
             reward_index += 1
@@ -473,6 +559,7 @@ def estimate_conditional_weights(
                     log_weight=weighted.log_weight,
                     proposal_model_id=model_id,
                     proposal_policy_id=policy_id,
+                    generation_statistics=statistics,
                 )
             )
 
@@ -497,7 +584,16 @@ def estimate_conditional_weights(
                 base_confidence_top_k=candidate.confidence_top_k,
             )
         )
-    return tuple(evaluated)
+    result = tuple(evaluated)
+    _observe_stage(
+        stage_observer,
+        "weight",
+        step_index,
+        weighting_started,
+        candidate_count=len(candidates),
+        rollout_evaluations=len(pending),
+    )
+    return result
 
 
 class AutoregressiveStepwiseAdapter:
@@ -514,6 +610,8 @@ class AutoregressiveStepwiseAdapter:
         rollout_sampling: SamplingConfig,
         reward: RewardFunction | None,
         reward_batch: RewardBatchFunction | None = None,
+        request_namespace: str = "conditional-is",
+        stage_observer: StageObserver | None = None,
     ) -> None:
         self.base_backend = base_backend
         self.rollout_backend = rollout_backend
@@ -523,9 +621,12 @@ class AutoregressiveStepwiseAdapter:
         self.rollout_sampling = rollout_sampling
         self.reward = reward
         self.reward_batch = reward_batch
-        self._statistics_by_state: dict[
-            TokenSequence, GeneratedSequenceStatistics
-        ] = {(): GeneratedSequenceStatistics()}
+        self.request_namespace = request_namespace
+        self.stage_observer = stage_observer
+        self._step_started: dict[int, float] = {}
+        self._statistics_by_state: dict[TokenSequence, GeneratedSequenceStatistics] = {
+            (): GeneratedSequenceStatistics()
+        }
 
     @property
     def initial_state(self) -> TokenSequence:
@@ -543,6 +644,7 @@ class AutoregressiveStepwiseAdapter:
         step_index: int,
         seeds: SeedStream,
     ) -> Sequence[SequenceSample]:
+        self._step_started[step_index] = perf_counter()
         _validate_base_sampling(self.base_sampling)
         remaining = self.config.total_length - len(state)
         if remaining <= 0:
@@ -555,9 +657,9 @@ class AutoregressiveStepwiseAdapter:
             self.base_sampling,
             seeds,
             step_index,
-            confidence_top_k=getattr(
-                self.reward, "generation_confidence_top_k", None
-            ),
+            confidence_top_k=getattr(self.reward, "generation_confidence_top_k", None),
+            request_namespace=self.request_namespace,
+            stage_observer=self.stage_observer,
         )
 
     def evaluate(
@@ -588,6 +690,8 @@ class AutoregressiveStepwiseAdapter:
             reward_batch=self.reward_batch,
             rollout_design=self.config.rollout_design,
             generated_prefix_statistics=self._statistics_by_state.get(state),
+            request_namespace=self.request_namespace,
+            stage_observer=self.stage_observer,
         )
         return tuple(
             StepwiseCandidate(candidate, candidate.log_weight)
@@ -600,7 +704,7 @@ class AutoregressiveStepwiseAdapter:
         selected: ConditionalCandidate,
         step_index: int,
     ) -> TokenSequence:
-        del step_index
+        started = perf_counter()
         generated = state + selected.token_ids
         previous = self._statistics_by_state.get(state)
         if previous is not None:
@@ -615,6 +719,23 @@ class AutoregressiveStepwiseAdapter:
         eos = self.base_sampling.eos_token_id
         if eos is not None and eos in generated:
             generated = generated[: generated.index(eos) + 1]
+        _observe_stage(
+            self.stage_observer,
+            "resample",
+            step_index,
+            started,
+            selected_tokens=len(selected.token_ids),
+        )
+        block_started = self._step_started.pop(step_index, None)
+        if block_started is not None:
+            _observe_stage(
+                self.stage_observer,
+                "block",
+                step_index,
+                block_started,
+                generated_tokens_before=len(state),
+                generated_tokens_after=len(generated),
+            )
         return generated
 
 
@@ -631,6 +752,8 @@ def _bounded_conditional_is_step(
     seeds: SeedStream,
     step_index: int,
     reward_batch: RewardBatchFunction | None,
+    request_namespace: str = "conditional-is",
+    stage_observer: StageObserver | None = None,
 ) -> ConditionalISStep:
     """Evaluate rollout batches until the fixed categorical choice is known."""
 
@@ -656,6 +779,8 @@ def _bounded_conditional_is_step(
         seeds,
         step_index,
         confidence_top_k=getattr(reward, "generation_confidence_top_k", None),
+        request_namespace=request_namespace,
+        stage_observer=stage_observer,
     )
     rollout_length = max(0, remaining_length - len(proposals[0].token_ids))
     eos = rollout_sampling.eos_token_id
@@ -714,6 +839,8 @@ def _bounded_conditional_is_step(
             step_index=step_index,
             rollout_design="iid",
             rollout_index_offset=rollout_offset,
+            request_namespace=request_namespace,
+            stage_observer=stage_observer,
         )
         evaluation_batches += 1
         for candidate_index, evaluated in enumerate(batch):
@@ -817,6 +944,8 @@ def conditional_is_step(
     seeds: SeedStream,
     step_index: int,
     reward_batch: RewardBatchFunction | None = None,
+    request_namespace: str = "conditional-is",
+    stage_observer: StageObserver | None = None,
 ) -> ConditionalISStep:
     if config.exact_rollout_early_stop:
         return _bounded_conditional_is_step(
@@ -831,6 +960,8 @@ def conditional_is_step(
             seeds=seeds,
             step_index=step_index,
             reward_batch=reward_batch,
+            request_namespace=request_namespace,
+            stage_observer=stage_observer,
         )
     adapter = AutoregressiveStepwiseAdapter(
         base_backend=base_backend,
@@ -841,6 +972,8 @@ def conditional_is_step(
         rollout_sampling=rollout_sampling,
         reward=reward,
         reward_batch=reward_batch,
+        request_namespace=request_namespace,
+        stage_observer=stage_observer,
     )
     selection = stepwise_generation_step(
         adapter,
@@ -872,6 +1005,8 @@ def run_conditional_is(
     rollout_backend: AutoregressiveBackend | None = None,
     rollout_sampling: SamplingConfig | None = None,
     reward_batch: RewardBatchFunction | None = None,
+    request_namespace: str = "conditional-is",
+    stage_observer: StageObserver | None = None,
 ) -> ConditionalISResult:
     """Generate a sequence by repeatedly applying finite conditional-IS steps."""
 
@@ -903,6 +1038,8 @@ def run_conditional_is(
                 seeds=seeds,
                 step_index=step_index,
                 reward_batch=reward_batch,
+                request_namespace=request_namespace,
+                stage_observer=stage_observer,
             )
             generated += step.selected.token_ids
             if eos is not None and eos in generated:
@@ -924,6 +1061,8 @@ def run_conditional_is(
         rollout_sampling=rollout_sampling,
         reward=reward,
         reward_batch=reward_batch,
+        request_namespace=request_namespace,
+        stage_observer=stage_observer,
     )
     generic = run_stepwise_generation(
         adapter,
