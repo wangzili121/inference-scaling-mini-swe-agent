@@ -40,6 +40,19 @@ conditional-is-swebench --count 3 --output artifacts/swebench/smoke-3
 ```
 
 The launcher rejects any mini-SWE-agent version other than v2.4.6, fixes the
-Verified `test` split, checks the Conditional IS service and Docker daemon, and
-records its resolved command in the output directory. Use `--dry-run` to inspect
-that manifest without contacting the service or dataset.
+Verified `test` split at dataset revision `c104f840`, checks the Conditional IS
+service and Docker daemon, and records the exact ordered task IDs in the output
+directory. Use `--dry-run` to inspect the selection without contacting the
+service or Docker.
+
+Evaluate generated patches with the pinned official SWE-bench harness:
+
+```bash
+conditional-is-evaluate \
+  --run-directory artifacts/swebench/smoke-3 \
+  --report-directory artifacts/swebench/evaluation \
+  --workers 2
+```
+
+The evaluator rejects missing predictions and mismatched dataset revisions
+before starting any test container.

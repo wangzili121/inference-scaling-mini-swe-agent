@@ -23,7 +23,11 @@ from inference_scaling.arllm.rewards import (
 )
 from inference_scaling.shared.metrics import importance_effective_sample_size
 from inference_scaling.shared.rng import SeedStream
-from inference_scaling.swe_agent.tool_calls import parse_assistant_text
+from inference_scaling.swe_agent.tool_calls import (
+    ParsedAssistant,
+    ToolCallParseError,
+    parse_assistant_text,
+)
 
 
 BASH_TOOL = {
@@ -366,7 +370,12 @@ class ConditionalISRunner:
         )
         result = execution.result
         text = self.backend.decode(result.token_ids, skip_special_tokens=False)
-        parsed = parse_assistant_text(text, request_id=request_id)
+        parse_error = None
+        try:
+            parsed = parse_assistant_text(text, request_id=request_id)
+        except ToolCallParseError as error:
+            parse_error = str(error)
+            parsed = ParsedAssistant(text or None, (), ())
         candidate_ess = [
             importance_effective_sample_size(
                 [candidate.log_weight for candidate in step.candidates]
@@ -392,6 +401,7 @@ class ConditionalISRunner:
             "stage_seconds": dict(stage_seconds),
             "backend_delta": execution.backend_delta,
             "backend_delta_scope": "process_window_not_concurrency_safe",
+            "tool_call_parse_error": parse_error,
             "finish_reason": (
                 "eos" if self.sampling.eos_token_id in result.token_ids else "length"
             ),

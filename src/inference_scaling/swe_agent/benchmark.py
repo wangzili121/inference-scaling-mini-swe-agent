@@ -85,11 +85,13 @@ def run_burst(
     timeout: float = 7200.0,
     seed: int = 20260908,
     conditional_overrides: dict[str, int] | None = None,
+    run_namespace: str | None = None,
 ) -> dict[str, Any]:
     if not records or not endpoints:
         raise ValueError("burst requires records and endpoints")
     if workers <= 0:
         raise ValueError("workers must be positive")
+    run_namespace = run_namespace or f"burst:{time.time_ns()}"
     release = threading.Event()
     before_snapshots = {
         endpoint: _backend_snapshot(endpoint) for endpoint in endpoints
@@ -97,7 +99,7 @@ def run_burst(
 
     def execute(index: int, record: dict[str, Any]) -> RequestMeasurement:
         endpoint = endpoints[index % len(endpoints)]
-        request_id = f"burst:{index}:{record['request_id']}"
+        request_id = f"{run_namespace}:{index}:{record['request_id']}"
         payload = {
             "messages": record["messages"],
             "request_id": request_id,
@@ -159,6 +161,7 @@ def run_burst(
         "workers": workers,
         "endpoints": list(endpoints),
         "conditional_is": dict(conditional_overrides or {}),
+        "run_namespace": run_namespace,
         "backend_delta": backend_delta,
         "endpoint_backend_delta": endpoint_backend_delta,
         "wall_seconds": wall_seconds,

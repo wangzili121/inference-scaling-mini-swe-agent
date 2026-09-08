@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import importlib.metadata
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -17,6 +17,7 @@ from typing import Sequence
 
 PINNED_MINI_SWE_AGENT_VERSION = "2.4.6"
 VERIFIED_DATASET = "princeton-nlp/SWE-Bench_Verified"
+VERIFIED_REVISION = "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
 
 
 def _repository_root() -> Path:
@@ -39,52 +40,93 @@ def _wait_for_service(endpoint: str, timeout: float) -> None:
     raise TimeoutError(f"Conditional IS service is not healthy: {error}")
 
 
-def _instance_filter(instance_ids: Sequence[str]) -> str:
-    return "^(?:" + "|".join(re.escape(value) for value in instance_ids) + ")$"
-
-
-def build_swebench_command(
+def select_instances(
+    instances: Sequence[dict],
     *,
-    overlay_config: Path,
-    output: Path,
-    endpoint: str,
     count: int,
-    workers: int,
     instance_ids: Sequence[str] = (),
-    redo_existing: bool = False,
-) -> list[str]:
+) -> list[dict]:
     if not 1 <= count <= 500:
         raise ValueError("count must lie in [1, 500]")
-    if workers <= 0:
-        raise ValueError("workers must be positive")
-    command = [
-        sys.executable,
-        "-m",
-        "minisweagent.run.benchmarks.swebench",
-        "--subset",
-        "verified",
-        "--split",
-        "test",
-        "--output",
-        str(output),
-        "--workers",
-        str(workers),
-        "--config",
-        "swebench.yaml",
-        "--config",
-        str(overlay_config),
-        "--config",
-        f"model.endpoint={endpoint.rstrip('/')}",
-        "--model-class",
-        "inference_scaling.swe_agent.model.ConditionalISModel",
-    ]
-    if instance_ids:
-        command.extend(("--filter", _instance_filter(instance_ids)))
-    else:
-        command.extend(("--slice", f"0:{count}"))
-    if redo_existing:
-        command.append("--redo-existing")
-    return command
+    if not instance_ids:
+        return list(instances[:count])
+    by_id = {str(item["instance_id"]): item for item in instances}
+    missing = [value for value in instance_ids if value not in by_id]
+    if missing:
+        raise ValueError("unknown Verified instance IDs: " + ", ".join(missing))
+    return [by_id[value] for value in instance_ids]
+
+
+def _run_batch(
+    instances: Sequence[dict],
+    *,
+    overlay_config: Path,
+    endpoint: str,
+    output: Path,
+    workers: int,
+    redo_existing: bool,
+) -> None:
+    from minisweagent.config import get_config_from_spec
+    from minisweagent.run.benchmarks.swebench import process_instance
+    from minisweagent.run.benchmarks.utils.batch_progress import (
+        RunBatchProgressManager,
+    )
+    from minisweagent.utils.log import add_file_handler, logger
+    from minisweagent.utils.serialize import recursive_merge
+    from rich.live import Live
+
+    output.mkdir(parents=True, exist_ok=True)
+    add_file_handler(output / "minisweagent.log")
+    selected = list(instances)
+    if not redo_existing and (output / "preds.json").exists():
+        existing = set(json.loads((output / "preds.json").read_text()))
+        selected = [item for item in selected if item["instance_id"] not in existing]
+    config = recursive_merge(
+        get_config_from_spec("swebench.yaml"),
+        get_config_from_spec(str(overlay_config)),
+        {
+            "model": {
+                "endpoint": endpoint.rstrip("/"),
+                "model_class": "inference_scaling.swe_agent.model.ConditionalISModel",
+            }
+        },
+    )
+    progress = RunBatchProgressManager(
+        len(selected), output / f"exit_statuses_{time.time()}.yaml"
+    )
+
+    def consume(futures: dict[concurrent.futures.Future, str]) -> None:
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                future.result()
+            except concurrent.futures.CancelledError:
+                pass
+            except Exception as error:
+                instance_id = futures[future]
+                logger.error(
+                    "Error in future for %s: %s",
+                    instance_id,
+                    error,
+                    exc_info=True,
+                )
+                progress.on_uncaught_exception(instance_id, error)
+
+    with Live(progress.render_group, refresh_per_second=4):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(process_instance, item, output, config, progress): str(
+                    item["instance_id"]
+                )
+                for item in selected
+            }
+            try:
+                consume(futures)
+            except KeyboardInterrupt:
+                logger.info("Cancelling all pending SWE-bench tasks")
+                for future in futures:
+                    if not future.running() and not future.done():
+                        future.cancel()
+                consume(futures)
 
 
 def _docker_preflight() -> None:
@@ -132,25 +174,31 @@ def main() -> None:
     if not overlay.is_file():
         raise FileNotFoundError(overlay)
     output = Path(args.output).resolve()
-    command = build_swebench_command(
-        overlay_config=overlay,
-        output=output,
-        endpoint=args.endpoint,
-        count=args.count,
-        workers=args.workers,
-        instance_ids=args.instance_id,
-        redo_existing=args.redo_existing,
+    if args.workers <= 0:
+        raise ValueError("workers must be positive")
+    from datasets import load_dataset
+
+    dataset = load_dataset(
+        VERIFIED_DATASET,
+        revision=VERIFIED_REVISION,
+        split="test",
     )
+    instances = select_instances(
+        list(dataset), count=args.count, instance_ids=args.instance_id
+    )
+    selected_ids = [str(item["instance_id"]) for item in instances]
     manifest = {
         "schema_version": 1,
         "dataset": VERIFIED_DATASET,
+        "dataset_revision": VERIFIED_REVISION,
+        "dataset_fingerprint": getattr(dataset, "_fingerprint", None),
         "split": "test",
         "mini_swe_agent_version": installed,
         "conditional_is_endpoint": args.endpoint.rstrip("/"),
-        "instance_ids": list(args.instance_id),
-        "count": len(args.instance_id) if args.instance_id else args.count,
+        "instance_ids": selected_ids,
+        "count": len(selected_ids),
         "workers": args.workers,
-        "command": command,
+        "argv": sys.argv,
     }
     if args.dry_run:
         print(json.dumps(manifest, indent=2))
@@ -163,11 +211,15 @@ def main() -> None:
     (output / "conditional_is_run_manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
     )
-    environment = dict(os.environ)
-    environment.setdefault("MSWEA_SILENT_STARTUP", "1")
-    result = subprocess.run(command, check=False, env=environment)
-    if result.returncode:
-        raise SystemExit(result.returncode)
+    os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
+    _run_batch(
+        instances,
+        overlay_config=overlay,
+        endpoint=args.endpoint,
+        output=output,
+        workers=args.workers,
+        redo_existing=args.redo_existing,
+    )
 
 
 if __name__ == "__main__":

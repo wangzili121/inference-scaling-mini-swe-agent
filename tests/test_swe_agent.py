@@ -133,6 +133,23 @@ def test_runner_forwards_profile_control_to_backend(tmp_path: Path) -> None:
     assert events == [("start", "tp2-best"), ("stop", None)]
 
 
+def test_runner_returns_malformed_tool_call_for_agent_format_recovery(
+    tmp_path: Path,
+) -> None:
+    backend = _AgentBackend()
+    backend.decode = lambda tokens, skip_special_tokens=False: (
+        '<tool_call>{"name":"bash","arguments":broken}</tool_call>'
+    )
+    runner = ConditionalISRunner(backend, _runner_config(tmp_path / "trace.jsonl"))
+
+    result = runner.query(
+        [{"role": "user", "content": "fix it"}], request_id="malformed", seed=3
+    )
+
+    assert result.message["extra"]["actions"] == []
+    assert "invalid tool-call JSON" in result.diagnostics["tool_call_parse_error"]
+
+
 def test_model_client_uses_stable_request_identity() -> None:
     class StubModel(ConditionalISModel):
         def __init__(self):

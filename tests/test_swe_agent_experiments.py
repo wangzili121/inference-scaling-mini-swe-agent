@@ -18,13 +18,14 @@ from inference_scaling.swe_agent.workload import freeze_workload
 from inference_scaling.swe_agent.reward_screen import _screen_temperature
 from inference_scaling.swe_agent.runtime_tune import select_arms
 from inference_scaling.swe_agent.topology import capability_matrix, native_topologies
-from inference_scaling.swe_agent.swebench import build_swebench_command
+from inference_scaling.swe_agent.swebench import select_instances
 from inference_scaling.swe_agent.profile_analysis import (
     analyze_algorithm_trace,
     analyze_ascend_profile,
     analyze_benchmark,
     recommendations,
 )
+from inference_scaling.swe_agent.evaluate import build_evaluation_command
 from tests.test_swe_agent import _AgentBackend, _runner_config
 
 
@@ -123,6 +124,7 @@ def test_burst_routes_whole_jobs_across_endpoints(monkeypatch) -> None:
         "http://two",
         "http://two",
     ]
+    assert all(call[1]["request_id"].startswith(result["run_namespace"]) for call in calls)
 
 
 def test_reward_screen_uses_one_pool_for_both_reward_families(
@@ -225,19 +227,42 @@ def test_four_card_topology_matrix_is_explicit_about_capability_gates() -> None:
     assert "candidate-rollout-stage-pipeline" in gated
 
 
-def test_swebench_launcher_fixes_verified_test_split(tmp_path: Path) -> None:
-    command = build_swebench_command(
-        overlay_config=tmp_path / "conditional.yaml",
-        output=tmp_path / "output",
-        endpoint="http://service:8123/",
+def test_swebench_launcher_selects_canonical_or_explicit_order() -> None:
+    instances = [{"instance_id": f"task-{index}"} for index in range(5)]
+
+    canonical = select_instances(
+        instances,
         count=3,
-        workers=2,
+    )
+    explicit = select_instances(
+        instances,
+        count=1,
+        instance_ids=("task-4", "task-1"),
     )
 
-    assert command[command.index("--subset") + 1] == "verified"
-    assert command[command.index("--split") + 1] == "test"
-    assert command[command.index("--slice") + 1] == "0:3"
-    assert "model.endpoint=http://service:8123" in command
+    assert [item["instance_id"] for item in canonical] == [
+        "task-0",
+        "task-1",
+        "task-2",
+    ]
+    assert [item["instance_id"] for item in explicit] == ["task-4", "task-1"]
+
+
+def test_evaluator_uses_pinned_local_dataset_snapshot(tmp_path: Path) -> None:
+    snapshot = tmp_path / "verified.json"
+    command = build_evaluation_command(
+        dataset_snapshot=snapshot,
+        predictions=tmp_path / "preds.json",
+        instance_ids=("task-1", "task-2"),
+        run_id="quality-10",
+        report_directory=tmp_path / "reports",
+        workers=2,
+        timeout=1800,
+        open_file_limit=4096,
+    )
+
+    assert command[command.index("--dataset_name") + 1] == str(snapshot)
+    assert command[-2:] == ["task-1", "task-2"]
 
 
 def test_profile_analysis_combines_algorithm_runtime_and_npu_evidence(
