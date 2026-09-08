@@ -102,7 +102,6 @@ def build_docker_command(
         "docker",
         "run",
         "--detach",
-        "--rm",
         "--network",
         "host",
         "--ipc",
@@ -179,7 +178,12 @@ def _git_revision(repository: Path) -> str | None:
         capture_output=True,
         text=True,
     )
-    return result.stdout.strip() if result.returncode == 0 else None
+    if result.returncode == 0:
+        return result.stdout.strip()
+    snapshot_revision = repository / ".source-commit"
+    if snapshot_revision.is_file():
+        return snapshot_revision.read_text(encoding="utf-8").strip() or None
+    return None
 
 
 def _image_id(image: str) -> str | None:

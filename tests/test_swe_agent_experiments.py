@@ -417,6 +417,7 @@ def test_deployer_rejects_busy_cards_and_mounts_native_categorical(
     )
 
     assert command.count("--device") == 5
+    assert "--rm" not in command
     assert "VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE=1" in command
     assert any(value.startswith("ASCEND_CUSTOM_OPP_PATH=") for value in command)
     assert any(value.startswith("LD_PRELOAD=") for value in command)
