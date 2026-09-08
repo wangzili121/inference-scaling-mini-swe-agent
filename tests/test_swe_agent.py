@@ -31,6 +31,26 @@ def test_qwen_tool_call_is_converted_to_one_bash_action() -> None:
     }
 
 
+def test_qwen3_native_function_parameter_tool_call_is_supported() -> None:
+    parsed = parse_assistant_text(
+        "Inspect the source.\n<tool_call>\n<function=bash>\n"
+        "<parameter=command>\ngrep -r \"extension\" sympy | head\n"
+        "</parameter>\n</function>\n</tool_call><|im_end|>",
+        request_id="request-native",
+    )
+
+    assert parsed.content == "Inspect the source."
+    assert parsed.actions == (
+        {
+            "command": 'grep -r "extension" sympy | head',
+            "tool_call_id": parsed.tool_calls[0]["id"],
+        },
+    )
+    assert json.loads(parsed.tool_calls[0]["function"]["arguments"]) == {
+        "command": 'grep -r "extension" sympy | head'
+    }
+
+
 def test_public_messages_normalizes_openai_argument_json_for_qwen_template() -> None:
     original = {
         "role": "assistant",

@@ -27,6 +27,12 @@ _TOOL_PATTERNS = (
 _TRAILING_SPECIAL = re.compile(
     r"(?:<\|im_end\|>|<\|endoftext\|>|<\|eot_id\|>|</s>)+\s*$"
 )
+_FUNCTION_PAYLOAD = re.compile(
+    r"^\s*<function=([^>\n]+)>\s*(.*?)\s*</function>\s*$", re.DOTALL
+)
+_PARAMETER_PAYLOAD = re.compile(
+    r"<parameter=([^>\n]+)>\s*(.*?)\s*</parameter>", re.DOTALL
+)
 
 
 def _tool_call_id(request_id: str, index: int) -> str:
@@ -36,6 +42,20 @@ def _tool_call_id(request_id: str, index: int) -> str:
 
 def _decode_payload(raw: str) -> dict[str, Any]:
     value = raw.strip()
+    function_match = _FUNCTION_PAYLOAD.fullmatch(value)
+    if function_match is not None:
+        body = function_match.group(2)
+        parameters = {
+            match.group(1).strip(): match.group(2).strip()
+            for match in _PARAMETER_PAYLOAD.finditer(body)
+        }
+        remainder = _PARAMETER_PAYLOAD.sub("", body).strip()
+        if remainder or not parameters:
+            raise ToolCallParseError("invalid Qwen function/parameter payload")
+        return {
+            "name": function_match.group(1).strip(),
+            "arguments": parameters,
+        }
     if value.startswith("```json"):
         value = value[7:]
     elif value.startswith("```"):
