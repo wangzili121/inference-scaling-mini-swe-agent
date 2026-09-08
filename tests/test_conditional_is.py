@@ -9,6 +9,7 @@ from inference_scaling.arllm.algorithms.conditional_is import (
 )
 from inference_scaling.arllm.backends import TabularAutoregressiveBackend
 from inference_scaling.arllm.config import ConditionalISConfig, SamplingConfig
+from inference_scaling.arllm.rewards import ConsilienceReward, SequenceLogProbabilityReward
 from inference_scaling.shared.metrics import total_variation
 from inference_scaling.shared.rng import SeedStream
 from inference_scaling.experimental.shared.rqmc import (
@@ -248,6 +249,64 @@ def test_conditional_is_never_exceeds_total_length() -> None:
     )
     assert len(result.token_ids) == 5
     assert [len(step.selected.token_ids) for step in result.steps] == [2, 2, 1]
+
+
+def test_conditional_is_reuses_on_policy_generation_logprobs_for_reward() -> None:
+    class NoScoreBackend(TabularAutoregressiveBackend):
+        def score_batch(self, requests):
+            raise AssertionError("ordinary on-policy CIS should not rescore sequences")
+
+    backend = NoScoreBackend({}, fallback=(0.6, 0.4))
+    sampling = SamplingConfig()
+    result = run_conditional_is(
+        backend,
+        (),
+        ConditionalISConfig(
+            candidate_count=3,
+            rollout_count=2,
+            block_size=1,
+            total_length=3,
+        ),
+        SequenceLogProbabilityReward(backend, sampling),
+        SeedStream(20260908),
+        base_sampling=sampling,
+        rollout_sampling=sampling,
+    )
+
+    assert len(result.token_ids) == 3
+
+
+def test_conditional_is_reuses_generation_topk_statistics_for_consilience() -> None:
+    backend = TabularAutoregressiveBackend({}, fallback=(0.6, 0.4))
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("generation top-K statistics should avoid exact rescoring")
+
+    backend.score_statistics_batch = fail  # type: ignore[attr-defined]
+    sampling = SamplingConfig()
+    result = run_conditional_is(
+        backend,
+        (),
+        ConditionalISConfig(
+            candidate_count=3,
+            rollout_count=2,
+            block_size=1,
+            total_length=3,
+        ),
+        ConsilienceReward(
+            backend,
+            sampling,
+            top_k=2,
+            window_fraction=0.5,
+            skip_fraction=0.0,
+            initial_penalty=1.0,
+        ),
+        SeedStream(20260908),
+        base_sampling=sampling,
+        rollout_sampling=sampling,
+    )
+
+    assert len(result.token_ids) == 3
 
 
 @pytest.mark.parametrize(

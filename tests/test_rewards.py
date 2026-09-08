@@ -11,6 +11,7 @@ from inference_scaling.arllm.rewards import (
     ConsilienceReward,
     SequenceLogProbabilityReward,
 )
+from inference_scaling.arllm.types import GeneratedSequenceStatistics
 
 
 def test_sequence_log_probability_reward_sums_all_token_scores() -> None:
@@ -23,6 +24,26 @@ def test_sequence_log_probability_reward_sums_all_token_scores() -> None:
     assert reward((), (1, 0)) == pytest.approx(2.0 * (log(0.25) + log(0.4)))
     assert reward.batch((), ((0,), (1, 1))) == pytest.approx(
         (2.0 * log(0.75), 2.0 * (log(0.25) + log(0.6)))
+    )
+
+
+def test_sequence_log_probability_reward_reuses_generation_statistics() -> None:
+    class NoScoreBackend(TabularAutoregressiveBackend):
+        def score_batch(self, requests):
+            raise AssertionError("generation statistics should avoid exact rescoring")
+
+    backend = NoScoreBackend({}, fallback=(0.5, 0.5))
+    sampling = SamplingConfig()
+    reward = SequenceLogProbabilityReward(backend, sampling, scale=2.0)
+    statistics = GeneratedSequenceStatistics(
+        token_ids=(0, 1),
+        token_logprobs=(log(0.5), log(0.25)),
+        model_id=backend.model_id,
+        policy_id=sampling.policy_id,
+    )
+
+    assert reward.batch_statistics((), (statistics,)) == pytest.approx(
+        (2.0 * log(0.125),)
     )
 
 
@@ -100,6 +121,30 @@ def test_consilience_reward_uses_initial_and_final_confidence_windows() -> None:
     assert reward((9,), completion) == pytest.approx(2.0 * (1.5 - 6.0))
     assert backend.confidence_top_k == 3
     assert backend.requests[0].prefix == (9,)
+
+
+def test_consilience_reward_reuses_generation_confidence_trajectory() -> None:
+    backend = _ConsilienceBackend({})
+    sampling = SamplingConfig()
+    reward = ConsilienceReward(
+        backend,
+        sampling,
+        top_k=3,
+        window_fraction=0.5,
+        skip_fraction=0.0,
+        initial_penalty=1.0,
+    )
+    statistics = GeneratedSequenceStatistics(
+        token_ids=(1, 2, 3, 4),
+        token_logprobs=(-1.0, -1.0, -1.0, -1.0),
+        model_id=backend.model_id,
+        policy_id=sampling.policy_id,
+        token_topk_confidences=(6.0, 5.0, 2.0, 1.0),
+        confidence_top_k=3,
+    )
+
+    assert reward.batch_statistics((), (statistics,)) == pytest.approx((-4.0,))
+    assert backend.requests == []
 
 
 def test_consilience_reward_is_batch_order_invariant_and_pointwise() -> None:

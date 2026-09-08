@@ -24,6 +24,7 @@ class GenerationRequest:
     request_id: str
     uniforms: tuple[float, ...] | None = None
     arithmetic_uniform: float | None = None
+    confidence_top_k: int | None = None
 
     def __post_init__(self) -> None:
         if self.max_new_tokens <= 0:
@@ -49,6 +50,79 @@ class GenerationRequest:
                 raise ValueError(
                     "the arithmetic sampling uniform must be finite and in [0, 1)"
                 )
+        if self.confidence_top_k is not None and self.confidence_top_k <= 0:
+            raise ValueError("confidence_top_k must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class GeneratedSequenceStatistics:
+    """Small generation-time statistics sufficient for model-derived rewards."""
+
+    token_ids: TokenSequence = ()
+    token_logprobs: tuple[float, ...] = ()
+    model_id: str | None = None
+    policy_id: str | None = None
+    token_topk_confidences: tuple[float, ...] | None = None
+    confidence_top_k: int | None = None
+
+    def __post_init__(self) -> None:
+        if len(self.token_ids) != len(self.token_logprobs):
+            raise ValueError("generation statistics require one log-probability per token")
+        if any(not isfinite(value) for value in self.token_logprobs):
+            raise ValueError("generation log-probabilities must be finite")
+        if (self.token_topk_confidences is None) != (self.confidence_top_k is None):
+            raise ValueError("top-K confidences and confidence_top_k must be provided together")
+        if self.token_topk_confidences is not None:
+            if len(self.token_topk_confidences) != len(self.token_ids):
+                raise ValueError("generation statistics require one top-K confidence per token")
+            if any(not isfinite(value) for value in self.token_topk_confidences):
+                raise ValueError("top-K confidences must be finite")
+            if self.confidence_top_k is None or self.confidence_top_k <= 0:
+                raise ValueError("confidence_top_k must be positive")
+
+    @property
+    def logprob(self) -> float:
+        return float(sum(self.token_logprobs))
+
+    def extend(
+        self,
+        *,
+        token_ids: TokenSequence,
+        token_logprobs: tuple[float, ...],
+        model_id: str,
+        policy_id: str,
+        token_topk_confidences: tuple[float, ...] | None = None,
+        confidence_top_k: int | None = None,
+    ) -> "GeneratedSequenceStatistics":
+        if len(token_ids) != len(token_logprobs):
+            raise ValueError("extension requires one log-probability per token")
+        homogeneous_model = model_id if not self.token_ids else (
+            model_id if self.model_id == model_id else None
+        )
+        homogeneous_policy = policy_id if not self.token_ids else (
+            policy_id if self.policy_id == policy_id else None
+        )
+        if not self.token_ids:
+            combined_confidences = token_topk_confidences
+            combined_top_k = confidence_top_k
+        elif (
+            self.token_topk_confidences is not None
+            and token_topk_confidences is not None
+            and self.confidence_top_k == confidence_top_k
+        ):
+            combined_confidences = self.token_topk_confidences + token_topk_confidences
+            combined_top_k = self.confidence_top_k
+        else:
+            combined_confidences = None
+            combined_top_k = None
+        return GeneratedSequenceStatistics(
+            token_ids=self.token_ids + tuple(token_ids),
+            token_logprobs=self.token_logprobs + tuple(token_logprobs),
+            model_id=homogeneous_model,
+            policy_id=homogeneous_policy,
+            token_topk_confidences=combined_confidences,
+            confidence_top_k=combined_top_k,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +136,8 @@ class SequenceSample:
     finish_reason: str = "length"
     reference_token_logprobs: tuple[float, ...] | None = None
     reference_policy_id: str | None = None
+    token_topk_confidences: tuple[float, ...] | None = None
+    confidence_top_k: int | None = None
 
     def __post_init__(self) -> None:
         if len(self.token_ids) != len(self.token_logprobs):
@@ -82,6 +158,17 @@ class SequenceSample:
             raise ValueError(
                 "each sampled token must have one reference-policy log-probability"
             )
+        if (self.token_topk_confidences is None) != (self.confidence_top_k is None):
+            raise ValueError(
+                "top-K confidences and confidence_top_k must be provided together"
+            )
+        if self.token_topk_confidences is not None:
+            if len(self.token_ids) != len(self.token_topk_confidences):
+                raise ValueError("each sampled token must have one top-K confidence")
+            if any(not isfinite(value) for value in self.token_topk_confidences):
+                raise ValueError("sampled top-K confidences must be finite")
+            if self.confidence_top_k is None or self.confidence_top_k <= 0:
+                raise ValueError("confidence_top_k must be positive")
 
     @property
     def logprob(self) -> float:
@@ -90,6 +177,17 @@ class SequenceSample:
     @property
     def full_sequence(self) -> TokenSequence:
         return self.prefix + self.token_ids
+
+    @property
+    def statistics(self) -> GeneratedSequenceStatistics:
+        return GeneratedSequenceStatistics(
+            token_ids=self.token_ids,
+            token_logprobs=self.token_logprobs,
+            model_id=self.model_id,
+            policy_id=self.policy_id,
+            token_topk_confidences=self.token_topk_confidences,
+            confidence_top_k=self.confidence_top_k,
+        )
 
 
 @dataclass(frozen=True, slots=True)

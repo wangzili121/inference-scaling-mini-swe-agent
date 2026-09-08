@@ -1,0 +1,112 @@
+diff --git a/csrc/build_aclnn.sh b/csrc/build_aclnn.sh
+index 1d0a374..b4d6ce0 100644
+--- a/csrc/build_aclnn.sh
++++ b/csrc/build_aclnn.sh
+@@ -25,7 +25,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
+     export CPATH=${ABSOLUTE_CATLASS_PATH}:${CPATH}
+ 
+ 
+-    CUSTOM_OPS="moe_grouped_matmul;grouped_matmul_swiglu_quant_weight_nz_tensor_list;lightning_indexer_vllm;sparse_flash_attention;matmul_allreduce_add_rmsnorm;moe_init_routing_custom;moe_gating_top_k;add_rms_norm_bias;apply_top_k_top_p_custom;transpose_kv_cache_by_block;copy_and_expand_eagle_inputs;causal_conv1d;lightning_indexer_quant;"
++    CUSTOM_OPS="moe_grouped_matmul;grouped_matmul_swiglu_quant_weight_nz_tensor_list;lightning_indexer_vllm;sparse_flash_attention;matmul_allreduce_add_rmsnorm;moe_init_routing_custom;moe_gating_top_k;add_rms_norm_bias;apply_top_k_top_p_custom;categorical_sample;transpose_kv_cache_by_block;copy_and_expand_eagle_inputs;causal_conv1d;lightning_indexer_quant;"
+     SOC_ARG="ascend910b"
+ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
+     # ASCEND910C (A3) series
+@@ -57,6 +57,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
+         "moe_gating_top_k"
+         "add_rms_norm_bias"
+         "apply_top_k_top_p_custom"
++        "categorical_sample"
+         "transpose_kv_cache_by_block"
+         "copy_and_expand_eagle_inputs"
+         "causal_conv1d"
+diff --git a/csrc/cmake/func.cmake b/csrc/cmake/func.cmake
+index e8ce575..ae9802b 100644
+--- a/csrc/cmake/func.cmake
++++ b/csrc/cmake/func.cmake
+@@ -43,7 +43,10 @@ function(op_add_subdirectory OP_LIST OP_DIR_LIST)
+     set(_OP_LIST)
+     set(_OP_DIR_LIST)
+ 
+-    file(GLOB OP_HOST_CMAKE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/**/op_host/CMakeLists.txt")
++    file(GLOB OP_HOST_CMAKE_FILES
++        "${CMAKE_CURRENT_SOURCE_DIR}/**/op_host/CMakeLists.txt"
++        "${CMAKE_CURRENT_SOURCE_DIR}/sampling/**/op_host/CMakeLists.txt"
++    )
+ 
+     foreach(OP_CMAKE_FILE ${OP_HOST_CMAKE_FILES})
+         get_filename_component(OP_HOST_DIR "${OP_CMAKE_FILE}" DIRECTORY)
+diff --git a/csrc/torch_binding.cpp b/csrc/torch_binding.cpp
+index 959f10b..a90a06c 100644
+--- a/csrc/torch_binding.cpp
++++ b/csrc/torch_binding.cpp
+@@ -30,6 +30,7 @@
+ #include "aclnn_torch_adapter/op_api_common.h"
+ #include "add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
+ #include "apply_top_k_top_p_custom/apply_top_k_top_p_custom_torch_adpt.h"
++#include "sampling/categorical_sample/categorical_sample_torch_adpt.h"
+ #include "batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
+ #include "dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
+ #include "dispatch_gmm_combine_decode/dispatch_gmm_combine_decode_torch_adpt.h"
+@@ -875,6 +876,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
+ 
+     ops.def("npu_apply_top_k_top_p(Tensor logits, Tensor? p=None, Tensor? k=None) -> Tensor");
+     ops.impl("npu_apply_top_k_top_p", torch::kPrivateUse1, &vllm_ascend::npu_apply_top_k_top_p);
++    ops.def(
++        "npu_categorical_sample("
++        "Tensor processed_logits, Tensor expanded_idx_mapping, Tensor temperature, Tensor seed, Tensor pos, "
++        "bool return_lse=False, bool apply_temperature=False, "
++        "Tensor(a!)? output_processed_logits=None, Tensor? output_processed_logits_col=None, bool use_fp64=False"
++        ") -> (Tensor sampled_token_ids, Tensor lse)"
++    );
++    ops.impl("npu_categorical_sample", torch::kPrivateUse1, &vllm_ascend::npu_categorical_sample);
+     ops.def(
+         "transpose_kv_cache_by_block(Tensor[] kCache, Tensor[] vCache, Tensor blockIDs, int blockSize, int headNum, int headDim, int splitNum, int layerNum) -> ()"
+     );
+diff --git a/csrc/torch_binding_meta.cpp b/csrc/torch_binding_meta.cpp
+index ed7f7dc..38c81d8 100644
+--- a/csrc/torch_binding_meta.cpp
++++ b/csrc/torch_binding_meta.cpp
+@@ -418,6 +418,35 @@ std::tuple<at::Tensor,at::Tensor, at::Tensor> npu_add_rms_norm_bias_meta(
+     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, rstd, x);
+ }
+ 
++std::tuple<at::Tensor, at::Tensor> npu_categorical_sample_meta(
++    const at::Tensor& processed_logits,
++    const at::Tensor& expanded_idx_mapping,
++    const at::Tensor& temperature,
++    const at::Tensor& seed,
++    const at::Tensor& pos,
++    bool return_lse,
++    bool apply_temperature,
++    const c10::optional<at::Tensor>& output_processed_logits,
++    const c10::optional<at::Tensor>& output_processed_logits_col,
++    bool use_fp64)
++{
++    (void)apply_temperature;
++    (void)output_processed_logits;
++    (void)output_processed_logits_col;
++    (void)use_fp64;
++    TORCH_CHECK(processed_logits.dim() == 2, "processed_logits must be 2D");
++    TORCH_CHECK(expanded_idx_mapping.dim() == 1, "expanded_idx_mapping must be 1D");
++    TORCH_CHECK(temperature.dim() == 1, "temperature must be 1D");
++    TORCH_CHECK(seed.dim() == 1, "seed must be 1D");
++    TORCH_CHECK(pos.dim() == 1, "pos must be 1D");
++    auto numRows = processed_logits.sym_size(0);
++    c10::SymDimVector rowShape = {numRows};
++    c10::SymDimVector lseShape = {return_lse ? numRows : c10::SymInt(0)};
++    at::Tensor sampledTokenIds = at::empty_symint(rowShape, processed_logits.options().dtype(at::kLong));
++    at::Tensor lse = at::empty_symint(lseShape, processed_logits.options().dtype(at::kFloat));
++    return std::make_tuple(sampledTokenIds, lse);
++}
++
+ std::tuple<at::Tensor, at::Tensor> npu_gemma_rms_norm_meta(
+     const at::Tensor& x,
+     const at::Tensor& gamma,
+@@ -608,6 +637,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
+     ops.impl("moe_gating_top_k", &vllm_ascend::meta::moe_gating_top_k_meta);
+     // Add_Rms_Norm_Bias
+     ops.impl("npu_add_rms_norm_bias", &vllm_ascend::meta::npu_add_rms_norm_bias_meta);
++    ops.impl("npu_categorical_sample", &vllm_ascend::meta::npu_categorical_sample_meta);
+     // transpose_kv_cache_by_block
+     ops.impl("transpose_kv_cache_by_block", &vllm_ascend::meta::transpose_kv_cache_by_block_meta);
+     // CopyAndExpandEagleInputs

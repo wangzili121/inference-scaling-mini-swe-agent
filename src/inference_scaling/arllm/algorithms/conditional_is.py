@@ -34,6 +34,7 @@ from inference_scaling.shared.stepwise import (
 from inference_scaling.shared.verifier import TokenBatchReward, TokenReward
 from inference_scaling.arllm.types import (
     AutoregressiveBackend,
+    GeneratedSequenceStatistics,
     GenerationRequest,
     ScoreRequest,
     SequenceSample,
@@ -66,6 +67,8 @@ class ConditionalCandidate:
     planned_rollout_count: int = 0
     log_weight_lower_bound: float | None = None
     log_weight_upper_bound: float | None = None
+    base_token_topk_confidences: tuple[float, ...] | None = None
+    base_confidence_top_k: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +145,7 @@ def _sample_candidates(
     sampling: SamplingConfig,
     seeds: SeedStream,
     step_index: int,
+    confidence_top_k: int | None = None,
 ) -> list[SequenceSample]:
     requests = [
         GenerationRequest(
@@ -152,6 +156,7 @@ def _sample_candidates(
                 "conditional_is", step_index, "candidate", candidate_index
             ),
             request_id=f"conditional-is:step:{step_index}:candidate:{candidate_index}",
+            confidence_top_k=confidence_top_k,
         )
         for candidate_index in range(count)
     ]
@@ -191,6 +196,7 @@ def estimate_conditional_weights(
     reward_batch: RewardBatchFunction | None = None,
     rollout_design: str = "iid",
     rollout_index_offset: int = 0,
+    generated_prefix_statistics: GeneratedSequenceStatistics | None = None,
 ) -> tuple[ConditionalCandidate, ...]:
     """Estimate each candidate's conditional weight with on/off-policy rollouts."""
 
@@ -216,6 +222,7 @@ def estimate_conditional_weights(
             "randomized QMC rollouts require a fixed pointwise reward; "
             "batch-coupled rewards change when rollout dependence changes"
         )
+    confidence_top_k = getattr(reward, "generation_confidence_top_k", None)
 
     requests: list[GenerationRequest] = []
     request_candidates: list[int] = []
@@ -289,6 +296,7 @@ def estimate_conditional_weights(
                     ),
                     uniforms=token_uniforms[rollout_index],
                     arithmetic_uniform=arithmetic_uniforms[rollout_index],
+                    confidence_top_k=confidence_top_k,
                 )
             )
             request_candidates.append(candidate_index)
@@ -324,8 +332,30 @@ def estimate_conditional_weights(
         # backend accounting cannot mistake it for an evaluated zero log-ratio.
         base_totals = [None for _ in samples]
 
+    prefix_statistics = generated_prefix_statistics or GeneratedSequenceStatistics()
+    candidate_statistics = [
+        prefix_statistics.extend(
+            token_ids=candidate.token_ids,
+            token_logprobs=candidate.token_logprobs,
+            model_id=candidate.model_id,
+            policy_id=candidate.policy_id,
+            token_topk_confidences=candidate.token_topk_confidences,
+            confidence_top_k=candidate.confidence_top_k,
+        )
+        for candidate in candidates
+    ]
     pending_by_candidate: list[
-        list[tuple[TokenSequence, float, float, str, str, TokenSequence]]
+        list[
+            tuple[
+                TokenSequence,
+                float | None,
+                float,
+                str,
+                str,
+                TokenSequence,
+                GeneratedSequenceStatistics,
+            ]
+        ]
     ] = [[] for _ in candidates]
     for candidate_index in terminal_candidates:
         generated = generated_prefix + candidates[candidate_index].token_ids
@@ -337,6 +367,7 @@ def estimate_conditional_weights(
                 rollout_backend.model_id,
                 rollout_sampling.policy_id,
                 generated,
+                candidate_statistics[candidate_index],
             )
         )
     for candidate_index, sample, base_logprob in zip(
@@ -354,11 +385,20 @@ def estimate_conditional_weights(
                 sample.model_id,
                 sample.policy_id,
                 generated,
+                candidate_statistics[candidate_index].extend(
+                    token_ids=sample.token_ids,
+                    token_logprobs=sample.token_logprobs,
+                    model_id=sample.model_id,
+                    policy_id=sample.policy_id,
+                    token_topk_confidences=sample.token_topk_confidences,
+                    confidence_top_k=sample.confidence_top_k,
+                ),
             )
         )
 
     pending = [item for group in pending_by_candidate for item in group]
-    generated_sequences = [item[-1] for item in pending]
+    generated_statistics = [item[-1] for item in pending]
+    generated_sequences = [item.token_ids for item in generated_statistics]
     if reward_batch is not None:
         rewards = tuple(
             float(value) for value in reward_batch(prompt, generated_sequences)
@@ -367,9 +407,20 @@ def estimate_conditional_weights(
             raise ValueError("reward_batch returned an invalid number of rewards")
     else:
         assert reward is not None
-        rewards = tuple(
-            float(reward(prompt, generated)) for generated in generated_sequences
-        )
+        statistics_batch = getattr(reward, "batch_statistics", None)
+        if callable(statistics_batch):
+            rewards = tuple(
+                float(value)
+                for value in statistics_batch(prompt, generated_statistics)
+            )
+            if len(rewards) != len(pending):
+                raise ValueError(
+                    "sample-aware reward returned an invalid number of rewards"
+                )
+        else:
+            rewards = tuple(
+                float(reward(prompt, generated)) for generated in generated_sequences
+            )
     if any(not isfinite(value) for value in rewards):
         raise ValueError("reward must be finite")
 
@@ -389,7 +440,15 @@ def estimate_conditional_weights(
     by_candidate: list[list[RolloutEvaluation]] = [[] for _ in candidates]
     reward_index = 0
     for candidate_index, group in enumerate(pending_by_candidate):
-        for token_ids, base_logprob, proposal_logprob, model_id, policy_id, _ in group:
+        for (
+            token_ids,
+            base_logprob,
+            proposal_logprob,
+            model_id,
+            policy_id,
+            _,
+            _,
+        ) in group:
             reward_value = rewards[reward_index]
             reward_index += 1
             observation = RolloutObservation(
@@ -434,6 +493,8 @@ def estimate_conditional_weights(
                 planned_rollout_count=len(evaluations),
                 log_weight_lower_bound=candidate_log_weight,
                 log_weight_upper_bound=candidate_log_weight,
+                base_token_topk_confidences=candidate.token_topk_confidences,
+                base_confidence_top_k=candidate.confidence_top_k,
             )
         )
     return tuple(evaluated)
@@ -462,6 +523,9 @@ class AutoregressiveStepwiseAdapter:
         self.rollout_sampling = rollout_sampling
         self.reward = reward
         self.reward_batch = reward_batch
+        self._statistics_by_state: dict[
+            TokenSequence, GeneratedSequenceStatistics
+        ] = {(): GeneratedSequenceStatistics()}
 
     @property
     def initial_state(self) -> TokenSequence:
@@ -491,6 +555,9 @@ class AutoregressiveStepwiseAdapter:
             self.base_sampling,
             seeds,
             step_index,
+            confidence_top_k=getattr(
+                self.reward, "generation_confidence_top_k", None
+            ),
         )
 
     def evaluate(
@@ -520,6 +587,7 @@ class AutoregressiveStepwiseAdapter:
             step_index=step_index,
             reward_batch=self.reward_batch,
             rollout_design=self.config.rollout_design,
+            generated_prefix_statistics=self._statistics_by_state.get(state),
         )
         return tuple(
             StepwiseCandidate(candidate, candidate.log_weight)
@@ -534,6 +602,16 @@ class AutoregressiveStepwiseAdapter:
     ) -> TokenSequence:
         del step_index
         generated = state + selected.token_ids
+        previous = self._statistics_by_state.get(state)
+        if previous is not None:
+            self._statistics_by_state[generated] = previous.extend(
+                token_ids=selected.token_ids,
+                token_logprobs=selected.base_token_logprobs,
+                model_id=self.base_backend.model_id,
+                policy_id=self.base_sampling.policy_id,
+                token_topk_confidences=selected.base_token_topk_confidences,
+                confidence_top_k=selected.base_confidence_top_k,
+            )
         eos = self.base_sampling.eos_token_id
         if eos is not None and eos in generated:
             generated = generated[: generated.index(eos) + 1]
@@ -577,6 +655,7 @@ def _bounded_conditional_is_step(
         base_sampling,
         seeds,
         step_index,
+        confidence_top_k=getattr(reward, "generation_confidence_top_k", None),
     )
     rollout_length = max(0, remaining_length - len(proposals[0].token_ids))
     eos = rollout_sampling.eos_token_id

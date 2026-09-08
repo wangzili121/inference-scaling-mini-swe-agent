@@ -1,0 +1,49 @@
+[source]
+inference_scaling_sha = "04492fe1e227e7171f9f20c971240c2d5ac3c535"
+mini_swe_agent_version = "2.4.6"
+runtime = "vllm-ascend-v0.18-mrv1"
+
+[models]
+base = "${CIS_MODEL_PATH}"
+
+[generation]
+max_new_tokens = 512
+
+[sampling]
+temperature = 1.0
+top_p = 1.0
+
+[conditional_is]
+candidate_count = 4
+rollout_count = 2
+block_size = 128
+reward_temperature = 1.0
+
+[reward]
+kind = "sequence_log_probability"
+scale = 1.0
+
+[runtime]
+backend = "vllm"
+device = "npu"
+dtype = "bfloat16"
+trust_remote_code = true
+
+[vllm]
+asynchronous = true
+tensor_parallel_size = 2
+gpu_memory_utilization = 0.90
+max_model_len = 32768
+max_num_seqs = 128
+max_num_batched_tokens = 32768
+enable_prefix_caching = true
+
+[vllm.engine_kwargs]
+enable_chunked_prefill = true
+compilation_config = { cudagraph_mode = "FULL_DECODE_ONLY" }
+
+[run]
+seed = 20260908
+
+[service]
+trace_path = "artifacts/traces/model_calls.jsonl"

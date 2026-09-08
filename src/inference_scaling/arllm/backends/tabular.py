@@ -119,6 +119,9 @@ class TabularAutoregressiveBackend:
             context = list(request.prefix)
             tokens: list[int] = []
             logprobs: list[float] = []
+            topk_confidences: list[float] | None = (
+                [] if request.confidence_top_k is not None else None
+            )
             finish_reason = "length"
             for step in range(request.max_new_tokens):
                 probs = self.probabilities(tuple(context), request.sampling)
@@ -159,6 +162,15 @@ class TabularAutoregressiveBackend:
                     token = min(token, self._vocab_size - 1)
                 tokens.append(token)
                 logprobs.append(float(np.log(probs[token])))
+                if topk_confidences is not None:
+                    effective_top_k = min(request.confidence_top_k or 1, self._vocab_size)
+                    positive = probs[probs > 0]
+                    if len(positive) < effective_top_k:
+                        raise ValueError(
+                            "confidence_top_k exceeds the policy support size"
+                        )
+                    top = np.partition(positive, -effective_top_k)[-effective_top_k:]
+                    topk_confidences.append(float(-np.log(top).mean()))
                 context.append(token)
                 if request.sampling.eos_token_id == token:
                     finish_reason = "eos"
@@ -172,6 +184,16 @@ class TabularAutoregressiveBackend:
                     model_id=self.model_id,
                     request_id=request.request_id,
                     finish_reason=finish_reason,
+                    token_topk_confidences=(
+                        None
+                        if topk_confidences is None
+                        else tuple(topk_confidences)
+                    ),
+                    confidence_top_k=(
+                        None
+                        if topk_confidences is None
+                        else min(request.confidence_top_k or 1, self._vocab_size)
+                    ),
                 )
             )
         return outputs

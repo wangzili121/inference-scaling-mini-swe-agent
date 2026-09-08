@@ -47,6 +47,12 @@ training = [
 dllm-training = [
   "peft==0.20.0",
 ]
+swebench = [
+  "mini-swe-agent==2.4.6",
+]
+
+[project.scripts]
+conditional-is-serve = "inference_scaling.swe_agent.server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -88,12 +88,37 @@ def _validate_mh_fused_vllm_version() -> None:
 
 
 def _load_vllm_sampling_api() -> tuple[Any, Any, Any]:
-    """Load public sampling types from their vLLM 0.25--0.26 locations."""
+    """Load public sampling types across the supported vLLM 0.18--0.26 range."""
 
-    from vllm import SamplingParams, TokensPrompt
-    from vllm.sampling_params import BeamSearchParams
+    from vllm import SamplingParams
+
+    try:
+        from vllm import TokensPrompt
+    except ImportError:
+        TokensPrompt = None
+    try:
+        from vllm.sampling_params import BeamSearchParams
+    except ImportError:
+        try:
+            from vllm import BeamSearchParams
+        except ImportError:
+            BeamSearchParams = _BeamSearchParamsShim
 
     return SamplingParams, TokensPrompt, BeamSearchParams
+
+
+@dataclass
+class _BeamSearchParamsShim:
+    """Minimal v0.18-compatible beam configuration for non-beam CIS runs."""
+
+    beam_width: int = 1
+    max_tokens: int = 16
+    ignore_eos: bool = False
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.beam_width = int(kwargs.get("beam_width", 1))
+        self.max_tokens = int(kwargs.get("max_tokens", 16))
+        self.ignore_eos = bool(kwargs.get("ignore_eos", False))
 
 
 @dataclass(frozen=True, slots=True)
@@ -539,7 +564,7 @@ class VLLMBackend:
             top_p=float(policy.top_p),
             top_k=0 if policy.top_k is None else int(policy.top_k),
             seed=int(request.seed),
-            logprobs=0,
+            logprobs=int(request.confidence_top_k or 0),
             flat_logprobs=False,
             ignore_eos=True,
             stop_token_ids=(
@@ -752,6 +777,23 @@ class VLLMBackend:
             _logprob_value(position, token)
             for position, token in zip(positions, tokens, strict=True)
         )
+        token_topk_confidences: tuple[float, ...] | None = None
+        effective_top_k: int | None = None
+        if request.confidence_top_k is not None:
+            confidence_values: list[float] = []
+            for position in positions:
+                if not isinstance(position, Mapping):
+                    raise RuntimeError("vLLM top-K log-probabilities must be a mapping")
+                logprobs = sorted(
+                    (float(getattr(value, "logprob", value)) for value in position.values()),
+                    reverse=True,
+                )
+                effective = request.confidence_top_k
+                if len(logprobs) < effective:
+                    raise RuntimeError("vLLM omitted requested top-K log-probabilities")
+                confidence_values.append(-sum(logprobs[:effective]) / effective)
+                effective_top_k = effective
+            token_topk_confidences = tuple(confidence_values)
         reference_values: tuple[float, ...] | None = None
         if reference_token_logprobs is not None:
             reference_values = tuple(float(value) for value in reference_token_logprobs)
@@ -805,6 +847,8 @@ class VLLMBackend:
             reference_policy_id=(
                 None if reference_values is None else reference_sampling.policy_id
             ),
+            token_topk_confidences=token_topk_confidences,
+            confidence_top_k=effective_top_k,
         )
         prompt_length = len(self._model_prefix(request.prefix))
         cached = min(prompt_length, int(getattr(output, "num_cached_tokens", 0) or 0))

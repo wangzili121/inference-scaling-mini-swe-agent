@@ -810,10 +810,7 @@ def _run_method(
                 ),
                 scale=float(conditional.get("logprob_reward_scale", 1.0)),
             )
-            if method == "iterated_conditional_is":
-                pointwise_reward = model_reward
-            else:
-                reward_batch = model_reward.batch
+            pointwise_reward = model_reward
             reward_diagnostics["model_reward"] = model_reward.describe()
         elif reward_source == "consilience":
             model_reward = _consilience_reward(
@@ -824,10 +821,7 @@ def _run_method(
                 ),
                 config,
             )
-            if method == "iterated_conditional_is":
-                pointwise_reward = model_reward
-            else:
-                reward_batch = model_reward.batch
+            pointwise_reward = model_reward
             reward_diagnostics["model_reward"] = model_reward.describe()
         elif reward_source != "verifier":
             if method == "iterated_conditional_is":

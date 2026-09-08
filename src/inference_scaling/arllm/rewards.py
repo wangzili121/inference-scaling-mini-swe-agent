@@ -7,7 +7,11 @@ from math import isfinite
 from typing import Any, Sequence
 
 from inference_scaling.arllm.config import SamplingConfig
-from inference_scaling.arllm.types import AutoregressiveBackend, ScoreRequest
+from inference_scaling.arllm.types import (
+    AutoregressiveBackend,
+    GeneratedSequenceStatistics,
+    ScoreRequest,
+)
 from inference_scaling.shared.types import TokenSequence
 
 
@@ -50,6 +54,22 @@ class SequenceLogProbabilityReward:
         ):
             raise RuntimeError("backend returned an invalid token score shape")
         return tuple(self.scale * float(sum(token_scores)) for token_scores in scored)
+
+    def batch_statistics(
+        self,
+        prompt: TokenSequence,
+        statistics: Sequence[GeneratedSequenceStatistics],
+    ) -> tuple[float, ...]:
+        """Reuse sampled-token log-probabilities when policy identity is exact."""
+
+        expected_policy = (self.sampling or SamplingConfig()).policy_id
+        if all(
+            item.model_id == self.backend.model_id
+            and item.policy_id == expected_policy
+            for item in statistics
+        ):
+            return tuple(self.scale * item.logprob for item in statistics)
+        return self.batch(prompt, tuple(item.token_ids for item in statistics))
 
     def describe(self) -> dict[str, object]:
         return {
@@ -102,6 +122,10 @@ class ConsilienceReward:
 
     def __call__(self, prompt: TokenSequence, completion: TokenSequence) -> float:
         return self.batch(prompt, (completion,))[0]
+
+    @property
+    def generation_confidence_top_k(self) -> int:
+        return self.top_k
 
     def _reasoning_tokens(self, completion: TokenSequence) -> TokenSequence:
         token_ids = tuple(completion)
@@ -157,6 +181,33 @@ class ConsilienceReward:
             values = tuple(float(value) for value in item.token_topk_confidences)
             if len(values) != len(sequence):
                 raise RuntimeError("backend returned an invalid Consilience trajectory")
+            rewards.append(self._trajectory_score(values))
+        return tuple(rewards)
+
+    def batch_statistics(
+        self,
+        prompt: TokenSequence,
+        statistics: Sequence[GeneratedSequenceStatistics],
+    ) -> tuple[float, ...]:
+        """Reuse compact top-K confidence trajectories captured during decoding."""
+
+        expected_policy = (self.sampling or SamplingConfig()).policy_id
+        reusable = all(
+            item.model_id == self.backend.model_id
+            and item.policy_id == expected_policy
+            and item.confidence_top_k == self.top_k
+            and item.token_topk_confidences is not None
+            for item in statistics
+        )
+        if not reusable:
+            return self.batch(prompt, tuple(item.token_ids for item in statistics))
+        rewards: list[float] = []
+        for item in statistics:
+            reasoning = self._reasoning_tokens(item.token_ids)
+            if not reasoning:
+                raise ValueError("Consilience reward requires a nonempty reasoning sequence")
+            assert item.token_topk_confidences is not None
+            values = item.token_topk_confidences[: len(reasoning)]
             rewards.append(self._trajectory_score(values))
         return tuple(rewards)
 

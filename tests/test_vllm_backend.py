@@ -62,6 +62,22 @@ def test_vllm_sampling_api_uses_025_and_026_public_import_paths(
     assert _load_vllm_sampling_api() == (_SamplingParams, dict, _BeamParams)
 
 
+def test_vllm_sampling_api_tolerates_v018_without_public_prompt_or_beam_types(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vllm = types.ModuleType("vllm")
+    sampling_params = types.ModuleType("vllm.sampling_params")
+    setattr(vllm, "SamplingParams", _SamplingParams)
+    monkeypatch.setitem(sys.modules, "vllm", vllm)
+    monkeypatch.setitem(sys.modules, "vllm.sampling_params", sampling_params)
+
+    loaded_sampling, loaded_prompt, loaded_beam = _load_vllm_sampling_api()
+
+    assert loaded_sampling is _SamplingParams
+    assert loaded_prompt is None
+    assert loaded_beam(beam_width=2).beam_width == 2
+
+
 @dataclass
 class _Metric:
     name: str
@@ -128,6 +144,29 @@ class _Engine:
 
     def shutdown(self):
         self.closed = True
+
+
+class _TopKEngine(_Engine):
+    def generate(self, prompts, *, sampling_params, use_tqdm, **kwargs):
+        self.calls.append((prompts, sampling_params, use_tqdm, kwargs))
+        params = sampling_params if isinstance(sampling_params, list) else [sampling_params]
+        return [
+            _Output(
+                [
+                    _Completion(
+                        [3],
+                        [
+                            {
+                                3: _Logprob(-0.1),
+                                4: _Logprob(-0.2),
+                                5: _Logprob(-0.6),
+                            }
+                        ],
+                    )
+                ]
+            )
+            for _prompt, _policy in zip(prompts, params, strict=True)
+        ]
 
 
 class _BeamEngine(_Engine):
@@ -217,6 +256,31 @@ def _backend(*, fallback=None):
         scoring_backend=fallback,
     )
     return backend, engine
+
+
+def test_vllm_generation_captures_requested_topk_confidence() -> None:
+    engine = _TopKEngine()
+    backend = VLLMBackend(
+        engine,
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+    )
+    request = GenerationRequest(
+        (1,),
+        1,
+        SamplingConfig(),
+        7,
+        "top-k",
+        confidence_top_k=3,
+    )
+
+    sample = backend.sample_batch([request])[0]
+
+    assert engine.calls[0][1][0].logprobs == 3
+    assert sample.token_topk_confidences == pytest.approx((0.3,))
+    assert sample.confidence_top_k == 3
 
 
 def test_vllm_sampling_preserves_per_request_seed_policy_and_order() -> None:
