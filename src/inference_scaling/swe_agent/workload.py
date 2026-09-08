@@ -139,21 +139,25 @@ def build_public_workload(
     paths = sorted(source.rglob("*.traj.json"))
     if not paths:
         raise ValueError(f"no *.traj.json files found below {source}")
-    counter = _token_counter(model)
     snapshots: list[dict[str, Any]] = []
     for path in paths:
         value = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(value, dict):
             raise ValueError(f"{path} is not a JSON object")
         snapshots.extend(
-            extract_call_snapshots(value, source=path, token_count=counter)
+            extract_call_snapshots(value, source=path)
         )
     if len(snapshots) < total:
         raise ValueError(f"need {total} public calls, found {len(snapshots)}")
     rng = random.Random(seed)
     rng.shuffle(snapshots)
     selected = snapshots[:total]
-    lengths = [int(item["diagnostics"]["prompt_tokens"]) for item in selected]
+    counter = _token_counter(model)
+    lengths = []
+    for item in selected:
+        length = counter(item["messages"])
+        item["diagnostics"]["prompt_tokens"] = length
+        lengths.append(length)
     required = max(lengths) + max_new_tokens + context_margin
     max_model_len = next(
         (value for value in (16384, 32768, 65536) if value >= required),

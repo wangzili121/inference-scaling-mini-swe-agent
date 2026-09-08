@@ -15,7 +15,11 @@ from inference_scaling.swe_agent.calibration import (
     calibrate_logprob_alpha,
     calibrate_reward_temperature,
 )
-from inference_scaling.swe_agent.workload import extract_call_snapshots, freeze_workload
+from inference_scaling.swe_agent.workload import (
+    build_public_workload,
+    extract_call_snapshots,
+    freeze_workload,
+)
 from inference_scaling.swe_agent.reward_screen import _screen_temperature
 from inference_scaling.swe_agent.runtime_tune import (
     adaptive_search_plan,
@@ -293,6 +297,45 @@ def test_public_trajectory_extracts_each_model_call_without_mutation(
     assert [item["diagnostics"]["prompt_tokens"] for item in snapshots] == [20, 40]
     assert snapshots[0]["messages"] == trajectory["messages"][:2]
     assert snapshots[1]["messages"] == trajectory["messages"][:4]
+
+
+def test_public_workload_tokenizes_only_seeded_selection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "trajectories"
+    source.mkdir()
+    for index in range(3):
+        (source / f"task-{index}.traj.json").write_text(
+            json.dumps(
+                {
+                    "instance_id": f"task-{index}",
+                    "messages": [
+                        {"role": "user", "content": "fix"},
+                        {"role": "assistant", "content": "inspect"},
+                        {"role": "tool", "content": "result"},
+                        {"role": "assistant", "content": "finish"},
+                    ],
+                }
+            )
+        )
+    calls = []
+
+    def counter(messages):
+        calls.append(messages)
+        return len(messages) * 10
+
+    monkeypatch.setattr(
+        "inference_scaling.swe_agent.workload._token_counter",
+        lambda _model: counter,
+    )
+
+    result = build_public_workload(
+        source, tmp_path / "output", model="model", seed=7, total=2
+    )
+
+    assert len(calls) == 2
+    assert result["count"] == 2
+    assert result["prompt_tokens"]["maximum"] in {10, 30}
 
 
 def test_swebench_launcher_selects_canonical_or_explicit_order() -> None:
