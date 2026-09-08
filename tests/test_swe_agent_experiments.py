@@ -397,6 +397,7 @@ def test_deployer_rejects_busy_cards_and_mounts_native_categorical(
     model = tmp_path / "model"
     categorical = tmp_path / "categorical"
     cache = tmp_path / "cache"
+    artifacts = tmp_path / "artifacts"
     config.parent.mkdir(parents=True)
     config.write_text("config")
     model.mkdir()
@@ -418,6 +419,7 @@ def test_deployer_rejects_busy_cards_and_mounts_native_categorical(
         config=config,
         categorical_root=categorical,
         cache_root=cache,
+        artifact_root=artifacts,
         devices=(0, 1),
         port=8123,
     )
@@ -430,6 +432,7 @@ def test_deployer_rejects_busy_cards_and_mounts_native_categorical(
     assert not any(value.startswith("LD_LIBRARY_PATH=") for value in command)
     assert any("${PYTHONPATH:+:${PYTHONPATH}}" in value for value in command)
     assert any("runtime/sampler.py" in value for value in command)
+    assert f"{artifacts}:/artifacts" in command
     assert all(asset["sha256"] for asset in assets)
 
 

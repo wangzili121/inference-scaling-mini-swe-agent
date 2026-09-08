@@ -93,6 +93,7 @@ def build_docker_command(
     cache_root: Path,
     devices: Sequence[int],
     port: int,
+    artifact_root: Path | None = None,
     overrides: Sequence[str] = (),
 ) -> tuple[list[str], list[dict[str, Any]]]:
     if not devices or len(set(devices)) != len(devices):
@@ -128,6 +129,8 @@ def build_docker_command(
     command.extend(("--volume", f"{repository}:/workspace"))
     command.extend(("--volume", f"{model}:/models/conditional-is:ro"))
     command.extend(("--volume", f"{cache_root}:/root/.cache/vllm"))
+    if artifact_root is not None:
+        command.extend(("--volume", f"{artifact_root}:/artifacts"))
     for asset in assets:
         command.extend(
             ("--volume", f"{asset['source']}:{asset['target']}:ro")
@@ -215,6 +218,13 @@ def main() -> None:
     parser.add_argument("--categorical-root", required=True)
     parser.add_argument("--cache-root", required=True)
     parser.add_argument(
+        "--artifact-root",
+        help=(
+            "host directory mounted read-write at /artifacts; when supplied, "
+            "the default algorithm trace is stored below this directory"
+        ),
+    )
+    parser.add_argument(
         "--config", default="configs/swebench/conditional_is_smoke.toml"
     )
     parser.add_argument("--image", default=DEFAULT_IMAGE)
@@ -232,6 +242,7 @@ def main() -> None:
     config = (repository / args.config).resolve()
     categorical_root = Path(args.categorical_root).resolve()
     cache_root = Path(args.cache_root).resolve()
+    artifact_root = Path(args.artifact_root).resolve() if args.artifact_root else None
     devices = tuple(int(value) for value in args.devices.split(","))
     for required in (repository, model, config, categorical_root):
         if not required.exists():
@@ -249,6 +260,12 @@ def main() -> None:
         conflicts = {device: busy[device] for device in devices if busy.get(device)}
         if conflicts:
             raise RuntimeError(f"refusing to use NPUs with existing processes: {conflicts}")
+    overrides = list(args.overrides)
+    trace_path = None
+    if artifact_root is not None:
+        trace_path = "/artifacts/algorithm-traces/model_calls.jsonl"
+        if not any(value.startswith("service.trace_path=") for value in overrides):
+            overrides.append(f"service.trace_path={json.dumps(trace_path)}")
     command, assets = build_docker_command(
         image=args.image,
         name=args.name,
@@ -257,9 +274,10 @@ def main() -> None:
         config=config,
         categorical_root=categorical_root,
         cache_root=cache_root,
+        artifact_root=artifact_root,
         devices=devices,
         port=args.port,
-        overrides=args.overrides,
+        overrides=overrides,
     )
     manifest = {
         "schema_version": 1,
@@ -272,9 +290,11 @@ def main() -> None:
         "config": str(config),
         "config_sha256": _sha256(config),
         "categorical_assets": assets,
+        "artifact_root": str(artifact_root) if artifact_root is not None else None,
+        "container_trace_path": trace_path,
         "devices": list(devices),
         "port": args.port,
-        "overrides": args.overrides,
+        "overrides": overrides,
         "command": command,
     }
     manifest_path = Path(args.manifest)
@@ -286,6 +306,8 @@ def main() -> None:
         print(json.dumps(manifest, indent=2))
         return
     cache_root.mkdir(parents=True, exist_ok=True)
+    if artifact_root is not None:
+        (artifact_root / "algorithm-traces").mkdir(parents=True, exist_ok=True)
     subprocess.run(command, check=True)
 
 
