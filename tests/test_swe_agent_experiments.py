@@ -52,7 +52,10 @@ from inference_scaling.swe_agent.profile_analysis import (
     recommendations,
 )
 from inference_scaling.swe_agent.profile_report import render_profile_report
-from inference_scaling.swe_agent.profile import _profile_preflight
+from inference_scaling.swe_agent.profile import (
+    _native_activation_evidence,
+    _profile_preflight,
+)
 from inference_scaling.swe_agent.graph_capture import graph_capture_candidates
 from inference_scaling.swe_agent.evaluate import build_evaluation_command
 from inference_scaling.swe_agent.deploy import (
@@ -899,12 +902,14 @@ def test_profile_matrix_plans_separate_unprofiled_service_and_torch_passes(
         warmup_workload=None,
         output=tmp_path / "profiles",
         seed=1,
+        categorical_root=tmp_path / "categorical",
     )
 
     assert len(commands) == 14
     assert sum(item["profiler"] == "none" for item in commands) == 6
     assert {item["algorithm"] for item in commands} == {"P0", "P1", "P2", "P3"}
     assert all("--profiler" in item["command"] for item in commands)
+    assert all("--categorical-root" in item["command"] for item in commands)
 
 
 def test_profile_archive_has_external_sha256(tmp_path: Path) -> None:
@@ -1041,3 +1046,24 @@ def test_profile_preflight_requires_native_categorical_assets(
 
     with pytest.raises(RuntimeError, match="requires --categorical-root"):
         _profile_preflight(args, tmp_path / "artifacts")
+
+
+def test_native_activation_evidence_requires_every_instance(tmp_path: Path) -> None:
+    activated = tmp_path / "activated.log"
+    inactive = tmp_path / "inactive.log"
+    activated.write_text("vLLM-Ascend native categorical sampler activated\n")
+    inactive.write_text("service ready\n")
+    args = SimpleNamespace(
+        environment=["VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE=1"]
+    )
+    services = [
+        SimpleNamespace(instance_id="profile-0", log=SimpleNamespace(name=activated)),
+        SimpleNamespace(instance_id="profile-1", log=SimpleNamespace(name=inactive)),
+    ]
+
+    evidence = _native_activation_evidence(args, services)
+
+    assert evidence["requested"] is True
+    assert evidence["activated"] is False
+    assert evidence["logs"]["profile-0"]["marker_count"] == 1
+    assert evidence["logs"]["profile-1"]["marker_count"] == 0
