@@ -102,6 +102,7 @@ def write_artifact_manifest(
                 "torch",
                 "torch-npu",
                 "transformers",
+                "msserviceprofiler",
             )
         ),
         "environment": {

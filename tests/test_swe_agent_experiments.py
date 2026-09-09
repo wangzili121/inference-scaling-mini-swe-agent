@@ -47,6 +47,7 @@ from inference_scaling.swe_agent.profile_analysis import (
     recommendations,
 )
 from inference_scaling.swe_agent.profile_report import render_profile_report
+from inference_scaling.swe_agent.profile import _profile_preflight
 from inference_scaling.swe_agent.graph_capture import graph_capture_candidates
 from inference_scaling.swe_agent.evaluate import build_evaluation_command
 from inference_scaling.swe_agent.deploy import (
@@ -905,3 +906,40 @@ def test_profile_archive_has_external_sha256(tmp_path: Path) -> None:
 
     assert Path(result["archive"]).is_file()
     assert Path(result["checksum"]).read_text().startswith(str(result["sha256"]))
+
+
+def test_profile_preflight_checks_inputs_before_starting_services(tmp_path: Path) -> None:
+    args = SimpleNamespace(
+        config=tmp_path / "missing.toml",
+        workload=tmp_path / "missing.jsonl",
+        warmup_workload=None,
+        profiling_symbols=None,
+        profiler="none",
+        environment=[],
+    )
+
+    with pytest.raises(FileNotFoundError, match="config, workload"):
+        _profile_preflight(args, tmp_path / "artifacts")
+
+
+def test_profile_preflight_checks_config_environment(tmp_path: Path) -> None:
+    config = tmp_path / "service.toml"
+    workload = tmp_path / "workload.jsonl"
+    config.write_text('model = "${CIS_MODEL_PATH}"\n')
+    workload.write_text("{}\n")
+    args = SimpleNamespace(
+        config=config,
+        workload=workload,
+        warmup_workload=None,
+        profiling_symbols=None,
+        profiler="none",
+        environment=[],
+    )
+
+    with pytest.raises(RuntimeError, match="CIS_MODEL_PATH"):
+        _profile_preflight(args, tmp_path / "artifacts")
+
+    args.environment = ["CIS_MODEL_PATH=/models/conditional-is"]
+    assert _profile_preflight(args, tmp_path / "artifacts") == {
+        "output_writable": True
+    }

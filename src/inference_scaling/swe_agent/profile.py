@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.metadata
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -22,6 +26,10 @@ from inference_scaling.swe_agent.artifacts import sha256_file, write_artifact_ma
 from inference_scaling.swe_agent.runtime_tune import _stop, _wait_for_health
 
 
+SERVICE_PROFILER_VERSION = "1.2.2"
+ENVIRONMENT_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
 @dataclass(slots=True)
 class ProfileService:
     instance_id: str
@@ -32,6 +40,102 @@ class ProfileService:
     trace_path: Path
     profile_directory: Path
     service_profile_config: Path | None
+
+
+def _verify_writable_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    probe = path / f".profile-preflight-{os.getpid()}"
+    try:
+        probe.write_text("ok\n", encoding="utf-8")
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def _profile_preflight(args: argparse.Namespace, output: Path) -> dict[str, Any]:
+    """Reject incomplete profiler environments before loading the model."""
+
+    required_files = {
+        "config": Path(args.config).resolve(),
+        "workload": Path(args.workload).resolve(),
+    }
+    if args.warmup_workload:
+        required_files["warmup workload"] = Path(args.warmup_workload).resolve()
+    if args.profiling_symbols:
+        required_files["profiling symbols"] = Path(args.profiling_symbols).resolve()
+    missing = [name for name, path in required_files.items() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "profiling preflight missing " + ", ".join(sorted(missing))
+        )
+    child_environment = dict(os.environ)
+    for assignment in args.environment:
+        if "=" not in assignment:
+            raise ValueError(f"environment override requires KEY=VALUE: {assignment}")
+        key, value = assignment.split("=", 1)
+        if value == "__UNSET__":
+            child_environment.pop(key, None)
+        else:
+            child_environment[key] = value
+    references = set(
+        ENVIRONMENT_REFERENCE.findall(
+            required_files["config"].read_text(encoding="utf-8")
+        )
+    )
+    missing_environment = sorted(
+        name for name in references if not child_environment.get(name)
+    )
+    if missing_environment:
+        raise RuntimeError(
+            "profiling preflight missing environment: "
+            + ", ".join(missing_environment)
+        )
+    _verify_writable_directory(output)
+
+    dependencies: dict[str, Any] = {"output_writable": True}
+    if args.profiler == "service":
+        try:
+            version = importlib.metadata.version("msserviceprofiler")
+        except importlib.metadata.PackageNotFoundError as error:
+            raise RuntimeError(
+                "service profiling requires msserviceprofiler=="
+                f"{SERVICE_PROFILER_VERSION} before model startup"
+            ) from error
+        if version != SERVICE_PROFILER_VERSION:
+            raise RuntimeError(
+                "service profiling requires msserviceprofiler=="
+                f"{SERVICE_PROFILER_VERSION}, found {version}"
+            )
+        executable = shutil.which("msserviceprofiler")
+        if executable is None:
+            raise RuntimeError("msserviceprofiler CLI is not on PATH")
+        completed = subprocess.run(
+            (executable, "analyze", "--help"),
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "msserviceprofiler analyze preflight failed: "
+                + (completed.stderr.strip() or completed.stdout.strip())
+            )
+        dependencies.update(
+            {
+                "msserviceprofiler": version,
+                "msserviceprofiler_cli": executable,
+            }
+        )
+    elif args.profiler == "torch":
+        try:
+            profiler = importlib.import_module("torch_npu.profiler.profiler")
+        except ImportError as error:
+            raise RuntimeError(
+                "torch profiling requires torch_npu.profiler before model startup"
+            ) from error
+        if not callable(getattr(profiler, "analyse", None)):
+            raise RuntimeError("torch_npu.profiler.profiler.analyse is unavailable")
+        dependencies["torch_npu_analyse"] = True
+    return dependencies
 
 
 def _post_control(
@@ -313,6 +417,7 @@ def main() -> None:
 
     output = Path(args.output_directory).resolve()
     output.mkdir(parents=True, exist_ok=True)
+    profiler_dependencies = _profile_preflight(args, output)
     records = _load_records(Path(args.workload))[: args.limit]
     if not records:
         raise ValueError("profiling requires at least one workload record")
@@ -383,6 +488,7 @@ def main() -> None:
                     for service in services
                 ],
                 "service_analysis": service_analysis,
+                "dependencies": profiler_dependencies,
             },
             "started_at": started_at,
             "topology": {
@@ -408,6 +514,7 @@ def main() -> None:
         command=sys.argv,
         metadata={
             "profiler": args.profiler,
+            "profiler_dependencies": profiler_dependencies,
             "profile_window": window,
             "devices": args.devices,
             "topology": result["topology"],
