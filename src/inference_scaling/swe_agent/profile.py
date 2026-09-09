@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 import urllib.request
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dataclasses import dataclass
@@ -52,6 +53,61 @@ def _verify_writable_directory(path: Path) -> None:
         probe.write_text("ok\n", encoding="utf-8")
     finally:
         probe.unlink(missing_ok=True)
+
+
+def _verify_local_model(
+    config_path: Path, environment: dict[str, str]
+) -> dict[str, Any] | None:
+    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    model = config.get("models", {}).get("base")
+    if not isinstance(model, str):
+        return None
+    reference = ENVIRONMENT_REFERENCE.sub(
+        lambda match: environment.get(match.group(1), match.group(0)), model
+    )
+    path = Path(reference)
+    if not path.is_absolute():
+        return {"reference": reference, "local": False}
+    if not path.is_dir():
+        raise RuntimeError(f"profiling preflight model directory is missing: {path}")
+
+    config_file = path / "config.json"
+    if not config_file.is_file():
+        raise RuntimeError(f"profiling preflight model config is missing: {config_file}")
+    try:
+        model_config = json.loads(config_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"profiling preflight model config is invalid: {config_file}"
+        ) from error
+    model_type = model_config.get("model_type")
+    if not isinstance(model_type, str) or not model_type:
+        raise RuntimeError(
+            f"profiling preflight model_type is missing: {config_file}"
+        )
+
+    tokenizer_files = [
+        path / name
+        for name in ("tokenizer.json", "tokenizer_config.json", "vocab.json")
+        if (path / name).is_file()
+    ]
+    if not tokenizer_files:
+        raise RuntimeError(
+            f"profiling preflight tokenizer files are missing under: {path}"
+        )
+    weight_files = sorted(path.glob("*.safetensors")) + sorted(path.glob("*.bin"))
+    if not weight_files:
+        raise RuntimeError(
+            f"profiling preflight model weights are missing under: {path}"
+        )
+    return {
+        "reference": reference,
+        "local": True,
+        "model_type": model_type,
+        "weight_files": len(weight_files),
+        "weight_bytes": sum(item.stat().st_size for item in weight_files),
+        "tokenizer_files": sorted(item.name for item in tokenizer_files),
+    }
 
 
 def _verify_npu_runtime(devices: Sequence[str]) -> dict[str, Any]:
@@ -192,6 +248,9 @@ def _profile_preflight(args: argparse.Namespace, output: Path) -> dict[str, Any]
     _verify_writable_directory(output)
 
     dependencies: dict[str, Any] = {"output_writable": True}
+    model = _verify_local_model(required_files["config"], child_environment)
+    if model is not None:
+        dependencies["model"] = model
     if getattr(args, "devices", None):
         dependencies["npu_runtime"] = _verify_npu_runtime(args.devices)
     if child_environment.get("VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE") == "1":

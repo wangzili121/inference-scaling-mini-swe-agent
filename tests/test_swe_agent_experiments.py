@@ -980,6 +980,42 @@ def test_profile_preflight_checks_config_environment(tmp_path: Path) -> None:
     }
 
 
+def test_profile_preflight_rejects_incomplete_local_model(tmp_path: Path) -> None:
+    model = tmp_path / "model"
+    model.mkdir()
+    config = tmp_path / "service.toml"
+    workload = tmp_path / "workload.jsonl"
+    config.write_text('[models]\nbase = "${CIS_MODEL_PATH}"\n')
+    workload.write_text("{}\n")
+    args = SimpleNamespace(
+        config=config,
+        workload=workload,
+        warmup_workload=None,
+        profiling_symbols=None,
+        profiler="none",
+        environment=[f"CIS_MODEL_PATH={model}"],
+        devices=[],
+    )
+
+    with pytest.raises(RuntimeError, match="model config is missing"):
+        _profile_preflight(args, tmp_path / "artifacts")
+
+    (model / "config.json").write_text('{"model_type": "qwen3_moe"}\n')
+    (model / "tokenizer_config.json").write_text("{}\n")
+    (model / "model-00001-of-00001.safetensors").write_bytes(b"weights")
+
+    dependencies = _profile_preflight(args, tmp_path / "artifacts")
+
+    assert dependencies["model"] == {
+        "reference": str(model),
+        "local": True,
+        "model_type": "qwen3_moe",
+        "weight_files": 1,
+        "weight_bytes": 7,
+        "tokenizer_files": ["tokenizer_config.json"],
+    }
+
+
 def test_service_profile_preflight_checks_analyzer_dependencies(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
