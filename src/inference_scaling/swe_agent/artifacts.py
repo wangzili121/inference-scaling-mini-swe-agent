@@ -126,3 +126,16 @@ def write_artifact_manifest(
     manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     payload["manifest_sha256"] = sha256_file(manifest_path)
     return payload
+
+
+def refresh_artifact_manifest(output_directory: str | Path) -> dict[str, Any]:
+    """Refresh artifact hashes without replacing collection-time metadata."""
+
+    output = Path(output_directory).resolve()
+    manifest_path = output / "artifact-manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["artifacts"] = artifact_index(output, excluded=(manifest_path,))
+    payload.pop("manifest_sha256", None)
+    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    payload["manifest_sha256"] = sha256_file(manifest_path)
+    return payload

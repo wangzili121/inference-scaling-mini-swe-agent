@@ -17,7 +17,7 @@ from inference_scaling.swe_agent.profile_analysis import (
     recommendations,
 )
 from inference_scaling.swe_agent.graph_capture import graph_capture_candidates
-from inference_scaling.swe_agent.artifacts import write_artifact_manifest
+from inference_scaling.swe_agent.artifacts import refresh_artifact_manifest
 
 
 def _write_csv(path: Path, rows: Iterable[dict[str, Any]]) -> None:
@@ -269,13 +269,7 @@ def render_profile_report(profile_directory: str | Path) -> dict[str, Any]:
     report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
     manifest_path = root / "artifact-manifest.json"
     if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text())
-        write_artifact_manifest(
-            root,
-            repository=manifest["repository"],
-            command=manifest["command"],
-            metadata=manifest["metadata"],
-        )
+        refresh_artifact_manifest(root)
     return {
         "analysis": str(derived / "analysis.json"),
         "report": str(report_path),

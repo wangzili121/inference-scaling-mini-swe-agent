@@ -14,7 +14,11 @@ from inference_scaling.swe_agent import profile as profile_module
 from inference_scaling.swe_agent import topology as topology_module
 from inference_scaling.swe_agent.algorithm_grid import _pareto
 from inference_scaling.swe_agent.archive_artifacts import archive_artifacts
-from inference_scaling.swe_agent.artifacts import source_revision
+from inference_scaling.swe_agent.artifacts import (
+    refresh_artifact_manifest,
+    source_revision,
+    write_artifact_manifest,
+)
 from inference_scaling.swe_agent.calibration import (
     block_ess_ratios,
     calibrate_logprob_alpha,
@@ -907,6 +911,26 @@ def test_profile_archive_has_external_sha256(tmp_path: Path) -> None:
 
     assert Path(result["archive"]).is_file()
     assert Path(result["checksum"]).read_text().startswith(str(result["sha256"]))
+
+
+def test_refresh_artifact_manifest_preserves_collection_metadata(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "profile"
+    output.mkdir()
+    manifest = write_artifact_manifest(
+        output,
+        repository=tmp_path,
+        command=("profile", "--profiler=torch"),
+        metadata={"profiler": "torch", "collected_on": "npu-host"},
+    )
+    (output / "derived.json").write_text("{}\n")
+
+    refreshed = refresh_artifact_manifest(output)
+
+    assert refreshed["created_at"] == manifest["created_at"]
+    assert refreshed["metadata"] == manifest["metadata"]
+    assert {item["path"] for item in refreshed["artifacts"]} == {"derived.json"}
 
 
 def test_profile_preflight_checks_inputs_before_starting_services(tmp_path: Path) -> None:
