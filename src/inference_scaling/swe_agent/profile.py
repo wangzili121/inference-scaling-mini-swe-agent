@@ -51,6 +51,48 @@ def _verify_writable_directory(path: Path) -> None:
         probe.unlink(missing_ok=True)
 
 
+def _verify_npu_runtime(devices: Sequence[str]) -> dict[str, Any]:
+    device_ids = sorted(
+        {
+            int(device)
+            for group in devices
+            for device in group.split(",")
+            if device.strip()
+        }
+    )
+    missing_nodes = [
+        str(path)
+        for device in device_ids
+        if not (path := Path(f"/dev/davinci{device}")).exists()
+    ]
+    if missing_nodes:
+        raise RuntimeError(
+            "profiling preflight missing NPU device nodes: "
+            + ", ".join(missing_nodes)
+        )
+    if not Path("/usr/local/Ascend/driver").is_dir():
+        raise RuntimeError("profiling preflight missing /usr/local/Ascend/driver")
+    executable = shutil.which("npu-smi")
+    if executable is None:
+        raise RuntimeError("profiling preflight requires npu-smi on PATH")
+    completed = subprocess.run(
+        (executable, "info"),
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    if completed.returncode != 0 or "910" not in completed.stdout:
+        raise RuntimeError(
+            "npu-smi preflight failed: "
+            + (completed.stderr.strip() or completed.stdout.strip())
+        )
+    return {
+        "device_ids": device_ids,
+        "npu_smi": executable,
+        "driver_mounted": True,
+    }
+
+
 def _profile_preflight(args: argparse.Namespace, output: Path) -> dict[str, Any]:
     """Reject incomplete profiler environments before loading the model."""
 
@@ -92,6 +134,8 @@ def _profile_preflight(args: argparse.Namespace, output: Path) -> dict[str, Any]
     _verify_writable_directory(output)
 
     dependencies: dict[str, Any] = {"output_writable": True}
+    if getattr(args, "devices", None):
+        dependencies["npu_runtime"] = _verify_npu_runtime(args.devices)
     if args.profiler == "service":
         try:
             version = importlib.metadata.version("msserviceprofiler")
