@@ -189,6 +189,42 @@ def test_burst_routes_whole_jobs_across_endpoints(monkeypatch) -> None:
     )
 
 
+def test_cis_work_balanced_routing_pairs_long_and_short_jobs(monkeypatch) -> None:
+    calls = []
+
+    def fake_post(endpoint, payload, timeout):
+        calls.append((endpoint, payload["request_id"]))
+        return {"message": {"extra": {"actions": []}}, "diagnostics": {}}
+
+    monkeypatch.setattr(benchmark, "_post", fake_post)
+    monkeypatch.setattr(benchmark, "_backend_snapshot", lambda endpoint: {})
+    records = [_trace_record(index) for index in range(4)]
+    for record, prompt_tokens in zip(records, (1000, 900, 100, 50), strict=True):
+        record["diagnostics"]["prompt_tokens"] = prompt_tokens
+
+    result = benchmark.run_burst(
+        records,
+        ("http://one", "http://two"),
+        workers=4,
+        routing="cis_work_balanced",
+        conditional_overrides={
+            "candidate_count": 15,
+            "rollout_count": 3,
+            "block_size": 128,
+        },
+    )
+
+    endpoints_by_index = {
+        int(request_id.split(":")[-2]): endpoint
+        for endpoint, request_id in calls
+    }
+    assert endpoints_by_index[0] == endpoints_by_index[3]
+    assert endpoints_by_index[1] == endpoints_by_index[2]
+    loads = result["routing"]["estimated_attention_work"]
+    assert set(loads) == {"http://one", "http://two"}
+    assert max(loads.values()) / min(loads.values()) < 1.1
+
+
 def test_burst_separates_execution_success_from_action_validity(monkeypatch) -> None:
     monkeypatch.setattr(
         benchmark,

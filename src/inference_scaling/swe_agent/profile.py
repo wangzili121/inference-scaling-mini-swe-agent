@@ -658,7 +658,9 @@ def main() -> None:
     parser.add_argument("--tensor-parallel-size", type=int, default=2)
     parser.add_argument("--pipeline-parallel-size", type=int, default=1)
     parser.add_argument(
-        "--routing", choices=("round_robin", "least_outstanding"), default="round_robin"
+        "--routing",
+        choices=("round_robin", "least_outstanding", "cis_work_balanced"),
+        default="round_robin",
     )
     parser.add_argument(
         "--profiler", choices=("none", "torch", "service"), required=True

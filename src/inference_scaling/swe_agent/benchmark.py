@@ -32,23 +32,111 @@ class RequestMeasurement:
     transport_retries: int = 0
 
 
+ROUTING_MODES = ("round_robin", "least_outstanding", "cis_work_balanced")
+
+
+def estimate_cis_attention_work(
+    record: dict[str, Any],
+    conditional: dict[str, int] | None,
+    *,
+    default_total_length: int = 512,
+) -> float:
+    """Estimate the dense attention work of one complete CIS request.
+
+    This deliberately models the algorithmic branch tree rather than a top-level
+    request count.  It is an upper-bound proxy: EOS can reduce real work, but the
+    ordering remains useful before any branch has started.
+    """
+
+    diagnostics = record.get("diagnostics")
+    prompt_tokens = (
+        diagnostics.get("prompt_tokens")
+        if isinstance(diagnostics, dict)
+        else None
+    )
+    if not isinstance(prompt_tokens, (int, float)) or prompt_tokens <= 0:
+        raise ValueError(
+            "cis_work_balanced routing requires diagnostics.prompt_tokens"
+        )
+    values = conditional or {}
+    candidates = int(values.get("candidate_count", 1))
+    rollouts = int(values.get("rollout_count", 1))
+    block = int(values.get("block_size", 1))
+    total = int(values.get("total_length", default_total_length))
+    if min(candidates, rollouts, block, total) <= 0:
+        raise ValueError("Conditional IS work parameters must be positive")
+
+    work = 0.0
+    generated = 0
+    while generated < total:
+        candidate_tokens = min(block, total - generated)
+        candidate_prefix = float(prompt_tokens + generated)
+        # Sum the KV length read by each autoregressive token in this block.
+        work += candidates * (
+            candidate_tokens * candidate_prefix
+            + candidate_tokens * (candidate_tokens + 1) / 2
+        )
+        rollout_tokens = total - generated - candidate_tokens
+        rollout_prefix = candidate_prefix + candidate_tokens
+        work += candidates * rollouts * (
+            rollout_tokens * rollout_prefix
+            + rollout_tokens * (rollout_tokens + 1) / 2
+        )
+        generated += candidate_tokens
+    return work
+
+
+def balanced_cis_assignments(
+    records: Sequence[dict[str, Any]],
+    endpoints: Sequence[str],
+    conditional: dict[str, int] | None,
+) -> tuple[tuple[str, ...], dict[str, float]]:
+    """Assign whole CIS trees with deterministic longest-processing-time first."""
+
+    loads = {endpoint: 0.0 for endpoint in endpoints}
+    assignments: list[str | None] = [None] * len(records)
+    estimates = [estimate_cis_attention_work(record, conditional) for record in records]
+    for index in sorted(range(len(records)), key=lambda item: (-estimates[item], item)):
+        endpoint = min(endpoints, key=lambda item: (loads[item], endpoints.index(item)))
+        assignments[index] = endpoint
+        loads[endpoint] += estimates[index]
+    return tuple(value for value in assignments if value is not None), loads
+
+
 class EndpointRouter:
     """Thread-safe whole-job routing with observable per-instance pressure."""
 
-    def __init__(self, endpoints: Sequence[str], mode: str) -> None:
-        if mode not in {"round_robin", "least_outstanding"}:
+    def __init__(
+        self,
+        endpoints: Sequence[str],
+        mode: str,
+        *,
+        assignments: Sequence[str] | None = None,
+        estimated_loads: dict[str, float] | None = None,
+    ) -> None:
+        if mode not in ROUTING_MODES:
             raise ValueError(f"unknown routing mode: {mode}")
+        if mode == "cis_work_balanced":
+            if assignments is None:
+                raise ValueError("cis_work_balanced routing requires assignments")
+            if any(endpoint not in endpoints for endpoint in assignments):
+                raise ValueError("routing assignment references an unknown endpoint")
         self.endpoints = tuple(endpoints)
         self.mode = mode
+        self._assignments = tuple(assignments or ())
+        self._estimated_loads = dict(estimated_loads or {})
         self._lock = threading.Lock()
         self._cursor = 0
         self._outstanding = {endpoint: 0 for endpoint in endpoints}
         self._assigned = {endpoint: 0 for endpoint in endpoints}
         self._maximum = {endpoint: 0 for endpoint in endpoints}
 
-    def acquire(self) -> str:
+    def acquire(self, request_index: int) -> str:
         with self._lock:
-            if self.mode == "round_robin":
+            if self.mode == "cis_work_balanced":
+                endpoint = self._assignments[request_index]
+                index = self.endpoints.index(endpoint)
+            elif self.mode == "round_robin":
                 index = self._cursor % len(self.endpoints)
             else:
                 minimum = min(self._outstanding.values())
@@ -84,6 +172,7 @@ class EndpointRouter:
                 "assigned": dict(self._assigned),
                 "maximum_outstanding": dict(self._maximum),
                 "final_outstanding": dict(self._outstanding),
+                "estimated_attention_work": dict(self._estimated_loads),
             }
 
 
@@ -180,7 +269,18 @@ def run_burst(
         raise ValueError("transport retries must be non-negative")
     run_namespace = run_namespace or f"burst:{time.time_ns()}"
     release = threading.Event()
-    router = EndpointRouter(endpoints, routing)
+    assignments = None
+    estimated_loads = None
+    if routing == "cis_work_balanced":
+        assignments, estimated_loads = balanced_cis_assignments(
+            records, endpoints, conditional_overrides
+        )
+    router = EndpointRouter(
+        endpoints,
+        routing,
+        assignments=assignments,
+        estimated_loads=estimated_loads,
+    )
     before_snapshots = {endpoint: _backend_snapshot(endpoint) for endpoint in endpoints}
 
     def execute(index: int, record: dict[str, Any]) -> RequestMeasurement:
@@ -193,7 +293,7 @@ def run_burst(
         if conditional_overrides:
             payload["conditional_is"] = dict(conditional_overrides)
         release.wait()
-        endpoint = router.acquire()
+        endpoint = router.acquire(index)
         started = time.perf_counter()
         started_at = time.time()
         completed_retries = 0
@@ -345,7 +445,7 @@ def main() -> None:
     parser.add_argument("--block-size", type=int)
     parser.add_argument(
         "--routing",
-        choices=("round_robin", "least_outstanding"),
+        choices=ROUTING_MODES,
         default="round_robin",
     )
     parser.add_argument("--output", required=True)

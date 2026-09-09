@@ -27,7 +27,11 @@ def build_deployment_manifest(
         raise ValueError("tuning result has no winner")
     engine = EngineConfig(**winner["engine"])
     feature = FeatureConfig(**winner["feature"])
-    if routing not in {"round_robin", "least_outstanding"}:
+    if routing not in {
+        "round_robin",
+        "least_outstanding",
+        "cis_work_balanced",
+    }:
         raise ValueError(f"unknown routing: {routing}")
     if len(devices) not in {1, 2}:
         raise ValueError("profiling deployment requires one or two instances")
@@ -61,7 +65,7 @@ def main() -> None:
     parser.add_argument("--devices", action="append", required=True)
     parser.add_argument(
         "--routing",
-        choices=("round_robin", "least_outstanding"),
+        choices=("round_robin", "least_outstanding", "cis_work_balanced"),
         default="round_robin",
     )
     parser.add_argument("--workers", type=int)
