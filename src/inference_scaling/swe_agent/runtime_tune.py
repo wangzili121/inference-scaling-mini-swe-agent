@@ -186,6 +186,7 @@ def adaptive_search_plan() -> dict[str, Any]:
         ],
         "fast_path": {
             "coarse_survivors": [4, 2, 2],
+            "fine_tuning_requests": 32,
             "memory_initial": [0.90, 0.94, 0.98],
             "partial_prefill_initial": [[1, 1], [2, 1], [4, 2]],
             "workers_initial": [16, 32, 64],
@@ -789,6 +790,7 @@ def main() -> None:
     current_result = _best(selected)
     current = EngineConfig(**current_result["engine"])
     saturated_workers = min(64, len(records))
+    fine_records = records[:32]
     expansion_results: list[dict[str, Any]] = []
     if current.max_num_seqs == 512:
         for value in (768, 1024, 1536, 2048):
@@ -837,7 +839,7 @@ def main() -> None:
             config=config,
             feature=chosen_feature,
             workers=saturated_workers,
-            records=records[:64],
+            records=fine_records,
             **common,
         )
         for config in sorted(refinement_configs, key=lambda item: item.config_id)
@@ -854,7 +856,7 @@ def main() -> None:
             config=replace(current, gpu_memory_utilization=memory),
             feature=chosen_feature,
             workers=saturated_workers,
-            records=records[:64],
+            records=fine_records,
             **common,
         )
         for memory in (0.90, 0.94, 0.98)
@@ -875,7 +877,7 @@ def main() -> None:
             config=replace(current, gpu_memory_utilization=memory),
             feature=chosen_feature,
             workers=saturated_workers,
-            records=records[:64],
+            records=fine_records,
             **common,
         )
         for memory in memory_refinement
@@ -896,7 +898,7 @@ def main() -> None:
             ),
             feature=chosen_feature,
             workers=saturated_workers,
-            records=records[:64],
+            records=fine_records,
             **common,
         )
         for partial, long_partial in ((1, 1), (2, 1), (4, 2))
@@ -928,7 +930,7 @@ def main() -> None:
             ),
             feature=chosen_feature,
             workers=saturated_workers,
-            records=records[:64],
+            records=fine_records,
             **common,
         )
         for partial, long_partial in extra_partial_values
