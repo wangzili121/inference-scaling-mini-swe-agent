@@ -248,6 +248,7 @@ def estimate_conditional_weights(
     rollout_design: str = "iid",
     rollout_index_offset: int = 0,
     generated_prefix_statistics: GeneratedSequenceStatistics | None = None,
+    rollout_submission_batch_size: int | None = None,
     request_namespace: str = "conditional-is",
     stage_observer: StageObserver | None = None,
 ) -> tuple[ConditionalCandidate, ...]:
@@ -268,6 +269,11 @@ def estimate_conditional_weights(
         raise ValueError("unknown rollout_design")
     if rollout_index_offset < 0:
         raise ValueError("rollout_index_offset must be non-negative")
+    if (
+        rollout_submission_batch_size is not None
+        and rollout_submission_batch_size <= 0
+    ):
+        raise ValueError("rollout_submission_batch_size must be positive")
     if rollout_index_offset and rollout_design != "iid":
         raise ValueError("staged rollout offsets currently require iid rollouts")
     if rollout_design != "iid" and reward_batch is not None:
@@ -356,8 +362,17 @@ def estimate_conditional_weights(
             rollout_prefixes.append(rollout_prefix)
 
     rollout_started = perf_counter()
+    submission_batch_size = rollout_submission_batch_size or len(requests) or 1
+    samples: list[SequenceSample] = []
+    submission_batches = 0
     with _profile_range("rollout"):
-        samples = rollout_backend.sample_batch(requests) if requests else []
+        for start in range(0, len(requests), submission_batch_size):
+            samples.extend(
+                rollout_backend.sample_batch(
+                    requests[start : start + submission_batch_size]
+                )
+            )
+            submission_batches += 1
     _observe_stage(
         stage_observer,
         "rollout",
@@ -366,6 +381,8 @@ def estimate_conditional_weights(
         sequence_count=len(requests),
         rollout_length=rollout_length,
         prefix_tokens=(len(rollout_prefixes[0]) if rollout_prefixes else 0),
+        submission_batches=submission_batches,
+        submission_batch_size=rollout_submission_batch_size,
     )
     if len(samples) != len(requests):
         raise RuntimeError("backend returned an invalid number of rollouts")
@@ -690,6 +707,9 @@ class AutoregressiveStepwiseAdapter:
             reward_batch=self.reward_batch,
             rollout_design=self.config.rollout_design,
             generated_prefix_statistics=self._statistics_by_state.get(state),
+            rollout_submission_batch_size=(
+                self.config.rollout_submission_batch_size
+            ),
             request_namespace=self.request_namespace,
             stage_observer=self.stage_observer,
         )

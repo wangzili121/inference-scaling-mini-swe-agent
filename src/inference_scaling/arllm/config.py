@@ -99,6 +99,7 @@ class ConditionalISConfig:
     exact_rollout_early_stop: bool = False
     rollout_log_weight_bounds: tuple[float, float] | None = None
     rollout_evaluation_batch_size: int = 1
+    rollout_submission_batch_size: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("candidate_count", "rollout_count", "block_size", "total_length"):
@@ -128,6 +129,11 @@ class ConditionalISConfig:
             "rollout_evaluation_batch_size",
             self.rollout_evaluation_batch_size,
         )
+        if self.rollout_submission_batch_size is not None:
+            require_positive(
+                "rollout_submission_batch_size",
+                self.rollout_submission_batch_size,
+            )
         if self.rollout_log_weight_bounds is not None:
             if len(self.rollout_log_weight_bounds) != 2:
                 raise ValueError("rollout_log_weight_bounds requires two values")

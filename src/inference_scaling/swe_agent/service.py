@@ -253,6 +253,11 @@ class ConditionalISRunner:
             block_size=int(conditional["block_size"]),
             total_length=self.maximum,
             reward_temperature=float(conditional.get("reward_temperature", 1.0)),
+            rollout_submission_batch_size=(
+                None
+                if conditional.get("rollout_submission_batch_size") is None
+                else int(conditional["rollout_submission_batch_size"])
+            ),
         )
         reward_kind = str(reward.get("kind", "sequence_log_probability"))
         if reward_kind == "sequence_log_probability":

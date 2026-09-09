@@ -236,6 +236,45 @@ def test_rollout_budget_subtracts_candidate_block() -> None:
     )
 
 
+def test_rollout_submission_batches_preserve_logical_candidate_order() -> None:
+    class RecordingBackend(TabularAutoregressiveBackend):
+        def __init__(self) -> None:
+            super().__init__({}, fallback=[0.5, 0.5])
+            self.batch_sizes: list[int] = []
+
+        def sample_batch(self, requests):
+            self.batch_sizes.append(len(requests))
+            return super().sample_batch(requests)
+
+    backend = RecordingBackend()
+    step = conditional_is_step(
+        base_backend=backend,
+        rollout_backend=backend,
+        prompt=(),
+        generated_prefix=(),
+        config=ConditionalISConfig(
+            candidate_count=3,
+            rollout_count=2,
+            block_size=1,
+            total_length=2,
+            rollout_submission_batch_size=2,
+        ),
+        base_sampling=SamplingConfig(),
+        rollout_sampling=SamplingConfig(),
+        reward=lambda _prompt, generated: float(sum(generated)),
+        seeds=SeedStream(20260910),
+        step_index=0,
+    )
+
+    assert backend.batch_sizes == [3, 2, 2, 2]
+    assert [len(candidate.rollouts) for candidate in step.candidates] == [2, 2, 2]
+
+
+def test_rollout_submission_batch_size_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="rollout_submission_batch_size"):
+        ConditionalISConfig(rollout_submission_batch_size=0)
+
+
 def test_conditional_is_never_exceeds_total_length() -> None:
     backend = TabularAutoregressiveBackend({}, fallback=[0.5, 0.5])
     result = run_conditional_is(
