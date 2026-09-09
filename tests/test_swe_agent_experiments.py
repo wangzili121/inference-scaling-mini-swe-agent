@@ -10,6 +10,7 @@ from inference_scaling.swe_agent.service import ConditionalISRunner
 from inference_scaling.swe_agent import benchmark
 from inference_scaling.swe_agent.algorithm_grid import _pareto
 from inference_scaling.swe_agent.archive_artifacts import archive_artifacts
+from inference_scaling.swe_agent.artifacts import source_revision
 from inference_scaling.swe_agent.calibration import (
     block_ess_ratios,
     calibrate_logprob_alpha,
@@ -105,6 +106,11 @@ def test_freeze_workload_is_deterministic_disjoint_and_filters_failures(
 def test_tuning_arm_trace_is_derived_from_its_service_log(tmp_path: Path) -> None:
     log = tmp_path / "logs" / "coarse-1" / "tp2-mns128.log"
     assert arm_trace_path(log) == log.with_suffix(".trace.jsonl")
+
+
+def test_artifact_manifest_reads_snapshot_revision_without_git(tmp_path: Path) -> None:
+    (tmp_path / ".source-commit").write_text("snapshot-sha\n", encoding="utf-8")
+    assert source_revision(tmp_path) == "snapshot-sha"
 
 
 def test_runtime_config_declares_every_feature_ablation_key() -> None:

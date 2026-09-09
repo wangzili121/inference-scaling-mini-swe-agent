@@ -32,6 +32,16 @@ def _git(repository: Path, *args: str) -> str | None:
     return completed.stdout.strip() if completed.returncode == 0 else None
 
 
+def source_revision(repository: Path) -> str | None:
+    revision = _git(repository, "rev-parse", "HEAD")
+    if revision:
+        return revision
+    snapshot = repository / ".source-commit"
+    if snapshot.is_file():
+        return snapshot.read_text(encoding="utf-8").strip() or None
+    return None
+
+
 def _versions(names: Iterable[str]) -> dict[str, str | None]:
     versions = {}
     for name in names:
@@ -75,7 +85,7 @@ def write_artifact_manifest(
         "created_at": time.time(),
         "repository": str(repository_path),
         "git": {
-            "commit": _git(repository_path, "rev-parse", "HEAD"),
+            "commit": source_revision(repository_path),
             "branch": _git(repository_path, "branch", "--show-current"),
             "status": _git(repository_path, "status", "--short"),
         },

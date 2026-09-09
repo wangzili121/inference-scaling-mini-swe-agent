@@ -64,7 +64,7 @@ conditional-is-runtime-tune \
 5. 补测 MNS `{192,384}`、MBT `{16K,64K}`，再依次搜索 memory 和 partial-prefill。
 6. worker 从 `{4,8,16,32,64}` 找吞吐平台；有足够不同调用且 W64 仍是边界胜者时扩到 96/128/256。
 
-每个 arm 启动干净 engine，避免继承上一个 arm 的 APC 状态；结果实时写入 `arms/<phase>/`，用 `--resume` 可安全续跑。硬门槛是成功率 100%、无 OOM、无 KV preemption，且 P95 不超过当轮最低值的 1.25 倍。
+每个 arm 启动干净 engine，避免继承上一个 arm 的 APC 状态；结果实时写入 `arms/<phase>/`，用 `--resume` 可安全续跑。硬门槛是 CIS/HTTP 执行成功率 100%、无 OOM、无 KV preemption，且 P95 不超过当轮最低值的 1.25 倍。模型输出的 `action_valid_rate` 单独记录，本阶段不把缺少 bash action 误判为部署失败。
 
 ## 3. 四卡双实例调优
 
