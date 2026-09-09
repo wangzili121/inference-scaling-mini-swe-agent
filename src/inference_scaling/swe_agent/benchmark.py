@@ -238,6 +238,25 @@ def run_burst(
     observed_actions = [
         item.action_valid for item in measurements if item.action_valid is not None
     ]
+    throughput = {
+        "jobs_per_second": successes / wall_seconds if wall_seconds else 0.0,
+        "generated_tokens_per_second": (
+            float(backend_delta.get("generated_tokens", 0.0)) / wall_seconds
+            if wall_seconds
+            else 0.0
+        ),
+        "prefill_tokens_per_second": (
+            float(backend_delta.get("prefill_tokens", 0.0)) / wall_seconds
+            if wall_seconds
+            else 0.0
+        ),
+        "generation_forward_token_slots_per_second": (
+            float(backend_delta.get("generation_forward_token_slots", 0.0))
+            / wall_seconds
+            if wall_seconds
+            else 0.0
+        ),
+    }
     return {
         "schema_version": 1,
         "requests": len(measurements),
@@ -249,7 +268,8 @@ def run_burst(
         "backend_delta": backend_delta,
         "endpoint_backend_delta": endpoint_backend_delta,
         "wall_seconds": wall_seconds,
-        "jobs_per_second": successes / wall_seconds if wall_seconds else 0.0,
+        "jobs_per_second": throughput["jobs_per_second"],
+        "throughput": throughput,
         "successes": successes,
         "success_rate": successes / len(measurements),
         "require_action": require_action,
