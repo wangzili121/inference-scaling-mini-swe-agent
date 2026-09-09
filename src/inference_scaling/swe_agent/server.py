@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import signal
@@ -20,6 +21,7 @@ def _verify_requested_runtime_features() -> None:
     try:
         import torch
         import vllm_ascend.sample.sampler as sampler
+        importlib.import_module("vllm_ascend.vllm_ascend_C")
     except (ImportError, OSError) as error:
         raise RuntimeError(
             "native categorical sampling was requested but its runtime failed to load"

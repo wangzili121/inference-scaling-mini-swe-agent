@@ -134,6 +134,7 @@ def _verify_native_categorical(
             sys.executable,
             "-c",
             "import torch; import vllm_ascend.sample.sampler as sampler; "
+            "__import__('vllm_ascend.vllm_ascend_C'); "
             "assert hasattr(torch.ops._C_ascend, 'npu_categorical_sample'); "
             "assert sampler._CATEGORICAL_SAMPLE_ENABLED; print(sampler.__file__)",
         ),
