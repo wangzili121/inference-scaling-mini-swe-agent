@@ -112,7 +112,8 @@ least-outstanding 未带来收益，反而使 jobs/s 降低约 14.8%。四卡 ge
 正式采集前增加了 fail-fast 预检，模型加载和占用 HBM 之前必须同时满足：
 
 - 配置、workload、warmup、输出目录和配置引用的环境变量有效；
-- Ascend 设备节点、驱动目录和 `npu-smi` 可用；
+- 本地模型目录含有效 `config.json/model_type`、tokenizer 文件和权重分片；
+- Ascend 设备节点、驱动目录和 `npu-smi` 可用，且 `libatb.so` 可以实际加载；
 - Service pass 固定 `msserviceprofiler==1.2.2`、`tzdata==2025.3`，且 analyzer CLI 和实际 vLLM hook 均可导入；
 - Torch pass 能导入并调用 `torch_npu.profiler.profiler.analyse`；
 - native categorical 的 sampler、Python extension、kernel library 和自定义 OPP 与编译产物逐项 SHA256 一致，算子已注册；
@@ -151,6 +152,41 @@ Service Profiler 的原始 SQLite 数据和 `batch.csv`、`kvcache.csv` 均可�
 native categorical 在异步调度下与 stock sampler 的随机流不 bit-exact，各 pass 的实际生成长度和 forward work 也会变化。因此性能只引用 none pass；Service/Torch 的 jobs/s 仅用于说明采集运行本身完整，不能用它们与 none 的差值估算 profiler 开销。四卡 none 相对两卡 none 的 jobs/s 为 `1.73x`，同时 P95 降低 `46.85%`，但两次运行的总 forward work 不同，精确扩展效率还需按 token slots 归一化。
 
 两卡 Torch 中 candidate/rollout 占阶段时间 `47.16%/52.84%`，四卡 Torch 中为 `63.53%/36.47%`；reward、weight、resample 均低于 `0.01%`。四卡虽然严格按 32/32 请求分流，Service/Torch 仍分别观察到 `31.83%/18.15%` 的实例完成时间 skew，说明请求数不能代表 CIS 剩余工作量。P0 还显示暴露 HCCL 在两卡和四卡窗口分别为 `15.69%/18.37%`。这些是下一轮代表性算法配置需要验证是否稳定迁移的候选瓶颈，不在本阶段直接实现调度或通信优化。
+
+## Native P1 并发选择与正式 Profiling
+
+P1 固定 `C8/R3/B128/L512` 和 sequence-logprob。其单个 CIS job 比 P0 轻，因此不能机械复用 P0 的 32 workers；在两卡同一 engine 配置和 64 个独立请求上补测饱和并发：
+
+| workers | jobs/s | P95 (s) | P99 (s) | forward slots/s | preemption |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 0.242964 | **145.53** | 211.22 | 3,750.40 | 0 |
+| 24 | **0.289787** | 172.26 | **190.09** | **4,322.87** | 0 |
+| 32 | 0.259561 | 225.04 | 242.81 | 5,292.95 | 38 |
+
+`workers=32` 的 preemption 不是正确性错误，也不应单独作为绝对淘汰条件；它说明该点进入 KV 过载区。这里 `workers=24` 相对 32 同时提升 jobs/s 约 `11.65%`、降低 P95 约 `23.45%`，因此没有“用 preemption 换取更高总体性能”的收益。P1 两卡正式并发锁定为 24。
+
+四卡仍采用两份相同 TP2 instance 和 round-robin，总并发按每实例 24 设置为 48。所有正式 pass 均为 100% 成功、零 OOM、零 KV preemption，每个 TP rank 均确认 native categorical 激活：
+
+| 部署 | pass | jobs/s | P95 (s) | APC hit | NPU busy 中位数 | 暴露 HCCL/窗口 | 统一时间线事件 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 两卡 TP2 | none | 0.289787 | 172.26 | - | - | - | - |
+| 两卡 TP2 | Service | 0.254479 | 188.25 | 95.19% | - | - | 788 |
+| 两卡 TP2 | Torch | 0.2433 | 168.81 | 95.95% | 94.46% | 13.36% | 383,716 |
+| 四卡 2xTP2 | none | 0.356120 | 135.47 | - | - | - | - |
+| 四卡 2xTP2 | Service | 0.455568 | 135.30 | 95.02% | - | - | 1,561 |
+| 四卡 2xTP2 | Torch | 0.411659 | 120.34 | 95.96% | 95.34% | 15.25% | 256,438 |
+
+性能仍只引用 none pass，Service/Torch 用于归因。P1 四卡 none 相对两卡 none 的 jobs/s 仅为 `1.23x`，按 forward slots/s 归一化也只有约 `1.28x`；这比 P0 的表观 `1.73x` 扩展差。四卡虽然按 32/32 job 静态均分，none pass 两个 endpoint 的 forward work 相差约 `35.9%`，Service 进一步报告 `86.14%` 的 instance latency skew。
+
+阶段也随拓扑明显迁移：两卡 Torch 的 candidate/rollout 为 `55.25%/44.75%`，四卡 Torch 变为 `66.99%/33.00%`；reward、weight、resample 仍低于 `0.01%`。暴露 HCCL 从两卡 `13.36%` 升到四卡 `15.25%`。因此截至 P1，稳定出现的候选瓶颈是 TP 通信暴露和按 job 数静态路由造成的 work skew，而不是 CPU reward；是否足以形成最终优化建议仍需 P2/P3 代表性配置验证。
+
+本轮正式原始目录：
+
+- P1 两卡 Service：`/data/disk/wangzili/cis-artifacts-1f16022/profiles/two-card/p1/service-w24`
+- P1 两卡 Torch：`/data/disk/wangzili/cis-artifacts-1f16022/profiles/two-card/p1/torch-w24`
+- P1 四卡 none/Service/Torch：`/data/disk/wangzili/cis-artifacts-e1396a6/profiles/four-card/p1/`
+
+Torch 两卡每个 rank 的原始 `trace_view.json` 约 2.05 GB，并各自保留 `analysis.db`、`kernel_details.csv` 和 `operator_details.csv`。Service exporter 仍受已记录的 request-id 列表转换问题影响，不生成厂商 `chrome_tracing.json`，但原始数据库、batch/KV CSV 和项目统一时间线完整。
 
 ## P/D Capability
 
