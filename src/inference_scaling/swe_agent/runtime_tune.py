@@ -149,6 +149,7 @@ def adaptive_search_plan() -> dict[str, Any]:
     return {
         "schema_version": 2,
         "feature_ab": [item.feature_id for item in feature_ablation_matrix()],
+        "feature_minimum_gain": 0.03,
         "topologies": ["tp2", "pp2"],
         "coarse": {
             "max_num_seqs": [64, 128, 256, 512],
@@ -436,6 +437,27 @@ def _gain(left: dict[str, Any], right: dict[str, Any]) -> float:
     return float(right["jobs_per_second"]) / baseline - 1.0
 
 
+def select_feature_result(
+    results: Sequence[dict[str, Any]], *, minimum_gain: float = 0.03
+) -> dict[str, Any]:
+    """Keep the optimized baseline unless an A/B arm clears the noise floor."""
+
+    if minimum_gain < 0:
+        raise ValueError("feature minimum gain must be non-negative")
+    baseline = next(
+        (
+            result
+            for result in results
+            if result.get("feature", {}).get("feature_id") == BASE_FEATURES.feature_id
+        ),
+        None,
+    )
+    winner = _best(results)
+    if baseline is None or not _valid(baseline) or winner is baseline:
+        return winner
+    return winner if _gain(baseline, winner) >= minimum_gain else baseline
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -550,7 +572,10 @@ def main() -> None:
         for feature in feature_ablation_matrix()
     ]
     history.extend(feature_results)
-    chosen_feature = FeatureConfig(**_best(feature_results)["feature"])
+    chosen_feature_result = select_feature_result(
+        feature_results, minimum_gain=plan["feature_minimum_gain"]
+    )
+    chosen_feature = FeatureConfig(**chosen_feature_result["feature"])
 
     survivors = [
         replace(config, max_model_len=max_model_len) for config in engine_grid()

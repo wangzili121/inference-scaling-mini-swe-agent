@@ -26,6 +26,7 @@ from inference_scaling.swe_agent.runtime_tune import (
     adaptive_search_plan,
     arm_trace_path,
     engine_grid,
+    select_feature_result,
     select_max_model_len,
     select_arms,
 )
@@ -286,6 +287,24 @@ def test_runtime_gate_and_algorithm_pareto_are_deterministic() -> None:
 
     assert [result["arm_id"] for result in selected] == ["fast", "balanced"]
     assert set(_pareto([fast, balanced])) == {"fast", "balanced"}
+
+
+def test_feature_selection_ignores_sub_noise_floor_gain() -> None:
+    baseline = _arm("baseline", 1.0, 10.0)
+    baseline["feature"] = {"feature_id": "optimized-baseline"}
+    candidate = _arm("candidate", 1.02, 10.1)
+    candidate["feature"] = {"feature_id": "hccl-aiv"}
+
+    assert select_feature_result([baseline, candidate]) is baseline
+
+
+def test_feature_selection_accepts_material_gain() -> None:
+    baseline = _arm("baseline", 1.0, 10.0)
+    baseline["feature"] = {"feature_id": "optimized-baseline"}
+    candidate = _arm("candidate", 1.04, 10.1)
+    candidate["feature"] = {"feature_id": "async-scheduling"}
+
+    assert select_feature_result([baseline, candidate]) is candidate
 
 
 def test_four_card_topology_matrix_is_explicit_about_capability_gates() -> None:
