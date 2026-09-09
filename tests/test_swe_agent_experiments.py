@@ -1019,3 +1019,25 @@ def test_service_profile_preflight_checks_analyzer_dependencies(
     versions["tzdata"] = "2025.2"
     with pytest.raises(RuntimeError, match="tzdata==2025.3"):
         _profile_preflight(args, tmp_path / "artifacts")
+
+
+def test_profile_preflight_requires_native_categorical_assets(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "service.toml"
+    workload = tmp_path / "workload.jsonl"
+    config.write_text('model = "/models/conditional-is"\n')
+    workload.write_text("{}\n")
+    args = SimpleNamespace(
+        config=config,
+        workload=workload,
+        warmup_workload=None,
+        profiling_symbols=None,
+        profiler="none",
+        environment=["VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE=1"],
+        devices=[],
+        categorical_root=None,
+    )
+
+    with pytest.raises(RuntimeError, match="requires --categorical-root"):
+        _profile_preflight(args, tmp_path / "artifacts")

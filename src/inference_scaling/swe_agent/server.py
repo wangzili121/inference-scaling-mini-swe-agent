@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import threading
 from http import HTTPStatus
@@ -11,6 +12,27 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from inference_scaling.swe_agent.service import ConditionalISRunner
+
+
+def _verify_requested_runtime_features() -> None:
+    if os.getenv("VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE") != "1":
+        return
+    try:
+        import torch
+        import vllm_ascend.sample.sampler as sampler
+    except (ImportError, OSError) as error:
+        raise RuntimeError(
+            "native categorical sampling was requested but its runtime failed to load"
+        ) from error
+    if not getattr(sampler, "_CATEGORICAL_SAMPLE_ENABLED", False):
+        raise RuntimeError(
+            "native categorical sampling was requested but the patched sampler is absent"
+        )
+    if not hasattr(torch.ops._C_ascend, "npu_categorical_sample"):
+        raise RuntimeError(
+            "native categorical sampling was requested but the Ascend operator is absent"
+        )
+    print("native categorical sampler preflight passed", flush=True)
 
 
 class ConditionalISHTTPServer(ThreadingHTTPServer):
@@ -115,6 +137,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8123)
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     args = parser.parse_args()
+    _verify_requested_runtime_features()
     runner = ConditionalISRunner.from_toml(args.config, overrides=args.overrides)
     server = ConditionalISHTTPServer((args.host, args.port), _handler(runner))
 

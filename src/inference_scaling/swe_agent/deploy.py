@@ -12,7 +12,7 @@ from typing import Any, Sequence
 
 
 DEFAULT_IMAGE = "quay.io/ascend/vllm-ascend:v0.18.0"
-_CATEGORICAL_MOUNTS = (
+CATEGORICAL_MOUNTS = (
     (
         "runtime/sampler.py",
         "/vllm-workspace/vllm-ascend/vllm_ascend/sample/sampler.py",
@@ -58,7 +58,7 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _tree_sha256(path: Path) -> str:
+def tree_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     for item in sorted(value for value in path.rglob("*") if value.is_file()):
         digest.update(str(item.relative_to(path)).encode("utf-8"))
@@ -66,9 +66,9 @@ def _tree_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _categorical_assets(root: Path) -> list[dict[str, Any]]:
+def categorical_assets(root: Path) -> list[dict[str, Any]]:
     assets = []
-    for relative, target in _CATEGORICAL_MOUNTS:
+    for relative, target in CATEGORICAL_MOUNTS:
         source = root / relative
         if not source.exists():
             raise FileNotFoundError(source)
@@ -76,7 +76,7 @@ def _categorical_assets(root: Path) -> list[dict[str, Any]]:
             {
                 "source": str(source),
                 "target": target,
-                "sha256": _sha256(source) if source.is_file() else _tree_sha256(source),
+                "sha256": _sha256(source) if source.is_file() else tree_sha256(source),
             }
         )
     return assets
@@ -98,7 +98,7 @@ def build_docker_command(
 ) -> tuple[list[str], list[dict[str, Any]]]:
     if not devices or len(set(devices)) != len(devices):
         raise ValueError("devices must be a nonempty unique list")
-    assets = _categorical_assets(categorical_root)
+    assets = categorical_assets(categorical_root)
     command = [
         "docker",
         "run",

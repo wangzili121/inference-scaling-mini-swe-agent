@@ -24,6 +24,7 @@ from inference_scaling.swe_agent.benchmark import (
     run_burst,
 )
 from inference_scaling.swe_agent.artifacts import sha256_file, write_artifact_manifest
+from inference_scaling.swe_agent.deploy import categorical_assets, tree_sha256
 from inference_scaling.swe_agent.runtime_tune import _stop, _wait_for_health
 
 
@@ -95,6 +96,60 @@ def _verify_npu_runtime(devices: Sequence[str]) -> dict[str, Any]:
     }
 
 
+def _verify_native_categorical(
+    root: Path, environment: dict[str, str]
+) -> dict[str, Any]:
+    assets = categorical_assets(root)
+    mismatches = []
+    for asset in assets:
+        target = Path(asset["target"])
+        if not target.exists():
+            mismatches.append(f"missing target {target}")
+            continue
+        actual = sha256_file(target) if target.is_file() else tree_sha256(target)
+        if actual != asset["sha256"]:
+            mismatches.append(f"hash mismatch {target}")
+    if mismatches:
+        raise RuntimeError(
+            "native categorical mount preflight failed: " + "; ".join(mismatches)
+        )
+
+    custom_opp = (
+        "/vllm-workspace/vllm-ascend/vllm_ascend/_cann_ops_custom/"
+        "vendors/vllm-ascend"
+    )
+    expected_library = f"{custom_opp}/op_api/lib/libcust_opapi.so"
+    if environment.get("ASCEND_CUSTOM_OPP_PATH") != custom_opp:
+        raise RuntimeError(
+            "native categorical preflight requires ASCEND_CUSTOM_OPP_PATH="
+            + custom_opp
+        )
+    preload = environment.get("LD_PRELOAD", "").split(":")
+    if expected_library not in preload:
+        raise RuntimeError(
+            "native categorical preflight requires LD_PRELOAD=" + expected_library
+        )
+    completed = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "import torch; import vllm_ascend.sample.sampler as sampler; "
+            "assert hasattr(torch.ops._C_ascend, 'npu_categorical_sample'); "
+            "assert sampler._CATEGORICAL_SAMPLE_ENABLED; print(sampler.__file__)",
+        ),
+        text=True,
+        capture_output=True,
+        timeout=120,
+        env=environment,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "native categorical operator preflight failed: "
+            + (completed.stderr.strip() or completed.stdout.strip())
+        )
+    return {"assets": assets, "operator_registered": True}
+
+
 def _profile_preflight(args: argparse.Namespace, output: Path) -> dict[str, Any]:
     """Reject incomplete profiler environments before loading the model."""
 
@@ -138,6 +193,15 @@ def _profile_preflight(args: argparse.Namespace, output: Path) -> dict[str, Any]
     dependencies: dict[str, Any] = {"output_writable": True}
     if getattr(args, "devices", None):
         dependencies["npu_runtime"] = _verify_npu_runtime(args.devices)
+    if child_environment.get("VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE") == "1":
+        categorical_root = getattr(args, "categorical_root", None)
+        if not categorical_root:
+            raise RuntimeError(
+                "native categorical sampling requires --categorical-root"
+            )
+        dependencies["native_categorical"] = _verify_native_categorical(
+            Path(categorical_root).resolve(), child_environment
+        )
     if args.profiler == "service":
         try:
             version = importlib.metadata.version("msserviceprofiler")
@@ -479,6 +543,7 @@ def main() -> None:
     parser.add_argument("--profile-memory", action="store_true")
     parser.add_argument("--profile-stack", action="store_true")
     parser.add_argument("--profiling-symbols")
+    parser.add_argument("--categorical-root")
     parser.add_argument("--candidate-count", type=int)
     parser.add_argument("--rollout-count", type=int)
     parser.add_argument("--block-size", type=int)

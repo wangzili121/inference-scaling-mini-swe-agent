@@ -64,6 +64,7 @@ def profile_commands(
     warmup_workload: Path | None,
     output: Path,
     seed: int,
+    categorical_root: Path | None = None,
 ) -> list[dict[str, Any]]:
     planned = []
     for deployment in deployments:
@@ -114,6 +115,8 @@ def profile_commands(
                     ]
                     for devices in deployment["devices"]:
                         command.extend(("--devices", str(devices)))
+                    if categorical_root is not None:
+                        command.extend(("--categorical-root", str(categorical_root)))
                     for override in deployment["overrides"]:
                         command.extend(("--set", str(override)))
                     for assignment in deployment.get("environment", ()):
@@ -230,6 +233,7 @@ def main() -> None:
     parser.add_argument("--deployment", action="append", required=True)
     parser.add_argument("--workload", required=True)
     parser.add_argument("--warmup-workload")
+    parser.add_argument("--categorical-root")
     parser.add_argument("--output-directory", required=True)
     parser.add_argument("--seed", type=int, default=20260908)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
@@ -248,6 +252,9 @@ def main() -> None:
         ),
         output=output,
         seed=args.seed,
+        categorical_root=(
+            Path(args.categorical_root).resolve() if args.categorical_root else None
+        ),
     )
     index = {
         "schema_version": 1,
