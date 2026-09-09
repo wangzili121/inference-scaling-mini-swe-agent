@@ -192,6 +192,11 @@ def _kernel_summary(path: Path) -> dict[str, Any]:
             if communication_time
             else 0.0
         ),
+        "exposed_communication_profile_ratio": (
+            max(0.0, communication_time - communication_overlap) / span
+            if span
+            else 0.0
+        ),
         "top_kernel_types_us": dict(
             sorted(by_type.items(), key=lambda item: item[1], reverse=True)[:20]
         ),
@@ -273,6 +278,12 @@ def analyze_ascend_profile(path: Path) -> dict[str, Any]:
             sum(item["exposed_communication_us"] for item in kernels)
             / sum(item["communication_us"] for item in kernels)
             if sum(item["communication_us"] for item in kernels)
+            else 0.0
+        ),
+        "exposed_communication_profile_ratio": (
+            sum(item["exposed_communication_us"] for item in kernels)
+            / sum(item["profile_span_us"] for item in kernels)
+            if sum(item["profile_span_us"] for item in kernels)
             else 0.0
         ),
     }
@@ -373,7 +384,10 @@ def recommendations(
             {
                 "trigger": "stage_gap_above_10_percent_or_device_underfilled",
                 "value": max(gap, 1.0 - device_busy),
-                "action": "implement cross-job candidate/rollout pipeline",
+                "action": (
+                    "correlate host/service gaps with CIS stage barriers before "
+                    "evaluating a cross-job candidate/rollout pipeline"
+                ),
             }
         )
     if float(benchmark.get("apc_token_hit_ratio", 0.0)) < 0.50:
@@ -392,11 +406,14 @@ def recommendations(
                 "action": "route by estimated remaining CIS work",
             }
         )
-    if float(ascend.get("exposed_communication_ratio", 0.0)) > 0.15:
+    exposed_profile_ratio = float(
+        ascend.get("exposed_communication_profile_ratio", 0.0)
+    )
+    if exposed_profile_ratio > 0.15:
         results.append(
             {
                 "trigger": "exposed_hccl_above_15_percent",
-                "value": ascend["exposed_communication_ratio"],
+                "value": exposed_profile_ratio,
                 "action": "overlap communication with independent CIS stage work",
             }
         )

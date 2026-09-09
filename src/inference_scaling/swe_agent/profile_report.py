@@ -123,6 +123,40 @@ def _kernel_events(
     return events
 
 
+def _service_events(profile_directory: Path) -> list[dict[str, Any]]:
+    events = []
+    for path in sorted(profile_directory.rglob("batch.csv")):
+        instance = next(
+            (part for part in path.parts if part.startswith("profile-")),
+            path.parent.name,
+        )
+        with path.open(newline="", encoding="utf-8-sig") as stream:
+            for row in csv.DictReader(stream):
+                try:
+                    start = float(row.get("start_time(ms)", "0")) * 1_000
+                    duration = float(row.get("during_time(ms)", "0")) * 1_000
+                except ValueError:
+                    continue
+                if start <= 0 or duration <= 0:
+                    continue
+                events.append(
+                    {
+                        "name": f"vLLM/{row.get('name') or 'batch'}",
+                        "cat": "vllm-service",
+                        "ph": "X",
+                        "ts": start,
+                        "dur": duration,
+                        "pid": f"service:{instance}",
+                        "tid": str(row.get("batch_type") or "batch"),
+                        "args": {
+                            "batch_size": row.get("batch_size"),
+                            "source": str(path),
+                        },
+                    }
+                )
+    return events
+
+
 def build_unified_timeline(profile_directory: Path, output: Path) -> dict[str, Any]:
     benchmark = json.loads((profile_directory / "benchmark.json").read_text())
     window = benchmark.get("profile", {}).get("window", {})
@@ -130,6 +164,7 @@ def build_unified_timeline(profile_directory: Path, output: Path) -> dict[str, A
         float(window.get("started_at", benchmark.get("started_at", 0.0))) * 1e6
     )
     events = _algorithm_events(profile_directory / "algorithm-traces")
+    events.extend(_service_events(profile_directory))
     events.extend(_kernel_events(profile_directory, window_start_us))
     events.sort(key=lambda item: float(item.get("ts", 0.0)))
     payload = {
@@ -222,7 +257,7 @@ def render_profile_report(profile_directory: str | Path) -> dict[str, Any]:
         f"- APC token hit ratio：{benchmark['apc_token_hit_ratio']:.2%}",
         f"- block 内未归入叶子阶段的间隙：{algorithm['block_gap_share']:.2%}",
         f"- NPU busy ratio 中位数：{ascend['device_busy_ratio']['median']:.2%}",
-        f"- 暴露通信占比：{ascend['exposed_communication_ratio']:.2%}",
+        f"- 暴露通信占 profile 窗口：{ascend['exposed_communication_profile_ratio']:.2%}",
         f"- MS Service batch/scheduler 证据：{'有' if service['has_batch_scheduler_evidence'] else '无'}",
         "",
         "## 算法阶段",

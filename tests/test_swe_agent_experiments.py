@@ -763,6 +763,7 @@ def test_profile_analysis_combines_algorithm_runtime_and_npu_evidence(
     assert algorithm["block_gap_share"] == pytest.approx(0.07)
     assert ascend["rank_count"] == 1
     assert ascend["ranks"][0]["exposed_communication_ratio"] == pytest.approx(0.5)
+    assert ascend["exposed_communication_profile_ratio"] == pytest.approx(1 / 3)
     assert any(item["trigger"] == "exposed_hccl_above_15_percent" for item in actions)
 
 
@@ -809,7 +810,10 @@ def test_profile_report_keeps_raw_data_and_renders_recomputable_outputs(
     service = tmp_path / "service" / "output"
     service.mkdir(parents=True)
     (service / "batch.csv").write_text(
-        "timestamp,num_scheduled_tokens,waiting_requests\n1,31,3\n2,63,2\n3,95,1\n"
+        "name,start_time(ms),during_time(ms),batch_size,batch_type,num_scheduled_tokens,waiting_requests\n"
+        "modelExec,1000,1,31,Prefill,31,3\n"
+        "modelExec,1002,1,63,Decode,63,2\n"
+        "modelExec,1004,1,95,Decode,95,1\n"
     )
 
     result = render_profile_report(tmp_path)
@@ -820,6 +824,7 @@ def test_profile_report_keeps_raw_data_and_renders_recomputable_outputs(
     assert {item["cat"] for item in timeline["traceEvents"]} == {
         "conditional-is",
         "npu-kernel",
+        "vllm-service",
     }
     assert (tmp_path / "algorithm-traces" / "rank0.jsonl").is_file()
     analysis = json.loads(Path(result["analysis"]).read_text())
