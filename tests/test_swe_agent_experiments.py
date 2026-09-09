@@ -307,6 +307,29 @@ def test_feature_selection_accepts_material_gain() -> None:
     assert select_feature_result([baseline, candidate]) is candidate
 
 
+def test_early_runtime_gate_balances_jobs_and_generated_work() -> None:
+    fastest_job = _arm("fastest-job", 3.0, 10.0)
+    runner_up = _arm("runner-up", 2.8, 10.0)
+    fastest_work = _arm("fastest-work", 2.5, 10.0)
+    for result, work_rate in (
+        (fastest_job, 100.0),
+        (runner_up, 90.0),
+        (fastest_work, 300.0),
+    ):
+        result["throughput"] = {
+            "generation_forward_token_slots_per_second": work_rate
+        }
+
+    selected = select_arms(
+        [runner_up, fastest_work, fastest_job], keep=2, balance_work_rate=True
+    )
+
+    assert [result["arm_id"] for result in selected] == [
+        "fastest-job",
+        "fastest-work",
+    ]
+
+
 def test_four_card_topology_matrix_is_explicit_about_capability_gates() -> None:
     topologies = {item.topology_id: item for item in native_topologies(19000)}
 

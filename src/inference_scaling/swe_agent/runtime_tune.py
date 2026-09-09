@@ -12,6 +12,7 @@ import sys
 import time
 import urllib.request
 from dataclasses import asdict, dataclass, replace
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -169,6 +170,10 @@ def adaptive_search_plan() -> dict[str, Any]:
         "partial_prefill": [[1, 1], [2, 1], [2, 2], [4, 2], [4, 4], [8, 4], [8, 8]],
         "workers": [4, 8, 16, 32, 64, 96, 128, 256],
         "successive_halving_requests": [16, 32, 64],
+        "coarse_selection_metrics": [
+            "jobs_per_second",
+            "generation_forward_token_slots_per_second",
+        ],
         "hard_gates": {
             "success_rate": 1.0,
             "oom": False,
@@ -235,6 +240,7 @@ def select_arms(
     *,
     keep: int,
     p95_factor: float = 1.25,
+    balance_work_rate: bool = False,
 ) -> list[dict[str, Any]]:
     if keep <= 0 or p95_factor < 1:
         raise ValueError("invalid successive-halving gate")
@@ -247,14 +253,49 @@ def select_arms(
         for result in valid
         if result["latency_seconds"]["p95"] <= minimum_p95 * p95_factor
     ]
-    gated.sort(
+    by_jobs = sorted(
+        gated,
         key=lambda result: (
             -float(result["jobs_per_second"]),
             float(result["latency_seconds"]["p95"]),
             str(result["arm_id"]),
+        ),
+    )
+    if not balance_work_rate:
+        return by_jobs[:keep]
+    by_work = sorted(
+        gated,
+        key=lambda result: (
+            -_generation_work_rate(result),
+            -float(result["jobs_per_second"]),
+            str(result["arm_id"]),
+        ),
+    )
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for job_result, work_result in zip_longest(by_jobs, by_work):
+        for result in (job_result, work_result):
+            if result is None or str(result["arm_id"]) in seen:
+                continue
+            selected.append(result)
+            seen.add(str(result["arm_id"]))
+            if len(selected) == keep:
+                return selected
+    return selected
+
+
+def _generation_work_rate(result: dict[str, Any]) -> float:
+    throughput = result.get("throughput") or {}
+    recorded = throughput.get("generation_forward_token_slots_per_second")
+    if isinstance(recorded, (int, float)):
+        return float(recorded)
+    wall_seconds = float(result.get("wall_seconds", 0.0))
+    slots = float(
+        (result.get("backend_delta") or {}).get(
+            "generation_forward_token_slots", 0.0
         )
     )
-    return gated[:keep]
+    return slots / wall_seconds if wall_seconds > 0 else 0.0
 
 
 def _wait_for_health(endpoint: str, process: subprocess.Popen, timeout: float) -> None:
@@ -595,7 +636,11 @@ def main() -> None:
             for config in survivors
         ]
         history.extend(round_results)
-        selected = select_arms(round_results, keep=min(keep, len(round_results)))
+        selected = select_arms(
+            round_results,
+            keep=min(keep, len(round_results)),
+            balance_work_rate=round_index < 3,
+        )
         survivors = [EngineConfig(**item["engine"]) for item in selected]
         _write_checkpoint(
             output / f"coarse-{round_index}.json",
