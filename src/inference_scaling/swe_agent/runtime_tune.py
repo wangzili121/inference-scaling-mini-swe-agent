@@ -15,6 +15,11 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
+from inference_scaling.swe_agent.artifacts import (
+    sha256_file,
+    source_revision,
+    write_artifact_manifest,
+)
 from inference_scaling.swe_agent.benchmark import _load_records, run_burst
 
 
@@ -452,13 +457,22 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    records = _load_records(Path(args.workload))
+    repository = Path(__file__).resolve().parents[3]
+    config_path = Path(args.config).resolve()
+    workload_path = Path(args.workload).resolve()
+    holdout_path = (
+        Path(args.holdout_workload).resolve() if args.holdout_workload else None
+    )
+    warmup_path = (
+        Path(args.warmup_workload).resolve() if args.warmup_workload else None
+    )
+    records = _load_records(workload_path)
     if len(records) < 64:
         raise ValueError("runtime tuning requires at least 64 unique workload records")
     holdout = (
-        _load_records(Path(args.holdout_workload)) if args.holdout_workload else []
+        _load_records(holdout_path) if holdout_path else []
     )
-    warmup = _load_records(Path(args.warmup_workload)) if args.warmup_workload else []
+    warmup = _load_records(warmup_path) if warmup_path else []
     output = Path(args.output_directory)
     max_model_len = select_max_model_len(records)
     plan = adaptive_search_plan()
@@ -466,10 +480,29 @@ def main() -> None:
         {
             "devices": args.devices,
             "seed": args.seed,
-            "workload": str(Path(args.workload).resolve()),
+            "source_revision": source_revision(repository),
+            "config": {"path": str(config_path), "sha256": sha256_file(config_path)},
+            "workload": {
+                "path": str(workload_path),
+                "sha256": sha256_file(workload_path),
+                "records": len(records),
+            },
             "holdout_workload": (
-                str(Path(args.holdout_workload).resolve())
-                if args.holdout_workload
+                {
+                    "path": str(holdout_path),
+                    "sha256": sha256_file(holdout_path),
+                    "records": len(holdout),
+                }
+                if holdout_path
+                else None
+            ),
+            "warmup_workload": (
+                {
+                    "path": str(warmup_path),
+                    "sha256": sha256_file(warmup_path),
+                    "records": len(warmup),
+                }
+                if warmup_path
                 else None
             ),
             "algorithm": {
@@ -487,7 +520,7 @@ def main() -> None:
 
     common = {
         "warmup_records": warmup,
-        "service_config": Path(args.config).resolve(),
+        "service_config": config_path,
         "endpoint": f"http://{args.host}:{args.port}",
         "port": args.port,
         "devices": args.devices,
@@ -733,6 +766,22 @@ def main() -> None:
         "winner": winner,
     }
     _write_checkpoint(output / "result.json", result)
+    write_artifact_manifest(
+        output,
+        repository=repository,
+        command=sys.argv,
+        metadata={
+            "kind": "two-card-runtime-tuning",
+            "devices": args.devices,
+            "source_revision": plan["source_revision"],
+            "config": plan["config"],
+            "workload": plan["workload"],
+            "holdout_workload": plan["holdout_workload"],
+            "warmup_workload": plan["warmup_workload"],
+            "algorithm": plan["algorithm"],
+            "winner": winner["arm_id"],
+        },
+    )
     print(json.dumps({"winner": winner}, indent=2))
 
 
