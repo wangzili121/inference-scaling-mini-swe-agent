@@ -10,6 +10,7 @@ from inference_scaling.arllm.backends import TabularAutoregressiveBackend
 from inference_scaling.swe_agent.service import ConditionalISRunner
 from inference_scaling.swe_agent.server import ConditionalISHTTPServer
 from inference_scaling.swe_agent import benchmark
+from inference_scaling.swe_agent import profile as profile_module
 from inference_scaling.swe_agent import topology as topology_module
 from inference_scaling.swe_agent.algorithm_grid import _pareto
 from inference_scaling.swe_agent.archive_artifacts import archive_artifacts
@@ -943,3 +944,49 @@ def test_profile_preflight_checks_config_environment(tmp_path: Path) -> None:
     assert _profile_preflight(args, tmp_path / "artifacts") == {
         "output_writable": True
     }
+
+
+def test_service_profile_preflight_checks_analyzer_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "service.toml"
+    workload = tmp_path / "workload.jsonl"
+    config.write_text('model = "/models/conditional-is"\n')
+    workload.write_text("{}\n")
+    args = SimpleNamespace(
+        config=config,
+        workload=workload,
+        warmup_workload=None,
+        profiling_symbols=None,
+        profiler="service",
+        environment=[],
+        devices=[],
+    )
+    versions = {"msserviceprofiler": "1.2.2", "tzdata": "2025.3"}
+    monkeypatch.setattr(
+        profile_module.importlib.metadata,
+        "version",
+        lambda name: versions[name],
+    )
+    monkeypatch.setattr(profile_module, "ZoneInfo", lambda name: name)
+    monkeypatch.setattr(profile_module.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(
+        profile_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout="", stderr=""
+        ),
+    )
+
+    dependencies = _profile_preflight(args, tmp_path / "artifacts")
+
+    assert dependencies == {
+        "output_writable": True,
+        "msserviceprofiler": "1.2.2",
+        "msserviceprofiler_cli": "/bin/msserviceprofiler",
+        "tzdata": "2025.3",
+    }
+
+    versions["tzdata"] = "2025.2"
+    with pytest.raises(RuntimeError, match="tzdata==2025.3"):
+        _profile_preflight(args, tmp_path / "artifacts")

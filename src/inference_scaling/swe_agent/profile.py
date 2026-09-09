@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence, TextIO
@@ -27,6 +28,7 @@ from inference_scaling.swe_agent.runtime_tune import _stop, _wait_for_health
 
 
 SERVICE_PROFILER_VERSION = "1.2.2"
+TZDATA_VERSION = "2025.3"
 ENVIRONMENT_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -149,6 +151,18 @@ def _profile_preflight(args: argparse.Namespace, output: Path) -> dict[str, Any]
                 "service profiling requires msserviceprofiler=="
                 f"{SERVICE_PROFILER_VERSION}, found {version}"
             )
+        try:
+            tzdata_version = importlib.metadata.version("tzdata")
+            ZoneInfo("Asia/Shanghai")
+        except (importlib.metadata.PackageNotFoundError, ZoneInfoNotFoundError) as error:
+            raise RuntimeError(
+                f"service profiling requires tzdata=={TZDATA_VERSION}"
+            ) from error
+        if tzdata_version != TZDATA_VERSION:
+            raise RuntimeError(
+                f"service profiling requires tzdata=={TZDATA_VERSION}, "
+                f"found {tzdata_version}"
+            )
         executable = shutil.which("msserviceprofiler")
         if executable is None:
             raise RuntimeError("msserviceprofiler CLI is not on PATH")
@@ -168,6 +182,7 @@ def _profile_preflight(args: argparse.Namespace, output: Path) -> dict[str, Any]
             {
                 "msserviceprofiler": version,
                 "msserviceprofiler_cli": executable,
+                "tzdata": tzdata_version,
             }
         )
     elif args.profiler == "torch":
@@ -388,6 +403,7 @@ def _analyze_service_profiles(
     executable = "msserviceprofiler"
     for service in services:
         analyzed = service.profile_directory / "analyzed"
+        analysis_log = service.profile_directory / "analysis.log"
         command = [
             executable,
             "analyze",
@@ -395,21 +411,29 @@ def _analyze_service_profiles(
             f"--output-path={analyzed}",
         ]
         try:
-            completed = subprocess.run(
-                command,
-                text=True,
-                capture_output=True,
-                timeout=1800,
-                cwd=service.profile_directory,
-            )
+            with analysis_log.open("w", encoding="utf-8") as log:
+                completed = subprocess.run(
+                    command,
+                    text=True,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    timeout=1800,
+                    cwd=service.profile_directory,
+                )
+            produced = {
+                path.name for path in analyzed.rglob("*") if path.is_file()
+            }
+            required = {"batch.csv", "chrome_tracing.json", "profiler.db"}
+            missing = sorted(required - produced)
             analyses.append(
                 {
                     "instance_id": service.instance_id,
                     "command": command,
                     "returncode": completed.returncode,
-                    "stdout": completed.stdout,
-                    "stderr": completed.stderr,
+                    "log": str(analysis_log),
                     "output": str(analyzed),
+                    "valid": completed.returncode == 0 and not missing,
+                    "missing_outputs": missing,
                 }
             )
         except (FileNotFoundError, subprocess.TimeoutExpired) as error:
@@ -418,6 +442,7 @@ def _analyze_service_profiles(
                     "instance_id": service.instance_id,
                     "command": command,
                     "error": f"{type(error).__name__}: {error}",
+                    "log": str(analysis_log),
                     "output": str(analyzed),
                 }
             )
