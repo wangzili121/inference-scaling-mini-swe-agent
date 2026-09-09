@@ -107,6 +107,34 @@ vLLM-Ascend v0.18 MRV1 对 `(2,1)` 和 `(4,2)` 均在启动 capability check 明
 
 least-outstanding 未带来收益，反而使 jobs/s 降低约 14.8%。四卡 general 配置因此锁定为 `2xTP2 + round-robin + total workers=64`。候选/rollout 分阶段路由与 P/D 不在 general baseline 中实现，留待完整 profiling 后凭 trace 决定。
 
+## Profiling 依赖与有效性检查
+
+正式采集前增加了 fail-fast 预检，模型加载和占用 HBM 之前必须同时满足：
+
+- 配置、workload、warmup、输出目录和配置引用的环境变量有效；
+- Ascend 设备节点、驱动目录和 `npu-smi` 可用；
+- Service pass 固定 `msserviceprofiler==1.2.2`、`tzdata==2025.3`，且 analyzer CLI 可执行；
+- Torch pass 能导入并调用 `torch_npu.profiler.profiler.analyse`；
+- native categorical 的 sampler、Python extension、kernel library 和自定义 OPP 与编译产物逐项 SHA256 一致，算子已注册；
+- 运行结束后每个实例日志都出现 native categorical 首次激活标记。
+
+预检发现早期 P0 profiler 容器只设置了 `VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE=1`，但没有挂载 backport 资产；vLLM 日志明确将其报告为未知环境变量。因此下列早期 trace 只作为 stock-sampler 诊断数据，不作为“已有优化全部开启”的最终 baseline：
+
+- 两卡 Service：`/data/disk/wangzili/cis-artifacts-e02af15/profiles/two-card/p0/service`
+- 两卡 Torch：`/data/disk/wangzili/cis-artifacts-40da93c/profiles/two-card/p0/torch`
+- 四卡 Service：`/data/disk/wangzili/cis-artifacts-b068967/profiles/four-card/p0/service`
+- 四卡 Torch：`/data/disk/wangzili/cis-artifacts-869cc59/profiles/four-card/p0/torch`
+
+正确挂载后的两卡 P0 native 无 profiler 基线使用 64 个独立请求、32 workers：成功率 100%，无 preemption，`0.156288 jobs/s`，P95 `313.91s`，forward token slots/s 为 `3706.84`。两个 TP rank 均出现 native sampler 激活标记。对应原始目录为 `/data/disk/wangzili/cis-artifacts-f655118/validation/native-p0-none`。
+
+相同环境关闭 native 后，stock 对照为 `0.151602 jobs/s`、P95 `337.42s`，同样 100% 成功且无 preemption。native 的 jobs/s 高 `3.09%`，P95 低 `6.97%`。两种 sampler 采样分布相同但随机流不 bit-exact，导致 candidate 长度、APC 和总 forward work 不同，因此这组 SWE workload 只证明正确 native 路径没有端到端回退，不能把全部差异都归因给 sampler kernel；sampler 的直接收益仍以既有同卡正反序两组 A/B 的几何平均 `1.115x` 为主要证据。stock 原始目录为 `/data/disk/wangzili/cis-artifacts-f655118/validation/stock-p0-none`。
+
+Service Profiler 的原始 SQLite 数据和 `batch.csv`、`kvcache.csv` 均可解析，但 1.2.2 的厂商 trace exporter 无法将 vLLM 批量 request-id 列表转换为字符串，因而不生成 `chrome_tracing.json`。原始库、完整 analyzer 日志和部分成功产物均保留；项目自己的统一 Perfetto/Chrome 时间线直接使用 batch CSV 与 CIS 事件补齐该可视化，且把厂商导出失败显式标记为无效而非静默通过。
+
+## P/D Capability
+
+v0.18 源码包含 `MooncakeConnectorV1` 和单机 P/D 文档，但当前镜像中的 `mooncake.engine.TransferEngine` 无法导入，缺少 `ascend_transport.so`。挂载主机驱动后结果不变；官方文档要求另行以 `USE_ASCEND_DIRECT=ON` 编译安装 Mooncake。P/D 因此记录为依赖不完整的 capability failure，不进入本轮 general baseline，也不为赶 profiling 临时修改核心 scheduler。
+
 ## 原始数据位置
 
 - smoke 归档：`/data/disk/wangzili/cis-artifacts-629451f/smoke-validation`

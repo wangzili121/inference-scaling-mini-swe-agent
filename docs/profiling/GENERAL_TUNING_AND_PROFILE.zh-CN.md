@@ -112,6 +112,7 @@ conditional-is-deployment-manifest \
 conditional-is-profile-matrix \
   --config configs/swebench/conditional_is_smoke.toml \
   --matrix configs/swebench/profile_matrix.toml \
+  --categorical-root /categorical \
   --deployment artifacts/deployments/two-card.json \
   --deployment artifacts/tuning/four-card/deployment.json \
   --workload artifacts/workloads/self-128/holdout-64.jsonl \
@@ -120,6 +121,8 @@ conditional-is-profile-matrix \
 ```
 
 每个硬件配置和算法配置分别运行 `none`、`service`、`torch`。P0 无 profiler 重复三次；其他项只在观察到超过 5% 噪声时追加复验。MS Service 窗口默认 60 秒，torch 默认 10 秒；如果没有同时覆盖 candidate/rollout，torch 可单独延长到最多 30 秒。首轮关闭 stack/memory。
+
+设置 native categorical 开关时，运行容器还必须把 `/categorical` 中的 sampler、Python extension、kernel library 和自定义 OPP 分别挂载到 vLLM-Ascend 对应路径，并设置 `ASCEND_CUSTOM_OPP_PATH` 与 `LD_PRELOAD`。profile preflight 会在模型加载前校验源/目标哈希和算子注册；仅设置环境变量会被拒绝。每次运行结束还会检查所有实例日志中的首次激活标记。
 
 ## 6. 交付物
 
