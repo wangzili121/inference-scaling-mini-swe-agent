@@ -1018,11 +1018,27 @@ def test_service_profile_preflight_checks_analyzer_dependencies(
         "output_writable": True,
         "msserviceprofiler": "1.2.2",
         "msserviceprofiler_cli": "/bin/msserviceprofiler",
+        "msserviceprofiler_vllm_hook": True,
         "tzdata": "2025.3",
     }
 
     versions["tzdata"] = "2025.2"
     with pytest.raises(RuntimeError, match="tzdata==2025.3"):
+        _profile_preflight(args, tmp_path / "artifacts")
+
+    versions["tzdata"] = "2025.3"
+
+    def missing_runtime(command, **kwargs):
+        if command[0] == profile_module.sys.executable:
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="ModuleNotFoundError: No module named 'ms_service_profiler'",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(profile_module.subprocess, "run", missing_runtime)
+    with pytest.raises(RuntimeError, match="vLLM hook preflight failed"):
         _profile_preflight(args, tmp_path / "artifacts")
 
 

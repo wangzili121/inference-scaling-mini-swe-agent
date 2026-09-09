@@ -228,6 +228,24 @@ def _profile_preflight(args: argparse.Namespace, output: Path) -> dict[str, Any]
                 f"service profiling requires tzdata=={TZDATA_VERSION}, "
                 f"found {tzdata_version}"
             )
+        hook_probe = subprocess.run(
+            (
+                sys.executable,
+                "-c",
+                "import ms_service_profiler; "
+                "from msserviceprofiler.vllm_profiler.vllm_v1 import batch_hookers; "
+                "print(ms_service_profiler.__file__)",
+            ),
+            text=True,
+            capture_output=True,
+            timeout=120,
+            env=child_environment,
+        )
+        if hook_probe.returncode != 0:
+            raise RuntimeError(
+                "service profiler vLLM hook preflight failed: "
+                + (hook_probe.stderr.strip() or hook_probe.stdout.strip())
+            )
         executable = shutil.which("msserviceprofiler")
         if executable is None:
             raise RuntimeError("msserviceprofiler CLI is not on PATH")
@@ -247,6 +265,7 @@ def _profile_preflight(args: argparse.Namespace, output: Path) -> dict[str, Any]
             {
                 "msserviceprofiler": version,
                 "msserviceprofiler_cli": executable,
+                "msserviceprofiler_vllm_hook": True,
                 "tzdata": tzdata_version,
             }
         )
