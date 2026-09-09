@@ -27,6 +27,7 @@ from inference_scaling.swe_agent.benchmark import (
 from inference_scaling.swe_agent.artifacts import sha256_file, write_artifact_manifest
 from inference_scaling.swe_agent.deploy import categorical_assets, tree_sha256
 from inference_scaling.swe_agent.runtime_tune import _stop, _wait_for_health
+from inference_scaling.swe_agent.service import _apply_config_overrides
 
 
 SERVICE_PROFILER_VERSION = "1.2.2"
@@ -56,9 +57,8 @@ def _verify_writable_directory(path: Path) -> None:
 
 
 def _verify_local_model(
-    config_path: Path, environment: dict[str, str]
+    config: dict[str, Any], environment: dict[str, str]
 ) -> dict[str, Any] | None:
-    config = tomllib.loads(config_path.read_text(encoding="utf-8"))
     model = config.get("models", {}).get("base")
     if not isinstance(model, str):
         return None
@@ -261,10 +261,21 @@ def _profile_preflight(args: argparse.Namespace, output: Path) -> dict[str, Any]
             "profiling preflight missing environment: "
             + ", ".join(missing_environment)
         )
+    resolved_config = tomllib.loads(
+        required_files["config"].read_text(encoding="utf-8")
+    )
+    _apply_config_overrides(
+        resolved_config, tuple(getattr(args, "overrides", ()))
+    )
+    reward = resolved_config.get("reward")
+    if isinstance(reward, dict):
+        reward_kind = str(reward.get("kind", "sequence_log_probability"))
+        if reward_kind not in {"sequence_log_probability", "consilience"}:
+            raise ValueError(f"unsupported agent reward {reward_kind!r}")
     _verify_writable_directory(output)
 
     dependencies: dict[str, Any] = {"output_writable": True}
-    model = _verify_local_model(required_files["config"], child_environment)
+    model = _verify_local_model(resolved_config, child_environment)
     if model is not None:
         dependencies["model"] = model
     if getattr(args, "devices", None):

@@ -980,6 +980,39 @@ def test_profile_preflight_checks_config_environment(tmp_path: Path) -> None:
     }
 
 
+def test_profile_preflight_parses_overrides_before_model_startup(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "service.toml"
+    workload = tmp_path / "workload.jsonl"
+    config.write_text(
+        '[reward]\nkind = "sequence_log_probability"\n', encoding="utf-8"
+    )
+    workload.write_text("{}\n", encoding="utf-8")
+    args = SimpleNamespace(
+        config=config,
+        workload=workload,
+        warmup_workload=None,
+        profiling_symbols=None,
+        profiler="none",
+        environment=[],
+        devices=[],
+        overrides=["reward.kind=sequence_log_probability"],
+    )
+
+    with pytest.raises(ValueError, match="values must be JSON"):
+        _profile_preflight(args, tmp_path / "artifacts")
+
+    args.overrides = ['reward.kind="unknown"']
+    with pytest.raises(ValueError, match="unsupported agent reward"):
+        _profile_preflight(args, tmp_path / "artifacts")
+
+    args.overrides = ['reward.kind="consilience"']
+    assert _profile_preflight(args, tmp_path / "artifacts") == {
+        "output_writable": True
+    }
+
+
 def test_profile_preflight_rejects_incomplete_local_model(tmp_path: Path) -> None:
     model = tmp_path / "model"
     model.mkdir()
