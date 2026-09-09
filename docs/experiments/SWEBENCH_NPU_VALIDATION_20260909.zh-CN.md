@@ -113,7 +113,7 @@ least-outstanding 未带来收益，反而使 jobs/s 降低约 14.8%。四卡 ge
 
 - 配置、workload、warmup、输出目录和配置引用的环境变量有效；
 - Ascend 设备节点、驱动目录和 `npu-smi` 可用；
-- Service pass 固定 `msserviceprofiler==1.2.2`、`tzdata==2025.3`，且 analyzer CLI 可执行；
+- Service pass 固定 `msserviceprofiler==1.2.2`、`tzdata==2025.3`，且 analyzer CLI 和实际 vLLM hook 均可导入；
 - Torch pass 能导入并调用 `torch_npu.profiler.profiler.analyse`；
 - native categorical 的 sampler、Python extension、kernel library 和自定义 OPP 与编译产物逐项 SHA256 一致，算子已注册；
 - 运行结束后每个实例日志都出现 native categorical 首次激活标记。
@@ -133,6 +133,25 @@ least-outstanding 未带来收益，反而使 jobs/s 降低约 14.8%。四卡 ge
 
 Service Profiler 的原始 SQLite 数据和 `batch.csv`、`kvcache.csv` 均可解析，但 1.2.2 的厂商 trace exporter 无法将 vLLM 批量 request-id 列表转换为字符串，因而不生成 `chrome_tracing.json`。原始库、完整 analyzer 日志和部分成功产物均保留；项目自己的统一 Perfetto/Chrome 时间线直接使用 batch CSV 与 CIS 事件补齐该可视化，且把厂商导出失败显式标记为无效而非静默通过。
 
+首次使用新 Service 镜像启动时，预检只验证了发行包和 analyzer CLI，却没有覆盖插件内部的 `ms_service_profiler` 运行时导入；同时容器把镜像原有 Ascend `PYTHONPATH` 覆盖成了 `/workspace/src`。服务在加载模型前退出，没有占用正式 workload，也没有形成 profile。提交 `e1396a6` 改为保留 Ascend Python 路径并追加项目源码路径，同时在 preflight 中直接导入 `msserviceprofiler.vllm_profiler.vllm_v1.batch_hookers`。后续四个正式 pass 均通过该检查。
+
+## Native P0 正式 Profiling
+
+正式 P0 固定 `C15/R3/B128/L512`、sequence-logprob、64 个独立请求；两卡为 `TP2 + workers=32`，四卡为 `2xTP2 + round-robin + workers=64`。所有 pass 均为 100% 成功、零 OOM、零 KV preemption，且每个实例的两个 TP rank 都出现 native sampler 激活标记。
+
+| 部署 | pass | jobs/s | P95 (s) | APC hit | NPU busy 中位数 | 暴露 HCCL/窗口 | 统一时间线事件 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| 两卡 TP2 | none | 0.156288 | 313.91 | 96.58% | - | - | - |
+| 两卡 TP2 | Service | 0.133945 | 368.53 | - | - | - | 700 |
+| 两卡 TP2 | Torch | 0.149312 | 318.85 | 96.02% | 78.00% | 15.69% | 190,778 |
+| 四卡 2xTP2 | none | 0.270663 | 166.85 | - | - | - | - |
+| 四卡 2xTP2 | Service | 0.278633 | 188.32 | 97.65% | - | - | 1,072 |
+| 四卡 2xTP2 | Torch | 0.302821 | 171.11 | 97.49% | 90.51% | 18.37% | 282,468 |
+
+native categorical 在异步调度下与 stock sampler 的随机流不 bit-exact，各 pass 的实际生成长度和 forward work 也会变化。因此性能只引用 none pass；Service/Torch 的 jobs/s 仅用于说明采集运行本身完整，不能用它们与 none 的差值估算 profiler 开销。四卡 none 相对两卡 none 的 jobs/s 为 `1.73x`，同时 P95 降低 `46.85%`，但两次运行的总 forward work 不同，精确扩展效率还需按 token slots 归一化。
+
+两卡 Torch 中 candidate/rollout 占阶段时间 `47.16%/52.84%`，四卡 Torch 中为 `63.53%/36.47%`；reward、weight、resample 均低于 `0.01%`。四卡虽然严格按 32/32 请求分流，Service/Torch 仍分别观察到 `31.83%/18.15%` 的实例完成时间 skew，说明请求数不能代表 CIS 剩余工作量。P0 还显示暴露 HCCL 在两卡和四卡窗口分别为 `15.69%/18.37%`。这些是下一轮代表性算法配置需要验证是否稳定迁移的候选瓶颈，不在本阶段直接实现调度或通信优化。
+
 ## P/D Capability
 
 v0.18 源码包含 `MooncakeConnectorV1` 和单机 P/D 文档，但当前镜像中的 `mooncake.engine.TransferEngine` 无法导入，缺少 `ascend_transport.so`。挂载主机驱动后结果不变；官方文档要求另行以 `USE_ASCEND_DIRECT=ON` 编译安装 Mooncake。P/D 因此记录为依赖不完整的 capability failure，不进入本轮 general baseline，也不为赶 profiling 临时修改核心 scheduler。
@@ -145,5 +164,7 @@ v0.18 源码包含 `MooncakeConnectorV1` 和单机 P/D 文档，但当前镜像�
 - 双卡 tuner：`/data/disk/wangzili/cis-artifacts-fb4bc3c/tuning/two-card`
 - 干净的 32/64-way focused 结果：`/data/disk/wangzili/cis-artifacts-0410709`
 - 四卡路由对照：`/data/disk/wangzili/cis-artifacts-8be6203/four-card/routing`
+- 正式 native P0：`/data/disk/wangzili/cis-artifacts-e1396a6/profiles`
+- 四卡 native P0 无 profiler：`/data/disk/wangzili/cis-artifacts-e1396a6/validation/four-card-p0-none`
 
 上述目录保存原始服务日志、算法 JSONL、Agent trajectory、prediction、exit status、部署 manifest、诊断快照与 SHA256 清单。正式性能结论只从后续相同 workload、饱和负载、独立 profiler pass 的实验产生。
