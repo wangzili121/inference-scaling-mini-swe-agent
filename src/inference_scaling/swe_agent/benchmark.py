@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import http.client
 import json
 import statistics
 import threading
 import time
+import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -27,6 +29,7 @@ class RequestMeasurement:
     diagnostics: dict[str, Any] | None
     started_at: float
     finished_at: float
+    transport_retries: int = 0
 
 
 class EndpointRouter:
@@ -109,6 +112,26 @@ def _post(endpoint: str, payload: dict[str, Any], timeout: float) -> dict[str, A
     return value
 
 
+def _post_with_retry(
+    endpoint: str,
+    payload: dict[str, Any],
+    timeout: float,
+    retries: int,
+) -> tuple[dict[str, Any], int]:
+    completed_retries = 0
+    while True:
+        try:
+            return _post(endpoint, payload, timeout), completed_retries
+        except urllib.error.HTTPError as error:
+            if error.code not in {502, 503, 504} or completed_retries >= retries:
+                raise
+        except (OSError, TimeoutError, http.client.HTTPException):
+            if completed_retries >= retries:
+                raise
+        completed_retries += 1
+        time.sleep(min(1.0, 0.25 * (2 ** (completed_retries - 1))))
+
+
 def _backend_snapshot(endpoint: str, timeout: float = 10.0) -> dict[str, Any] | None:
     try:
         with urllib.request.urlopen(
@@ -147,11 +170,14 @@ def run_burst(
     routing: str = "round_robin",
     after_release: Callable[[], None] | None = None,
     require_action: bool = False,
+    transport_retries: int = 2,
 ) -> dict[str, Any]:
     if not records or not endpoints:
         raise ValueError("burst requires records and endpoints")
     if workers <= 0:
         raise ValueError("workers must be positive")
+    if transport_retries < 0:
+        raise ValueError("transport retries must be non-negative")
     run_namespace = run_namespace or f"burst:{time.time_ns()}"
     release = threading.Event()
     router = EndpointRouter(endpoints, routing)
@@ -170,8 +196,11 @@ def run_burst(
         endpoint = router.acquire()
         started = time.perf_counter()
         started_at = time.time()
+        completed_retries = 0
         try:
-            response = _post(endpoint, payload, timeout)
+            response, completed_retries = _post_with_retry(
+                endpoint, payload, timeout, transport_retries
+            )
             actions = response.get("message", {}).get("extra", {}).get("actions", [])
             action_valid = bool(actions)
             if require_action and not action_valid:
@@ -185,6 +214,7 @@ def run_burst(
                     response.get("diagnostics"),
                     started_at,
                     time.time(),
+                    completed_retries,
                 )
             return RequestMeasurement(
                 request_id,
@@ -196,6 +226,7 @@ def run_burst(
                 response.get("diagnostics"),
                 started_at,
                 time.time(),
+                completed_retries,
             )
         except Exception as error:
             return RequestMeasurement(
@@ -208,6 +239,7 @@ def run_burst(
                 None,
                 started_at,
                 time.time(),
+                completed_retries,
             )
         finally:
             router.release(endpoint)
@@ -272,6 +304,7 @@ def run_burst(
         "throughput": throughput,
         "successes": successes,
         "success_rate": successes / len(measurements),
+        "transport_retries": sum(item.transport_retries for item in measurements),
         "require_action": require_action,
         "action_valid_rate": (
             sum(observed_actions) / len(observed_actions) if observed_actions else None

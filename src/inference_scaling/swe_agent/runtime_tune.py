@@ -148,7 +148,7 @@ def engine_grid(
 
 def adaptive_search_plan() -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "feature_ab": [item.feature_id for item in feature_ablation_matrix()],
         "feature_minimum_gain": 0.03,
         "topologies": ["tp2", "pp2"],
@@ -171,14 +171,26 @@ def adaptive_search_plan() -> dict[str, Any]:
             "max_num_seqs": [192, 384],
             "max_num_batched_tokens": [16384, 65536],
         },
-        "memory": [0.88, 0.90, 0.92, 0.94, 0.96, 0.97, 0.98],
+        "memory_coarse": [0.90, 0.94, 0.98],
+        "memory_refinement": {
+            "0.90": [0.88, 0.92],
+            "0.94": [0.92, 0.96],
+            "0.98": [0.96],
+        },
         "partial_prefill": [[1, 1], [2, 1], [2, 2], [4, 2], [4, 4], [8, 4], [8, 8]],
-        "workers": [4, 8, 16, 32, 64, 96, 128, 256],
+        "workers": [16, 32, 64, 96, 128, 256],
         "successive_halving_requests": [16, 32, 64],
         "coarse_selection_metrics": [
             "jobs_per_second",
             "generation_forward_token_slots_per_second",
         ],
+        "fast_path": {
+            "coarse_survivors": [4, 2, 2],
+            "memory_initial": [0.90, 0.94, 0.98],
+            "partial_prefill_initial": [[1, 1], [2, 1], [4, 2]],
+            "workers_initial": [16, 32, 64],
+            "expand_only_at_boundary": True,
+        },
         "hard_gates": {
             "success_rate": 1.0,
             "oom": False,
@@ -735,14 +747,14 @@ def main() -> None:
         },
     )
     selected = select_arms(
-        round_results, keep=min(8, len(round_results)), balance_work_rate=True
+        round_results, keep=min(4, len(round_results)), balance_work_rate=True
     )
     survivors = [EngineConfig(**item["engine"]) for item in selected]
     _write_checkpoint(
         output / "coarse-1.json",
         {"request_count": 16, "results": round_results, "selected": selected},
     )
-    for round_index, (request_count, keep) in enumerate(((32, 4), (64, 2)), 2):
+    for round_index, (request_count, keep) in enumerate(((32, 2), (64, 2)), 2):
         round_results = [
             _cached_arm(
                 output,
@@ -750,7 +762,7 @@ def main() -> None:
                 resume=args.resume,
                 config=config,
                 feature=chosen_feature,
-                workers=args.initial_workers,
+                workers=request_count,
                 records=records[:request_count],
                 **common,
             )
@@ -776,6 +788,7 @@ def main() -> None:
 
     current_result = _best(selected)
     current = EngineConfig(**current_result["engine"])
+    saturated_workers = min(64, len(records))
     expansion_results: list[dict[str, Any]] = []
     if current.max_num_seqs == 512:
         for value in (768, 1024, 1536, 2048):
@@ -786,7 +799,7 @@ def main() -> None:
                 resume=args.resume,
                 config=candidate,
                 feature=chosen_feature,
-                workers=args.initial_workers,
+                workers=saturated_workers,
                 records=records[:64],
                 **common,
             )
@@ -803,7 +816,7 @@ def main() -> None:
                 resume=args.resume,
                 config=candidate,
                 feature=chosen_feature,
-                workers=args.initial_workers,
+                workers=saturated_workers,
                 records=records[:64],
                 **common,
             )
@@ -823,7 +836,7 @@ def main() -> None:
             resume=args.resume,
             config=config,
             feature=chosen_feature,
-            workers=args.initial_workers,
+            workers=saturated_workers,
             records=records[:64],
             **common,
         )
@@ -840,34 +853,36 @@ def main() -> None:
             resume=args.resume,
             config=replace(current, gpu_memory_utilization=memory),
             feature=chosen_feature,
-            workers=args.initial_workers,
+            workers=saturated_workers,
             records=records[:64],
             **common,
         )
-        for memory in (0.88, 0.90, 0.92, 0.94, 0.96)
+        for memory in (0.90, 0.94, 0.98)
     ]
     history.extend(memory_results)
     current_result = _best(memory_results)
     current = EngineConfig(**current_result["engine"])
-    if current.gpu_memory_utilization == 0.96:
-        upper_memory = []
-        for memory in (0.97, 0.98):
-            result = _cached_arm(
-                output,
-                "memory-upper",
-                resume=args.resume,
-                config=replace(current, gpu_memory_utilization=memory),
-                feature=chosen_feature,
-                workers=args.initial_workers,
-                records=records[:64],
-                **common,
-            )
-            upper_memory.append(result)
-            if not _valid(result):
-                break
-        history.extend(upper_memory)
-        current_result = _best([current_result, *upper_memory])
-        current = EngineConfig(**current_result["engine"])
+    memory_refinement = {
+        0.90: (0.88, 0.92),
+        0.94: (0.92, 0.96),
+        0.98: (0.96,),
+    }[current.gpu_memory_utilization]
+    memory_refinement_results = [
+        _cached_arm(
+            output,
+            "memory-refine",
+            resume=args.resume,
+            config=replace(current, gpu_memory_utilization=memory),
+            feature=chosen_feature,
+            workers=saturated_workers,
+            records=records[:64],
+            **common,
+        )
+        for memory in memory_refinement
+    ]
+    history.extend(memory_refinement_results)
+    current_result = _best([current_result, *memory_refinement_results])
+    current = EngineConfig(**current_result["engine"])
 
     partial_results = [
         _cached_arm(
@@ -880,25 +895,50 @@ def main() -> None:
                 max_long_partial_prefills=long_partial,
             ),
             feature=chosen_feature,
-            workers=args.initial_workers,
+            workers=saturated_workers,
             records=records[:64],
             **common,
         )
-        for partial, long_partial in (
-            (1, 1),
-            (2, 1),
-            (2, 2),
-            (4, 2),
-            (4, 4),
-            (8, 4),
-            (8, 8),
-        )
+        for partial, long_partial in ((1, 1), (2, 1), (4, 2))
     ]
     history.extend(partial_results)
     current_result = _best(partial_results)
     current = EngineConfig(**current_result["engine"])
 
-    worker_values = [4, 8, 16, 32, 64]
+    extra_partial_values: tuple[tuple[int, int], ...] = ()
+    if (
+        current.max_num_partial_prefills,
+        current.max_long_partial_prefills,
+    ) == (2, 1):
+        extra_partial_values = ((2, 2),)
+    elif (
+        current.max_num_partial_prefills,
+        current.max_long_partial_prefills,
+    ) == (4, 2):
+        extra_partial_values = ((4, 4), (8, 4), (8, 8))
+    extra_partial_results = [
+        _cached_arm(
+            output,
+            "partial-prefill-upper",
+            resume=args.resume,
+            config=replace(
+                current,
+                max_num_partial_prefills=partial,
+                max_long_partial_prefills=long_partial,
+            ),
+            feature=chosen_feature,
+            workers=saturated_workers,
+            records=records[:64],
+            **common,
+        )
+        for partial, long_partial in extra_partial_values
+    ]
+    if extra_partial_results:
+        history.extend(extra_partial_results)
+        current_result = _best([current_result, *extra_partial_results])
+        current = EngineConfig(**current_result["engine"])
+
+    worker_values = [16, 32, 64]
     worker_results = [
         _cached_arm(
             output,

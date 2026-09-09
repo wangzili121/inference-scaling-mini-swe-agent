@@ -201,6 +201,30 @@ def test_burst_separates_execution_success_from_action_validity(monkeypatch) -> 
     assert gated["action_valid_rate"] == 0.0
 
 
+def test_burst_retries_transient_connection_failure_with_same_job_id(
+    monkeypatch,
+) -> None:
+    request_ids = []
+
+    def flaky_post(endpoint, payload, timeout):
+        request_ids.append(payload["request_id"])
+        if len(request_ids) == 1:
+            raise ConnectionResetError("reset")
+        return {"message": {"extra": {"actions": []}}, "diagnostics": {}}
+
+    monkeypatch.setattr(benchmark, "_post", flaky_post)
+    monkeypatch.setattr(benchmark, "_backend_snapshot", lambda endpoint: {})
+    monkeypatch.setattr(benchmark.time, "sleep", lambda seconds: None)
+
+    result = benchmark.run_burst(
+        [_trace_record(1)], ("http://one",), workers=1, transport_retries=1
+    )
+
+    assert result["success_rate"] == 1.0
+    assert result["transport_retries"] == 1
+    assert request_ids[0] == request_ids[1]
+
+
 def test_reward_screen_uses_one_pool_for_both_reward_families(
     tmp_path: Path,
 ) -> None:
@@ -369,6 +393,9 @@ def test_adaptive_runtime_plan_expands_real_boundaries() -> None:
     assert plan["boundary_expansion"]["max_num_seqs"][-1] == 2048
     assert plan["boundary_expansion"]["max_num_batched_tokens"][-1] == 524288
     assert plan["partial_prefill"][-1] == [8, 8]
+    assert plan["fast_path"]["coarse_survivors"] == [4, 2, 2]
+    assert plan["memory_coarse"] == [0.90, 0.94, 0.98]
+    assert plan["fast_path"]["workers_initial"] == [16, 32, 64]
     assert select_max_model_len([_trace_record(1)]) == 16384
     long_record = _trace_record(2)
     long_record["diagnostics"]["prompt_tokens"] = 32001
