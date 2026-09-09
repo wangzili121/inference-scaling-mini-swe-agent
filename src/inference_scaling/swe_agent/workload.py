@@ -134,6 +134,7 @@ def build_public_workload(
     total: int = 64,
     max_new_tokens: int = 512,
     context_margin: int = 256,
+    maximum_context: int = 65536,
 ) -> dict[str, Any]:
     source = Path(source_directory)
     paths = sorted(source.rglob("*.traj.json"))
@@ -151,21 +152,37 @@ def build_public_workload(
         raise ValueError(f"need {total} public calls, found {len(snapshots)}")
     rng = random.Random(seed)
     rng.shuffle(snapshots)
-    selected = snapshots[:total]
     counter = _token_counter(model)
+    selected: list[dict[str, Any]] = []
     lengths = []
-    for item in selected:
+    oversized_calls_skipped = 0
+    for item in snapshots:
         length = counter(item["messages"])
+        if length + max_new_tokens + context_margin > maximum_context:
+            oversized_calls_skipped += 1
+            continue
         item["diagnostics"]["prompt_tokens"] = length
+        selected.append(item)
         lengths.append(length)
+        if len(selected) == total:
+            break
+    if len(selected) < total:
+        raise ValueError(
+            f"need {total} calls within context {maximum_context}, found {len(selected)}"
+        )
     required = max(lengths) + max_new_tokens + context_margin
     max_model_len = next(
-        (value for value in (16384, 32768, 65536) if value >= required),
+        (
+            value
+            for value in (16384, 32768, 65536)
+            if required <= value <= maximum_context
+        ),
         None,
     )
     if max_model_len is None:
         raise ValueError(
-            f"selected workload requires max_model_len >= {required}, above 64K"
+            f"selected workload requires max_model_len >= {required}, "
+            f"outside supported buckets up to {maximum_context}"
         )
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=True)
@@ -186,6 +203,8 @@ def build_public_workload(
         },
         "max_new_tokens": max_new_tokens,
         "context_margin": context_margin,
+        "maximum_context": maximum_context,
+        "oversized_calls_skipped": oversized_calls_skipped,
         "required_context": required,
         "selected_max_model_len": max_model_len,
         "truncated": False,
@@ -270,6 +289,7 @@ def main() -> None:
     parser.add_argument("--total", type=int, default=128)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--context-margin", type=int, default=256)
+    parser.add_argument("--maximum-context", type=int, default=65536)
     args = parser.parse_args()
     if bool(args.trace) == bool(args.public_trajectories):
         parser.error("provide exactly one of --trace or --public-trajectories")
@@ -284,6 +304,7 @@ def main() -> None:
             total=args.total,
             max_new_tokens=args.max_new_tokens,
             context_margin=args.context_margin,
+            maximum_context=args.maximum_context,
         )
     else:
         result = freeze_workload(

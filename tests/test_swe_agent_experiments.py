@@ -384,6 +384,49 @@ def test_public_workload_tokenizes_only_seeded_selection(
     assert len(calls) == 2
     assert result["count"] == 2
     assert result["prompt_tokens"]["maximum"] in {10, 30}
+    assert result["maximum_context"] == 65536
+    assert result["oversized_calls_skipped"] == 0
+
+
+def test_public_workload_skips_real_calls_outside_context_without_truncation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "trajectories"
+    source.mkdir()
+    for index, content in enumerate(("long", "short-1", "short-2")):
+        (source / f"task-{index}.traj.json").write_text(
+            json.dumps(
+                {
+                    "instance_id": f"task-{index}",
+                    "messages": [
+                        {"role": "user", "content": content},
+                        {"role": "assistant", "content": "done"},
+                    ],
+                }
+            )
+        )
+    monkeypatch.setattr(
+        "inference_scaling.swe_agent.workload.random.Random.shuffle",
+        lambda self, values: None,
+    )
+    monkeypatch.setattr(
+        "inference_scaling.swe_agent.workload._token_counter",
+        lambda _model: lambda messages: (
+            70000 if messages[-1]["content"] == "long" else 100
+        ),
+    )
+
+    result = build_public_workload(
+        source,
+        tmp_path / "output",
+        model="model",
+        total=2,
+        maximum_context=65536,
+    )
+
+    assert result["count"] == 2
+    assert result["oversized_calls_skipped"] == 1
+    assert result["truncated"] is False
 
 
 def test_swebench_launcher_selects_canonical_or_explicit_order() -> None:
