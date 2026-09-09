@@ -237,6 +237,7 @@ def run_topology(
     result.update(
         {
             "topology_id": topology.topology_id,
+            "routing_diagnostics": result.get("routing"),
             "routing": topology.routing,
             "services": [asdict(service) for service in topology.services],
         }
@@ -305,6 +306,7 @@ def run_routing_comparison(
             result.update(
                 {
                     "topology_id": topology.topology_id,
+                    "routing_diagnostics": result.get("routing"),
                     "routing": topology.routing,
                     "services": [asdict(service) for service in topology.services],
                     "shared_service_lifecycle": True,
