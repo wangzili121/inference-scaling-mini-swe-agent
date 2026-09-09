@@ -178,6 +178,7 @@ def adaptive_search_plan() -> dict[str, Any]:
             "0.98": [0.96],
         },
         "partial_prefill": [[1, 1], [2, 1], [2, 2], [4, 2], [4, 4], [8, 4], [8, 8]],
+        "partial_prefill_capability_gated": True,
         "workers": [16, 32, 64, 96, 128, 256],
         "successive_halving_requests": [16, 32, 64],
         "coarse_selection_metrics": [
@@ -555,6 +556,12 @@ def main() -> None:
     parser.add_argument("--candidate-count", type=int, default=15)
     parser.add_argument("--rollout-count", type=int, default=3)
     parser.add_argument("--block-size", type=int, default=128)
+    parser.add_argument(
+        "--partial-prefill-search",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable only after the runtime passes concurrent-prefill capability smoke",
+    )
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -612,6 +619,7 @@ def main() -> None:
                 "rollout_count": args.rollout_count,
                 "block_size": args.block_size,
             },
+            "partial_prefill_search": args.partial_prefill_search,
             "selected_max_model_len": max_model_len,
         }
     )
@@ -886,59 +894,69 @@ def main() -> None:
     current_result = _best([current_result, *memory_refinement_results])
     current = EngineConfig(**current_result["engine"])
 
-    partial_results = [
-        _cached_arm(
-            output,
-            "partial-prefill",
-            resume=args.resume,
-            config=replace(
-                current,
-                max_num_partial_prefills=partial,
-                max_long_partial_prefills=long_partial,
-            ),
-            feature=chosen_feature,
-            workers=saturated_workers,
-            records=fine_records,
-            **common,
-        )
-        for partial, long_partial in ((1, 1), (2, 1), (4, 2))
-    ]
-    history.extend(partial_results)
-    current_result = _best(partial_results)
-    current = EngineConfig(**current_result["engine"])
-
-    extra_partial_values: tuple[tuple[int, int], ...] = ()
-    if (
-        current.max_num_partial_prefills,
-        current.max_long_partial_prefills,
-    ) == (2, 1):
-        extra_partial_values = ((2, 2),)
-    elif (
-        current.max_num_partial_prefills,
-        current.max_long_partial_prefills,
-    ) == (4, 2):
-        extra_partial_values = ((4, 4), (8, 4), (8, 8))
-    extra_partial_results = [
-        _cached_arm(
-            output,
-            "partial-prefill-upper",
-            resume=args.resume,
-            config=replace(
-                current,
-                max_num_partial_prefills=partial,
-                max_long_partial_prefills=long_partial,
-            ),
-            feature=chosen_feature,
-            workers=saturated_workers,
-            records=fine_records,
-            **common,
-        )
-        for partial, long_partial in extra_partial_values
-    ]
-    if extra_partial_results:
-        history.extend(extra_partial_results)
-        current_result = _best([current_result, *extra_partial_results])
+    if args.partial_prefill_search:
+        partial_results = [
+            _cached_arm(
+                output,
+                "partial-prefill",
+                resume=args.resume,
+                config=replace(
+                    current,
+                    max_num_partial_prefills=partial,
+                    max_long_partial_prefills=long_partial,
+                ),
+                feature=chosen_feature,
+                workers=saturated_workers,
+                records=fine_records,
+                **common,
+            )
+            for partial, long_partial in ((1, 1), (2, 1), (4, 2))
+        ]
+        history.extend(partial_results)
+        current_result = _best(partial_results)
         current = EngineConfig(**current_result["engine"])
+
+        extra_partial_values: tuple[tuple[int, int], ...] = ()
+        if (
+            current.max_num_partial_prefills,
+            current.max_long_partial_prefills,
+        ) == (2, 1):
+            extra_partial_values = ((2, 2),)
+        elif (
+            current.max_num_partial_prefills,
+            current.max_long_partial_prefills,
+        ) == (4, 2):
+            extra_partial_values = ((4, 4), (8, 4), (8, 8))
+        extra_partial_results = [
+            _cached_arm(
+                output,
+                "partial-prefill-upper",
+                resume=args.resume,
+                config=replace(
+                    current,
+                    max_num_partial_prefills=partial,
+                    max_long_partial_prefills=long_partial,
+                ),
+                feature=chosen_feature,
+                workers=saturated_workers,
+                records=fine_records,
+                **common,
+            )
+            for partial, long_partial in extra_partial_values
+        ]
+        if extra_partial_results:
+            history.extend(extra_partial_results)
+            current_result = _best([current_result, *extra_partial_results])
+            current = EngineConfig(**current_result["engine"])
+    else:
+        _write_checkpoint(
+            output / "partial-prefill-capability.json",
+            {
+                "searched": False,
+                "reason": "runtime capability smoke required",
+                "selected": [1, 1],
+            },
+        )
 
     worker_values = [16, 32, 64]
     worker_results = [

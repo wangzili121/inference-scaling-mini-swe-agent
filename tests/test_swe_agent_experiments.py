@@ -399,6 +399,7 @@ def test_adaptive_runtime_plan_expands_real_boundaries() -> None:
     assert plan["boundary_expansion"]["max_num_seqs"][-1] == 2048
     assert plan["boundary_expansion"]["max_num_batched_tokens"][-1] == 524288
     assert plan["partial_prefill"][-1] == [8, 8]
+    assert plan["partial_prefill_capability_gated"]
     assert plan["fast_path"]["coarse_survivors"] == [4, 2, 2]
     assert plan["memory_coarse"] == [0.90, 0.94, 0.98]
     assert plan["fast_path"]["workers_initial"] == [16, 32, 64]
