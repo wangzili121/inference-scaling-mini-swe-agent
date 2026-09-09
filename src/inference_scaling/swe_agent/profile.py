@@ -113,6 +113,7 @@ def _profile_preflight(args: argparse.Namespace, output: Path) -> dict[str, Any]
             text=True,
             capture_output=True,
             timeout=30,
+            cwd=output,
         )
         if completed.returncode != 0:
             raise RuntimeError(
@@ -351,7 +352,11 @@ def _analyze_service_profiles(
         ]
         try:
             completed = subprocess.run(
-                command, text=True, capture_output=True, timeout=1800
+                command,
+                text=True,
+                capture_output=True,
+                timeout=1800,
+                cwd=service.profile_directory,
             )
             analyses.append(
                 {
