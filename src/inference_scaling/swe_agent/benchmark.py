@@ -21,6 +21,7 @@ class RequestMeasurement:
     request_id: str
     endpoint: str
     success: bool
+    action_valid: bool | None
     seconds: float
     error: str | None
     diagnostics: dict[str, Any] | None
@@ -145,6 +146,7 @@ def run_burst(
     run_namespace: str | None = None,
     routing: str = "round_robin",
     after_release: Callable[[], None] | None = None,
+    require_action: bool = False,
 ) -> dict[str, Any]:
     if not records or not endpoints:
         raise ValueError("burst requires records and endpoints")
@@ -171,12 +173,24 @@ def run_burst(
         try:
             response = _post(endpoint, payload, timeout)
             actions = response.get("message", {}).get("extra", {}).get("actions", [])
-            if not actions:
-                raise RuntimeError("selected completion has no valid action")
+            action_valid = bool(actions)
+            if require_action and not action_valid:
+                return RequestMeasurement(
+                    request_id,
+                    endpoint,
+                    False,
+                    False,
+                    time.perf_counter() - started,
+                    "selected completion has no valid action",
+                    response.get("diagnostics"),
+                    started_at,
+                    time.time(),
+                )
             return RequestMeasurement(
                 request_id,
                 endpoint,
                 True,
+                action_valid,
                 time.perf_counter() - started,
                 None,
                 response.get("diagnostics"),
@@ -188,6 +202,7 @@ def run_burst(
                 request_id,
                 endpoint,
                 False,
+                None,
                 time.perf_counter() - started,
                 f"{type(error).__name__}: {error}",
                 None,
@@ -220,6 +235,9 @@ def run_burst(
     }
     latencies = [item.seconds for item in measurements]
     successes = sum(item.success for item in measurements)
+    observed_actions = [
+        item.action_valid for item in measurements if item.action_valid is not None
+    ]
     return {
         "schema_version": 1,
         "requests": len(measurements),
@@ -234,6 +252,10 @@ def run_burst(
         "jobs_per_second": successes / wall_seconds if wall_seconds else 0.0,
         "successes": successes,
         "success_rate": successes / len(measurements),
+        "require_action": require_action,
+        "action_valid_rate": (
+            sum(observed_actions) / len(observed_actions) if observed_actions else None
+        ),
         "latency_seconds": {
             "mean": statistics.fmean(latencies),
             "p50": _percentile(latencies, 0.50),
@@ -259,6 +281,11 @@ def main() -> None:
         help="run only the first N workload records after loading the fixed manifest",
     )
     parser.add_argument("--timeout", type=float, default=7200.0)
+    parser.add_argument(
+        "--require-action",
+        action="store_true",
+        help="treat a completed CIS response without a bash action as failed",
+    )
     parser.add_argument("--seed", type=int, default=20260908)
     parser.add_argument("--candidate-count", type=int)
     parser.add_argument("--rollout-count", type=int)
@@ -292,6 +319,7 @@ def main() -> None:
         seed=args.seed,
         conditional_overrides=conditional_overrides,
         routing=args.routing,
+        require_action=args.require_action,
     )
     Path(args.output).write_text(json.dumps(result, indent=2) + "\n")
     print(

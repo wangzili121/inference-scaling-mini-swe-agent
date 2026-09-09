@@ -163,6 +163,34 @@ def test_burst_routes_whole_jobs_across_endpoints(monkeypatch) -> None:
     )
 
 
+def test_burst_separates_execution_success_from_action_validity(monkeypatch) -> None:
+    monkeypatch.setattr(
+        benchmark,
+        "_post",
+        lambda endpoint, payload, timeout: {
+            "message": {"extra": {"actions": []}},
+            "diagnostics": {"prompt_tokens": 10},
+        },
+    )
+    monkeypatch.setattr(benchmark, "_backend_snapshot", lambda endpoint: {})
+    records = [
+        {
+            "request_id": "request-1",
+            "messages": [{"role": "user", "content": "x"}],
+        }
+    ]
+
+    result = benchmark.run_burst(records, ("http://one",), workers=1)
+    gated = benchmark.run_burst(
+        records, ("http://one",), workers=1, require_action=True
+    )
+
+    assert result["success_rate"] == 1.0
+    assert result["action_valid_rate"] == 0.0
+    assert gated["success_rate"] == 0.0
+    assert gated["action_valid_rate"] == 0.0
+
+
 def test_reward_screen_uses_one_pool_for_both_reward_families(
     tmp_path: Path,
 ) -> None:
