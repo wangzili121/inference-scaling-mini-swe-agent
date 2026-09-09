@@ -7,6 +7,7 @@ import pytest
 
 from inference_scaling.arllm.backends import TabularAutoregressiveBackend
 from inference_scaling.swe_agent.service import ConditionalISRunner
+from inference_scaling.swe_agent.server import ConditionalISHTTPServer
 from inference_scaling.swe_agent import benchmark
 from inference_scaling.swe_agent.algorithm_grid import _pareto
 from inference_scaling.swe_agent.archive_artifacts import archive_artifacts
@@ -223,6 +224,11 @@ def test_burst_retries_transient_connection_failure_with_same_job_id(
     assert result["success_rate"] == 1.0
     assert result["transport_retries"] == 1
     assert request_ids[0] == request_ids[1]
+
+
+def test_conditional_is_server_accepts_saturated_burst_queue() -> None:
+    assert ConditionalISHTTPServer.request_queue_size >= 256
+    assert ConditionalISHTTPServer.daemon_threads
 
 
 def test_reward_screen_uses_one_pool_for_both_reward_families(

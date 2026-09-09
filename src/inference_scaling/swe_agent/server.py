@@ -13,6 +13,14 @@ from typing import Any
 from inference_scaling.swe_agent.service import ConditionalISRunner
 
 
+class ConditionalISHTTPServer(ThreadingHTTPServer):
+    """Keep saturated bursts in the socket queue while the engine admits jobs."""
+
+    request_queue_size = 1024
+    daemon_threads = True
+    block_on_close = False
+
+
 def _handler(runner: ConditionalISRunner) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
@@ -108,7 +116,7 @@ def main() -> None:
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     args = parser.parse_args()
     runner = ConditionalISRunner.from_toml(args.config, overrides=args.overrides)
-    server = ThreadingHTTPServer((args.host, args.port), _handler(runner))
+    server = ConditionalISHTTPServer((args.host, args.port), _handler(runner))
 
     def stop(_signum: int, _frame: Any) -> None:
         threading.Thread(target=server.shutdown, daemon=True).start()
