@@ -152,6 +152,11 @@ def adaptive_search_plan() -> dict[str, Any]:
         "feature_ab": [item.feature_id for item in feature_ablation_matrix()],
         "feature_minimum_gain": 0.03,
         "topologies": ["tp2", "pp2"],
+        "topology_gate": {
+            "pp2_anchors": [[64, 8192], [64, 32768], [256, 32768]],
+            "minimum_throughput_deficit": 0.25,
+            "minimum_p95_penalty": 0.25,
+        },
         "coarse": {
             "max_num_seqs": [64, 128, 256, 512],
             "max_num_batched_tokens": [8192, 32768, 131072],
@@ -296,6 +301,27 @@ def _generation_work_rate(result: dict[str, Any]) -> float:
         )
     )
     return slots / wall_seconds if wall_seconds > 0 else 0.0
+
+
+def _topology_dominated(
+    reference: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    throughput_deficit: float = 0.25,
+    p95_penalty: float = 0.25,
+) -> bool:
+    if not 0 <= throughput_deficit < 1 or p95_penalty < 0:
+        raise ValueError("invalid topology dominance threshold")
+    if not _valid(reference) or not _valid(candidate):
+        return not _valid(candidate)
+    return (
+        float(candidate["jobs_per_second"])
+        <= float(reference["jobs_per_second"]) * (1 - throughput_deficit)
+        and _generation_work_rate(candidate)
+        <= _generation_work_rate(reference) * (1 - throughput_deficit)
+        and float(candidate["latency_seconds"]["p95"])
+        >= float(reference["latency_seconds"]["p95"]) * (1 + p95_penalty)
+    )
 
 
 def _wait_for_health(endpoint: str, process: subprocess.Popen, timeout: float) -> None:
@@ -618,10 +644,105 @@ def main() -> None:
     )
     chosen_feature = FeatureConfig(**chosen_feature_result["feature"])
 
-    survivors = [
+    full_grid = [
         replace(config, max_model_len=max_model_len) for config in engine_grid()
     ]
-    for round_index, (request_count, keep) in enumerate(((16, 8), (32, 4), (64, 2)), 1):
+    tp_configs = [config for config in full_grid if config.topology == "tp2"]
+    pp_configs = [config for config in full_grid if config.topology == "pp2"]
+    anchor_values = {
+        tuple(item) for item in plan["topology_gate"]["pp2_anchors"]
+    }
+    pp_anchors = [
+        config
+        for config in pp_configs
+        if (config.max_num_seqs, config.max_num_batched_tokens) in anchor_values
+    ]
+    round_results = [
+        _cached_arm(
+            output,
+            "coarse-1",
+            resume=args.resume,
+            config=config,
+            feature=chosen_feature,
+            workers=args.initial_workers,
+            records=records[:16],
+            **common,
+        )
+        for config in (*tp_configs, *pp_anchors)
+    ]
+    history.extend(round_results)
+    by_engine = {
+        (
+            item["engine"]["topology"],
+            item["engine"]["max_num_seqs"],
+            item["engine"]["max_num_batched_tokens"],
+        ): item
+        for item in round_results
+    }
+    comparisons = []
+    for pp_config in pp_anchors:
+        key = (pp_config.max_num_seqs, pp_config.max_num_batched_tokens)
+        tp_result = by_engine[("tp2", *key)]
+        pp_result = by_engine[("pp2", *key)]
+        dominated = _topology_dominated(tp_result, pp_result)
+        comparisons.append(
+            {
+                "max_num_seqs": key[0],
+                "max_num_batched_tokens": key[1],
+                "tp2_arm": tp_result["arm_id"],
+                "pp2_arm": pp_result["arm_id"],
+                "jobs_per_second_ratio": (
+                    float(pp_result["jobs_per_second"])
+                    / float(tp_result["jobs_per_second"])
+                ),
+                "work_rate_ratio": (
+                    _generation_work_rate(pp_result)
+                    / _generation_work_rate(tp_result)
+                ),
+                "p95_ratio": (
+                    float(pp_result["latency_seconds"]["p95"])
+                    / float(tp_result["latency_seconds"]["p95"])
+                ),
+                "dominated": dominated,
+            }
+        )
+    pp2_pruned = bool(comparisons) and all(
+        item["dominated"] for item in comparisons
+    )
+    if not pp2_pruned:
+        remaining_pp = [config for config in pp_configs if config not in pp_anchors]
+        remaining_results = [
+            _cached_arm(
+                output,
+                "coarse-1",
+                resume=args.resume,
+                config=config,
+                feature=chosen_feature,
+                workers=args.initial_workers,
+                records=records[:16],
+                **common,
+            )
+            for config in remaining_pp
+        ]
+        round_results.extend(remaining_results)
+        history.extend(remaining_results)
+    _write_checkpoint(
+        output / "topology-gate.json",
+        {
+            **plan["topology_gate"],
+            "comparisons": comparisons,
+            "pp2_pruned": pp2_pruned,
+        },
+    )
+    selected = select_arms(
+        round_results, keep=min(8, len(round_results)), balance_work_rate=True
+    )
+    survivors = [EngineConfig(**item["engine"]) for item in selected]
+    _write_checkpoint(
+        output / "coarse-1.json",
+        {"request_count": 16, "results": round_results, "selected": selected},
+    )
+    for round_index, (request_count, keep) in enumerate(((32, 4), (64, 2)), 2):
         round_results = [
             _cached_arm(
                 output,
@@ -639,7 +760,7 @@ def main() -> None:
         selected = select_arms(
             round_results,
             keep=min(keep, len(round_results)),
-            balance_work_rate=round_index < 3,
+            balance_work_rate=round_index == 2,
         )
         survivors = [EngineConfig(**item["engine"]) for item in selected]
         _write_checkpoint(

@@ -23,6 +23,7 @@ from inference_scaling.swe_agent.workload import (
 )
 from inference_scaling.swe_agent.reward_screen import _screen_temperature
 from inference_scaling.swe_agent.runtime_tune import (
+    _topology_dominated,
     adaptive_search_plan,
     arm_trace_path,
     engine_grid,
@@ -328,6 +329,19 @@ def test_early_runtime_gate_balances_jobs_and_generated_work() -> None:
         "fastest-job",
         "fastest-work",
     ]
+
+
+def test_topology_gate_requires_throughput_and_tail_dominance() -> None:
+    tp2 = _arm("tp2", 1.0, 10.0)
+    pp2 = _arm("pp2", 0.7, 13.0)
+    for result, work_rate in ((tp2, 100.0), (pp2, 70.0)):
+        result["throughput"] = {
+            "generation_forward_token_slots_per_second": work_rate
+        }
+
+    assert _topology_dominated(tp2, pp2)
+    pp2["latency_seconds"]["p95"] = 11.0
+    assert not _topology_dominated(tp2, pp2)
 
 
 def test_four_card_topology_matrix_is_explicit_about_capability_gates() -> None:
