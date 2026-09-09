@@ -145,10 +145,26 @@ def _verify_npu_runtime(devices: Sequence[str]) -> dict[str, Any]:
             "npu-smi preflight failed: "
             + (completed.stderr.strip() or completed.stdout.strip())
         )
+    atb_probe = subprocess.run(
+        (
+            sys.executable,
+            "-c",
+            "import ctypes; ctypes.CDLL('libatb.so'); print('libatb.so')",
+        ),
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    if atb_probe.returncode != 0:
+        raise RuntimeError(
+            "ATB runtime preflight failed: "
+            + (atb_probe.stderr.strip() or atb_probe.stdout.strip())
+        )
     return {
         "device_ids": device_ids,
         "npu_smi": executable,
         "driver_mounted": True,
+        "atb_runtime": True,
     }
 
 
