@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -9,6 +10,7 @@ from inference_scaling.arllm.backends import TabularAutoregressiveBackend
 from inference_scaling.swe_agent.service import ConditionalISRunner
 from inference_scaling.swe_agent.server import ConditionalISHTTPServer
 from inference_scaling.swe_agent import benchmark
+from inference_scaling.swe_agent import topology as topology_module
 from inference_scaling.swe_agent.algorithm_grid import _pareto
 from inference_scaling.swe_agent.archive_artifacts import archive_artifacts
 from inference_scaling.swe_agent.artifacts import source_revision
@@ -32,7 +34,11 @@ from inference_scaling.swe_agent.runtime_tune import (
     select_max_model_len,
     select_arms,
 )
-from inference_scaling.swe_agent.topology import capability_matrix, native_topologies
+from inference_scaling.swe_agent.topology import (
+    capability_matrix,
+    native_topologies,
+    run_routing_comparison,
+)
 from inference_scaling.swe_agent.swebench import apply_image_template, select_instances
 from inference_scaling.swe_agent.profile_analysis import (
     analyze_algorithm_trace,
@@ -387,6 +393,49 @@ def test_four_card_topology_matrix_is_explicit_about_capability_gates() -> None:
     gated = matrix["gated"]
     assert "pd-2-plus-2" in gated
     assert "candidate-rollout-stage-pipeline" in gated
+
+
+def test_routing_comparison_reuses_initialized_services(
+    monkeypatch, tmp_path: Path
+) -> None:
+    topologies = native_topologies()[:2]
+    started = []
+    stopped = []
+    routing = []
+    services = [SimpleNamespace(endpoint="http://one", process=object())]
+    monkeypatch.setattr(
+        topology_module,
+        "_start_services",
+        lambda *args, **kwargs: started.append(True) or services,
+    )
+    monkeypatch.setattr(topology_module, "_wait_for_health", lambda *args: None)
+    monkeypatch.setattr(
+        topology_module,
+        "_stop_services",
+        lambda running: stopped.append(tuple(running)),
+    )
+
+    def fake_burst(records, endpoints, **kwargs):
+        routing.append(kwargs["routing"])
+        return {"success_rate": 1.0}
+
+    monkeypatch.setattr(topology_module, "run_burst", fake_burst)
+    results = run_routing_comparison(
+        topologies,
+        [_trace_record(1)],
+        warmup_records=[_trace_record(2)],
+        config=tmp_path / "config.toml",
+        output=tmp_path,
+        workers=1,
+        startup_timeout=1,
+        request_timeout=1,
+        seed=3,
+    )
+
+    assert started == [True]
+    assert len(stopped) == 1
+    assert routing == ["round_robin", "round_robin", "least_outstanding"]
+    assert all(result["shared_service_lifecycle"] for result in results)
 
 
 def test_adaptive_runtime_plan_expands_real_boundaries() -> None:

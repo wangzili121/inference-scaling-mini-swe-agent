@@ -244,6 +244,78 @@ def run_topology(
     return result
 
 
+def run_routing_comparison(
+    topologies: Sequence[TopologySpec],
+    records: Sequence[dict[str, Any]],
+    *,
+    warmup_records: Sequence[dict[str, Any]],
+    config: Path,
+    output: Path,
+    workers: int,
+    startup_timeout: float,
+    request_timeout: float,
+    seed: int,
+    host: str = "0.0.0.0",
+    overrides: Sequence[str] = (),
+    environment_overrides: Sequence[str] = (),
+    conditional_overrides: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Compare routing policies while reusing the same initialized services."""
+
+    if not topologies:
+        raise ValueError("routing comparison requires at least one topology")
+    services = topologies[0].services
+    if any(topology.services != services for topology in topologies[1:]):
+        raise ValueError("routing comparison requires identical service layouts")
+    processes = _start_services(
+        topologies[0],
+        config=config,
+        output=output,
+        host=host,
+        overrides=overrides,
+        environment_overrides=environment_overrides,
+    )
+    results: list[dict[str, Any]] = []
+    try:
+        for service in processes:
+            _wait_for_health(service.endpoint, service.process, startup_timeout)
+        endpoints = tuple(service.endpoint for service in processes)
+        if warmup_records:
+            warmup = run_burst(
+                warmup_records,
+                endpoints,
+                workers=min(workers, len(warmup_records)),
+                timeout=request_timeout,
+                seed=seed,
+                routing=topologies[0].routing,
+                conditional_overrides=conditional_overrides,
+            )
+            if warmup["success_rate"] != 1.0:
+                raise RuntimeError("topology warmup workload failed")
+        for topology in topologies:
+            result = run_burst(
+                records,
+                endpoints,
+                workers=workers,
+                timeout=request_timeout,
+                seed=seed,
+                routing=topology.routing,
+                conditional_overrides=conditional_overrides,
+            )
+            result.update(
+                {
+                    "topology_id": topology.topology_id,
+                    "routing": topology.routing,
+                    "services": [asdict(service) for service in topology.services],
+                    "shared_service_lifecycle": True,
+                }
+            )
+            results.append(result)
+    finally:
+        _stop_services(processes)
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
@@ -288,27 +360,31 @@ def main() -> None:
     ]
     if requested - {topology.topology_id for topology in topologies}:
         raise ValueError("requested topology is not natively executable")
-    results = [
-        run_topology(
-            topology,
-            records,
-            warmup_records=warmup_records,
-            config=Path(args.config).resolve(),
-            output=output,
-            workers=args.workers,
-            startup_timeout=args.startup_timeout,
-            request_timeout=args.request_timeout,
-            seed=args.seed,
-            overrides=args.overrides,
-            environment_overrides=args.environment,
-            conditional_overrides={
-                "candidate_count": args.candidate_count,
-                "rollout_count": args.rollout_count,
-                "block_size": args.block_size,
-            },
-        )
-        for topology in topologies
-    ]
+    shared_layout = bool(topologies) and all(
+        topology.services == topologies[0].services for topology in topologies[1:]
+    )
+    common = {
+        "warmup_records": warmup_records,
+        "config": Path(args.config).resolve(),
+        "output": output,
+        "workers": args.workers,
+        "startup_timeout": args.startup_timeout,
+        "request_timeout": args.request_timeout,
+        "seed": args.seed,
+        "overrides": args.overrides,
+        "environment_overrides": args.environment,
+        "conditional_overrides": {
+            "candidate_count": args.candidate_count,
+            "rollout_count": args.rollout_count,
+            "block_size": args.block_size,
+        },
+    }
+    if shared_layout:
+        results = run_routing_comparison(topologies, records, **common)
+    else:
+        results = [
+            run_topology(topology, records, **common) for topology in topologies
+        ]
     payload = {"schema_version": 1, "capabilities": capabilities, "results": results}
     (output / "result.json").write_text(
         json.dumps(payload, indent=2) + "\n", encoding="utf-8"
