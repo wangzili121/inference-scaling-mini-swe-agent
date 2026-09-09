@@ -415,6 +415,33 @@ def _stop_services(services: Sequence[ProfileService]) -> None:
         service.log.close()
 
 
+def _native_activation_evidence(
+    args: argparse.Namespace, services: Sequence[ProfileService]
+) -> dict[str, Any]:
+    requested = any(
+        assignment == "VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE=1"
+        for assignment in args.environment
+    )
+    if not requested:
+        return {"requested": False, "activated": False, "logs": {}}
+    marker = "vLLM-Ascend native categorical sampler activated"
+    logs = {}
+    for service in services:
+        path = Path(service.log.name)
+        logs[service.instance_id] = {
+            "path": str(path),
+            "marker_count": path.read_text(encoding="utf-8", errors="replace").count(
+                marker
+            ),
+        }
+    return {
+        "requested": True,
+        "activated": bool(logs)
+        and all(item["marker_count"] > 0 for item in logs.values()),
+        "logs": logs,
+    }
+
+
 def _profile_lifecycle(
     args: argparse.Namespace,
     services: Sequence[ProfileService],
@@ -607,6 +634,9 @@ def main() -> None:
     finally:
         _stop_services(services)
 
+    native_activation = _native_activation_evidence(args, services)
+    if "native_categorical" in profiler_dependencies:
+        profiler_dependencies["native_categorical"]["activation"] = native_activation
     service_analysis = (
         _analyze_service_profiles(services) if args.profiler == "service" else []
     )
@@ -671,6 +701,10 @@ def main() -> None:
             "seed": args.seed,
         },
     )
+    if native_activation["requested"] and not native_activation["activated"]:
+        raise RuntimeError(
+            "native categorical operator was available but no service activated it"
+        )
     print(
         json.dumps(
             {

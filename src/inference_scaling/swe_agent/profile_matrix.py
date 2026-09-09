@@ -188,8 +188,8 @@ def render_matrix_summary(output: Path, index: dict[str, Any]) -> dict[str, str]
             "npu_busy_ratio_median": float(
                 ascend.get("device_busy_ratio", {}).get("median", 0.0)
             ),
-            "exposed_communication_ratio": float(
-                ascend.get("exposed_communication_ratio", 0.0)
+            "exposed_communication_profile_ratio": float(
+                ascend.get("exposed_communication_profile_ratio", 0.0)
             ),
         }
         rows.append(row)
@@ -197,7 +197,7 @@ def render_matrix_summary(output: Path, index: dict[str, Any]) -> dict[str, str]
             f"| {deployment} | {algorithm} | {row['jobs_per_second_mean']:.4f} | "
             f"{row['p95_seconds_mean']:.3f} | {row['throughput_noise']:.2%} | "
             f"{row['block_gap_share']:.2%} | {row['npu_busy_ratio_median']:.2%} | "
-            f"{row['exposed_communication_ratio']:.2%} |"
+            f"{row['exposed_communication_profile_ratio']:.2%} |"
         )
     report.extend(
         [
