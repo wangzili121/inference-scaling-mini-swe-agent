@@ -127,6 +127,8 @@ least-outstanding 未带来收益，反而使 jobs/s 降低约 14.8%。四卡 ge
 
 正确挂载后的两卡 P0 native 无 profiler 基线使用 64 个独立请求、32 workers：成功率 100%，无 preemption，`0.156288 jobs/s`，P95 `313.91s`，forward token slots/s 为 `3706.84`。两个 TP rank 均出现 native sampler 激活标记。对应原始目录为 `/data/disk/wangzili/cis-artifacts-f655118/validation/native-p0-none`。
 
+为排除启用 native sampler 后 MNS 最优点迁移，又只补测了相邻的 `MNS=384`，其余配置和 64 个请求保持不变。结果为 `0.138898 jobs/s`、P95 `331.32s`，成功率 100%；相对 `MNS=256` 吞吐下降 `11.13%`、P95 上升 `5.54%`。因此不再扩展 MNS，正式 profiling 锁定 `TP2、MNS=256、MBT=32768、memory=0.90、partial-prefill=(1,1)、workers=32`。原始目录为 `/data/disk/wangzili/cis-artifacts-53a19cf/validation/native-mns384-p0-none`。
+
 相同环境关闭 native 后，stock 对照为 `0.151602 jobs/s`、P95 `337.42s`，同样 100% 成功且无 preemption。native 的 jobs/s 高 `3.09%`，P95 低 `6.97%`。两种 sampler 采样分布相同但随机流不 bit-exact，导致 candidate 长度、APC 和总 forward work 不同，因此这组 SWE workload 只证明正确 native 路径没有端到端回退，不能把全部差异都归因给 sampler kernel；sampler 的直接收益仍以既有同卡正反序两组 A/B 的几何平均 `1.115x` 为主要证据。stock 原始目录为 `/data/disk/wangzili/cis-artifacts-f655118/validation/stock-p0-none`。
 
 Service Profiler 的原始 SQLite 数据和 `batch.csv`、`kvcache.csv` 均可解析，但 1.2.2 的厂商 trace exporter 无法将 vLLM 批量 request-id 列表转换为字符串，因而不生成 `chrome_tracing.json`。原始库、完整 analyzer 日志和部分成功产物均保留；项目自己的统一 Perfetto/Chrome 时间线直接使用 batch CSV 与 CIS 事件补齐该可视化，且把厂商导出失败显式标记为无效而非静默通过。
