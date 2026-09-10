@@ -21,6 +21,7 @@ import inspect
 import itertools
 import os
 import threading
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from math import isclose, isfinite
@@ -1368,6 +1369,20 @@ class AsyncVLLMBackend(VLLMBackend):
             speculation=speculation,
             native_suffix_speculation=native_suffix_speculation,
         )
+        self._request_trace_observer: Callable[[Mapping[str, Any]], None] | None = None
+
+    def set_request_trace_observer(
+        self,
+        observer: Callable[[Mapping[str, Any]], None] | None,
+    ) -> None:
+        """Observe request-level lifecycle events without changing scheduling."""
+
+        self._request_trace_observer = observer
+
+    def _observe_request(self, event: Mapping[str, Any]) -> None:
+        observer = self._request_trace_observer
+        if observer is not None:
+            observer(event)
 
     @classmethod
     def from_pretrained(
@@ -1557,23 +1572,106 @@ class AsyncVLLMBackend(VLLMBackend):
 
         return self._runner.run(read())
 
-    async def _generate_one(self, prompt: Any, params: Any) -> Any:
+    async def _generate_one(
+        self,
+        prompt: Any,
+        params: Any,
+        request: GenerationRequest | None = None,
+    ) -> Any:
+        submitted_at = time.time()
+        epoch_offset = submitted_at - time.monotonic()
+        engine_request_id = (
+            request.request_id if request is not None else self._next_request_id()
+        )
         kwargs = {
             "prompt": prompt,
             "sampling_params": params,
-            "request_id": self._next_request_id(),
+            "request_id": engine_request_id,
         }
         if self._lora_request is not None:
             kwargs["lora_request"] = self._lora_request
         self._engine_requests_started(1)
         final = None
+        first_output_at: float | None = None
+        common = {
+            "schema_version": 1,
+            "request_id": None if request is None else request.request_id,
+            "engine_request_id": engine_request_id,
+            "prefix_tokens": None if request is None else len(request.prefix),
+            "max_new_tokens": None if request is None else request.max_new_tokens,
+            "seed": None if request is None else request.seed,
+        }
+        self._observe_request(
+            {
+                **common,
+                "event": "submitted",
+                "event_unix_us": int(submitted_at * 1e6),
+            }
+        )
         try:
             async for output in self._engine.generate(**kwargs):
+                if first_output_at is None:
+                    first_output_at = time.time()
+                    self._observe_request(
+                        {
+                            **common,
+                            "event": "first_output",
+                            "event_unix_us": int(first_output_at * 1e6),
+                        }
+                    )
                 final = output
+        except BaseException as error:
+            self._observe_request(
+                {
+                    **common,
+                    "event": "error",
+                    "event_unix_us": int(time.time() * 1e6),
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+            raise
         finally:
             self._engine_requests_finished(1)
         if final is None:
             raise RuntimeError("asynchronous vLLM request returned no output")
+        finished_at = time.time()
+        metrics = getattr(final, "metrics", None)
+        timing: dict[str, Any] = {}
+        if metrics is not None:
+            for name in ("queued_ts", "scheduled_ts", "first_token_ts", "last_token_ts"):
+                value = float(getattr(metrics, name, 0.0) or 0.0)
+                if value > 0:
+                    timing[f"{name[:-3]}_unix_us"] = int((epoch_offset + value) * 1e6)
+            queued = float(getattr(metrics, "queued_ts", 0.0) or 0.0)
+            scheduled = float(getattr(metrics, "scheduled_ts", 0.0) or 0.0)
+            first_token = float(getattr(metrics, "first_token_ts", 0.0) or 0.0)
+            last_token = float(getattr(metrics, "last_token_ts", 0.0) or 0.0)
+            if queued > 0 and scheduled >= queued:
+                timing["queue_us"] = int((scheduled - queued) * 1e6)
+            if scheduled > 0 and first_token >= scheduled:
+                timing["scheduled_to_first_token_us"] = int(
+                    (first_token - scheduled) * 1e6
+                )
+            if first_token > 0 and last_token >= first_token:
+                timing["decode_us"] = int((last_token - first_token) * 1e6)
+        completion = self._completion(final)
+        self._observe_request(
+            {
+                **common,
+                **timing,
+                "event": "finished",
+                "event_unix_us": int(finished_at * 1e6),
+                "output_tokens": len(completion.token_ids),
+                "cached_tokens": int(getattr(final, "num_cached_tokens", 0) or 0),
+                "finish_reason": str(
+                    getattr(completion, "finish_reason", "length") or "length"
+                ),
+                "frontend_first_output_unix_us": (
+                    None if first_output_at is None else int(first_output_at * 1e6)
+                ),
+            }
+        )
         return final
 
     async def _generate_many(self, prompts: Sequence[Any], params: Any) -> list[Any]:
@@ -1605,7 +1703,7 @@ class AsyncVLLMBackend(VLLMBackend):
             )
 
         async def indexed(index: int, prompt: Any, policy: Any):
-            return index, await self._generate_one(prompt, policy)
+            return index, await self._generate_one(prompt, policy, requests[index])
 
         tasks = [
             asyncio.create_task(indexed(index, prompt, policy))
@@ -1630,6 +1728,36 @@ class AsyncVLLMBackend(VLLMBackend):
         if any(item is None for item in parsed):
             raise RuntimeError("asynchronous vLLM omitted a request result")
         return [item for item in parsed if item is not None]
+
+    def sample_batch(
+        self, requests: Sequence[GenerationRequest]
+    ) -> list[SequenceSample]:
+        """Submit algorithm request IDs directly so service traces retain the CIS tree."""
+
+        if not requests:
+            return []
+        if self._mh_fused_logprobs:
+            return super().sample_batch(requests)
+        if self._closed:
+            raise RuntimeError("vLLM backend is closed")
+        prompts = tuple(self._prompt(request.prefix) for request in requests)
+        params = [self._sampling_params(request) for request in requests]
+        parsed = self._runner.run(
+            self._generate_many_as_completed(
+                prompts,
+                params,
+                tuple(requests),
+                lambda _index, _sample: None,
+            )
+        )
+        samples = [item[0] for item in parsed]
+        self._record_sample_batch(
+            samples,
+            prefill_tokens=sum(item[1] for item in parsed),
+            cached_tokens=sum(item[2] for item in parsed),
+            forward_slots=sum(item[3] for item in parsed),
+        )
+        return samples
 
     def _generate(self, prompts: Sequence[Any], params: Any) -> list[Any]:
         if self._closed:

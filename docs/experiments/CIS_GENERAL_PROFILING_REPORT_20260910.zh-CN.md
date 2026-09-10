@@ -89,7 +89,52 @@ candidate streaming 的中位提前量只有 `5.85ms`。固定 B 使 candidate �
 令输出长度不可预知，静态 prompt/C/R/B/L 估计不够稳健，只适合作为在线
 remaining-work routing 的先验。
 
-## 6. 后续建议（尚未作为收益结论）
+## 6. 双卡 Request-Forest 深剖
+
+为回答“每个 candidate/rollout 到底进入了哪里、等在什么位置”，在同一 P0 和
+双卡最佳 general 配置上补采了一次 60 秒 Service pass。算法层保留完整
+`job/block/candidate/rollout/parent` 关系，backend 对每条底层请求记录 submit、
+scheduled、first-token、finish、cached tokens 和实际参加的每一个 vLLM batch。
+64 个顶层调用全部成功、零 preemption；原始目录为
+`/data/disk/wangzili/cis-request-profile/p0-two-card-service`。
+
+采集共包含 68 条算法记录（4 warmup + 64 正式）、2,148 条底层 engine request
+和 109 个 Service batch。代表 block 来自
+`sphinx-doc__sphinx-10673:call-15`，prompt 为 30,546 token；15 个 candidate 中
+C6/C7/C14 直接 EOS，其余 12 个 candidate 实际派生 36 个 rollout，共 51 条
+结构化底层请求，其中 50 条进入采集窗口。
+
+- candidate queue P50/P95 为 `25.60s/26.35s`，rollout queue P50/P95 为
+  `17.63s/19.00s`；这是真实 engine queue，不是算法阶段时长反推。
+- candidate 完成时间跨度为 `32.17s`；非终止 candidate 完成到第一条 child submit
+  的 P50/P95 为 `3.47s/4.55s`。该间隔存在，但结合既有 host streaming 负结果，
+  不能把“完成即提交”直接当作优化结论。
+- rollout 输出长度 P50/P95/max 为 `148.5/384/384` token，完成时间跨度为
+  `180.65s`；较早完成的 rollout 最多等待约 `180.65s` 才能解除 block barrier。
+  C11/R1、C11/R0、C2/R0 均生成 384 token，构成该 block 的真实关键路径。
+- 同一 candidate 的 sibling rollout 在 batch membership 上有 `99.68%` 同批率。
+  因此“只让 sibling 同批”的通用 bundle scheduler 已没有大空间；更直接的机会是
+  让同一 forward 中已经共存的 sibling 在 attention 内复用 shared trunk KV。
+- 该 block 涉及的 89 个 Service batch 中，83 个是 `Prefill,Decode` 混合批，
+  即 `93.26%`；89 个 batch 全部达到 size 256。设备不是没有喂满，剩余问题是
+  满 batch 内部的阶段/形状干扰和共享 KV 语义缺失。
+- APC 确实在工作：代表 candidate 的首条 rollout 只命中 12,160 个 prefix token，
+  后续 sibling 通常命中 30,592/30,674；这进一步把问题从“普通 prefix cache
+  miss”收窄到 decode attention 对共享 KV 的重复读取。
+
+补采的 30 秒双卡 Torch pass 使用相同配置和 request lifecycle tracing，原始目录为
+`/data/disk/wangzili/cis-request-profile/p0-two-card-torch`。它用于把上述请求森林与
+rank 0/1 的 NPU kernel、AICore/AICPU、HCCL 和 Host 时间线对齐，不用其吞吐替代
+无 profiler baseline。该 pass 含 4,556 条原始 kernel 事件；完整 profiler span
+的 rank 0/1 busy 为 `82.48%/84.40%`，暴露 HCCL/profile 为
+`8.78%/11.07%`。与算法绝对时间戳对齐的 30 秒窗口几乎全程是
+candidate+rollout mixed，rank 0/1 busy 分别为 `73.46%/73.09%`。
+`FusedInferAttentionScore` 双 rank 累计 `33.83 device-seconds`，占双 rank
+device-busy union 的 `67.3%`；`hcom_allReduce` 累计 `5.83 device-seconds`。
+时间线还定位到窗口内部至少一个双 rank 同时低 busy 的 200ms 空洞，说明满载
+batch、持续 backlog 与设备每毫秒持续忙碌不是同一件事。
+
+## 7. 后续建议（尚未作为收益结论）
 
 1. `in-engine branch-on-token`：candidate 到 B token 后直接 fork R 个 block-table
    child，减少 host callback、重新 admission、prefix hash 和 request lifecycle。
@@ -102,7 +147,7 @@ remaining-work routing 的先验。
 4. `online remaining-work routing`：使用已完成 token、当前 branch 数和 barrier
    余量更新代价；不再依赖已被 P1/P3 反例否定的静态估计。
 
-## 7. 数据与可视化
+## 8. 数据与可视化
 
 - 完整原始路径与各 pass 记录：
   `docs/experiments/SWEBENCH_NPU_VALIDATION_20260909.zh-CN.md`
@@ -111,9 +156,16 @@ remaining-work routing 的先验。
 - 可复现导出器：`experiments/swebench/export_profile_dashboard.py`
 - mixed-stage 原始目录：
   `/data/disk/wangzili/cis-mixed-profile/p0-four-card-torch`
+- 双卡逐请求 Service 原始目录：
+  `/data/disk/wangzili/cis-request-profile/p0-two-card-service`
+- 双卡逐请求 Torch 原始目录：
+  `/data/disk/wangzili/cis-request-profile/p0-two-card-torch`
+- 逐请求导出与渲染器：`experiments/swebench/export_cis_request_profile.py`、
+  `experiments/swebench/render_cis_request_profile.py`
 - 交互式 viewer 同时保留完整算法 Gantt、15 秒 NPU/HCCL 忙闲、按阶段统计的
-  busy/HCCL 表、120ms 的 4,556 条原始 kernel 下钻、296 条逐 batch Service
-  事件，以及五项带证据的优化空间标注。
+  busy/HCCL 表、1ms 的 4,556 条原始 kernel 下钻、逐 batch Service 事件、36 个
+  CIS job 的交错矩阵，以及 queue、mixed forward、Attention 和 barrier tail 的
+  图内高亮。
 
 原始 `*ascend_pt`、`analysis.db`、kernel/operator CSV、Service 目录和算法 JSONL
 仍留在服务器，viewer 使用的是从这些文件可重复生成的紧凑数据，不替代原始证据。

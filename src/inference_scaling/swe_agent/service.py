@@ -224,13 +224,18 @@ class JsonlTraceWriter:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._lock = threading.Lock()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._stream = self.path.open("a", encoding="utf-8", buffering=1)
 
     def append(self, record: Mapping[str, Any]) -> None:
         payload = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         with self._lock:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            with self.path.open("a", encoding="utf-8") as stream:
-                stream.write(payload + "\n")
+            self._stream.write(payload + "\n")
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._stream.closed:
+                self._stream.close()
 
 
 class ConditionalISRunner:
@@ -312,6 +317,24 @@ class ConditionalISRunner:
         )
         trace_path = service.get("trace_path")
         self.trace_writer = JsonlTraceWriter(trace_path) if trace_path else None
+        self.request_trace_writer = None
+        set_request_observer = getattr(backend, "set_request_trace_observer", None)
+        if trace_path and callable(set_request_observer):
+            algorithm_trace_path = Path(str(trace_path))
+            request_trace_path = (
+                algorithm_trace_path.parent.parent
+                / "request-traces"
+                / algorithm_trace_path.name
+            )
+            self.request_trace_writer = JsonlTraceWriter(request_trace_path)
+
+            def observe_request(event: Mapping[str, Any]) -> None:
+                assert self.request_trace_writer is not None
+                self.request_trace_writer.append(
+                    {**dict(event), "instance_id": self.instance_id}
+                )
+
+            set_request_observer(observe_request)
         self.query_cache = IdempotentQueryCache(
             int(service.get("idempotency_cache_size", 256))
         )
@@ -430,15 +453,65 @@ class ConditionalISRunner:
             },
         }
         if self.trace_writer is not None:
+            conditional_steps = []
+            eos = self.sampling.eos_token_id
+            for block_id, step in enumerate(result.steps):
+                candidates = []
+                for candidate_index, candidate in enumerate(step.candidates):
+                    terminal = bool(
+                        eos is not None
+                        and candidate.token_ids
+                        and candidate.token_ids[-1] == eos
+                    )
+                    rollouts = []
+                    if not terminal:
+                        for rollout_index, rollout in enumerate(candidate.rollouts):
+                            rollouts.append(
+                                {
+                                    "request_id": (
+                                        f"{request_id}:step:{block_id}:"
+                                        f"candidate:{candidate_index}:"
+                                        f"rollout:{rollout_index}"
+                                    ),
+                                    "rollout_index": rollout_index,
+                                    "output_tokens": len(rollout.token_ids),
+                                    "reward": rollout.reward,
+                                    "log_weight": rollout.log_weight,
+                                    "proposal_logprob": rollout.proposal_logprob,
+                                }
+                            )
+                    candidates.append(
+                        {
+                            "request_id": (
+                                f"{request_id}:step:{block_id}:"
+                                f"candidate:{candidate_index}"
+                            ),
+                            "candidate_index": candidate_index,
+                            "output_tokens": len(candidate.token_ids),
+                            "terminal": terminal,
+                            "selected": candidate_index == step.selected_index,
+                            "log_weight": candidate.log_weight,
+                            "rollouts": rollouts,
+                        }
+                    )
+                conditional_steps.append(
+                    {
+                        "block_id": block_id,
+                        "generated_tokens_before": step.generated_length_before,
+                        "selected_candidate": step.selected_index,
+                        "candidates": candidates,
+                    }
+                )
             self.trace_writer.append(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "request_id": request_id,
                     "messages": list(messages),
                     "prompt_token_ids": execution.prompt,
                     "message": message,
                     "diagnostics": diagnostics,
                     "stage_events": list(execution.stage_events),
+                    "conditional_steps": conditional_steps,
                 }
             )
         return QueryResult(message=message, diagnostics=diagnostics)
@@ -557,6 +630,10 @@ class ConditionalISRunner:
         )
 
     def close(self) -> None:
+        if self.trace_writer is not None:
+            self.trace_writer.close()
+        if self.request_trace_writer is not None:
+            self.request_trace_writer.close()
         close_backend(self.backend)
 
 

@@ -31,7 +31,7 @@ SWE-bench 调用和已调优 general baseline 后，P0-P3 的共同结论为：
 - APC token hit ratio 通常为 95%-97%；它已解决大部分重复 prefill，但没有解决
   decode 时的共享 KV 重读。
 - Ascend Torch trace 中 `FusedInferAttentionScore` 始终是最大或最主要 kernel，
-  典型占设备 busy 时间约 38%-61%。
+  代表窗口占设备 busy 时间约 38%-75%；最新双卡 mixed 窗口为 `67.3%`。
 - P0/P1/P2/P3 的四卡双 instance 均出现不同程度的实际工作偏斜；最新 P3
   Torch pass 在严格 32/32 job 分配下仍有 30.19% endpoint mean latency skew。
 - P3 四卡 Torch pass 中四个 rank 的 NPU busy ratio 为 75.13%-86.58%，暴露
@@ -51,6 +51,14 @@ SWE-bench 调用和已调优 general baseline 后，P0-P3 的共同结论为：
 - 静态 whole-job work routing 在 P1 的 work-normalized throughput 提升
   `22.65%`，但在 P3 下降 `11.39%`。仅用请求开始前可见的 prompt/C/R/B/L
   无法稳定预测随机 EOS 后的实际剩余工作，不能直接成为默认路由。
+- 新增的双卡逐请求 Service trace 显示，代表 P0 block 中同一 candidate 的
+  sibling rollout 已有 `99.68%` batch 同批率，但 `93.26%` 的相关 batch 仍是
+  满载的 Prefill+Decode 混合批。它排除了“仅靠 sibling bundling”作为主要收益
+  来源，同时加强了 Forest Attention 的前提：需要共享 KV 的 sibling 已经在同一
+  forward 中共存，只是普通 FIA 不理解这层共享。
+- 同一代表 block 的 rollout 输出长度 P50/P95 为 `148.5/384` token，完成跨度
+  `180.65s`；barrier 的关键路径由少数 384-token rollout 决定。barrier-critical
+  priority 必须在 engine 内估计真实剩余 token，不能依据静态 candidate 数量。
 
 因此，继续只调 MNS、MBT 或普通请求并发不会触及主要剩余问题。下一阶段需要
 让 runtime 显式理解 Conditional IS 的树结构。
@@ -123,7 +131,9 @@ trunk + C * candidate_suffix + C * R * unique_tail
 
 kernel 与调度必须共同设计。只做 candidate completion streaming 会降低 barrier，
 但也可能把 sibling 拆散，损失 Forest Attention 的共享组；只等待完整 sibling
-则会增加尾延迟。因此 scheduler 的调度单位应是可调大小的 subtree bundle。
+则会增加尾延迟。逐请求 trace 又表明当前提交顺序已经让 sibling 几乎总是同批，
+因此 scheduler 的价值不能定义成“把 sibling 凑到一起”，而应定义成在保留这层
+locality 的同时控制 mixed batch shape，并缩短真实 barrier critical tail。
 
 前两种直观方案已被真实 P0 饱和 A/B 排除：candidate streaming 和 per-job
 bounded submission 都会降低吞吐。静态 whole-job work balancing 也只在部分

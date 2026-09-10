@@ -1,0 +1,269 @@
+<div id="cis-request-flow">
+  <style>
+    #cis-request-flow { color: var(--foreground); font: 12px/1.45 ui-sans-serif, system-ui, sans-serif; letter-spacing: 0; }
+    #cis-request-flow * { box-sizing: border-box; }
+    #cis-request-flow h1 { margin: 0 0 4px; font-size: 20px; letter-spacing: 0; }
+    #cis-request-flow h2 { margin: 0 0 4px; font-size: 15px; letter-spacing: 0; }
+    #cis-request-flow p { margin: 0; }
+    #cis-request-flow .muted { color: var(--muted-foreground); }
+    #cis-request-flow .head { padding-bottom: 13px; border-bottom: 1px solid var(--border); }
+    #cis-request-flow .facts { display: grid; grid-template-columns: repeat(5,minmax(105px,1fr)); margin-top: 12px; border-block: 1px solid var(--border); }
+    #cis-request-flow .fact { padding: 9px 8px 9px 0; }
+    #cis-request-flow .fact b { display: block; font-size: 16px; font-variant-numeric: tabular-nums; }
+    #cis-request-flow section { padding: 17px 0; border-bottom: 1px solid var(--border); }
+    #cis-request-flow .legend { display: flex; flex-wrap: wrap; gap: 6px 15px; margin: 9px 0; }
+    #cis-request-flow .legend span { display: inline-flex; align-items: center; gap: 5px; color: var(--muted-foreground); }
+    #cis-request-flow .swatch { width: 10px; height: 10px; border: 1px solid color-mix(in srgb,currentColor 55%,transparent); }
+    #cis-request-flow .canvas-wrap { position: relative; width: 100%; overflow: hidden; border: 1px solid var(--border); background: var(--background); }
+    #cis-request-flow canvas { display: block; width: 100%; }
+    #cis-request-flow .issues { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 9px 18px; margin-top: 11px; }
+    #cis-request-flow .issue { padding-left: 10px; border-left: 3px solid var(--destructive); }
+    #cis-request-flow .issue.good { border-left-color: var(--viz-series-2); }
+    #cis-request-flow .issue b { display: block; }
+    #cis-request-flow .table-wrap { overflow-x: auto; }
+    #cis-request-flow table { width: 100%; margin-top: 10px; border-collapse: collapse; font: 11px/1.4 ui-monospace, SFMono-Regular, monospace; }
+    #cis-request-flow th, #cis-request-flow td { padding: 5px 7px; border-bottom: 1px solid var(--border); text-align: right; }
+    #cis-request-flow th:first-child, #cis-request-flow td:first-child { text-align: left; }
+    #cis-request-flow tr.selected { background: color-mix(in srgb,var(--viz-series-2) 10%,transparent); }
+    #cis-request-flow .source { margin-top: 8px; color: var(--muted-foreground); font: 11px/1.45 ui-monospace, SFMono-Regular, monospace; overflow-wrap: anywhere; }
+    #cis-request-flow .tooltip { display: none; position: fixed; z-index: 100; pointer-events: none; max-width: 440px; padding: 8px 10px; border: 1px solid var(--border); background: var(--popover); color: var(--popover-foreground); box-shadow: 0 4px 18px color-mix(in srgb,var(--foreground) 20%,transparent); font: 11px/1.5 ui-monospace, SFMono-Regular, monospace; white-space: pre-line; }
+    @media(max-width:680px){
+      #cis-request-flow .facts { grid-template-columns: repeat(2,minmax(0,1fr)); }
+      #cis-request-flow .issues { grid-template-columns: 1fr; }
+    }
+  </style>
+
+  <div class="head">
+    <h1>Conditional IS 请求森林逐事件 Profiling</h1>
+    <p class="muted" id="subtitle"></p>
+    <div class="facts" id="request-facts"></div>
+  </div>
+
+  <section>
+    <h2>全局 60 秒：36 个 CIS job 怎样交错进入一个 TP2 engine</h2>
+    <p class="muted">每行是一条顶层 CIS job，candidate/rollout 来自算法绝对时间戳；红色竖带是底层排队峰值。32 workers 是客户端并发槽，模型侧只有一个 EngineCore scheduler，TP rank 0/1 共同执行每个 forward。</p>
+    <div class="legend" id="global-legend"></div>
+    <div class="canvas-wrap"><canvas id="global-job-gantt" role="img" aria-label="多个 Conditional IS job 的 candidate rollout 交错时间线"></canvas></div>
+  </section>
+
+  <section>
+    <h2>Engine queue、已首次调度请求与真实 batch 组成</h2>
+    <p class="muted">第一图从 2,148 条 request lifecycle 重建首次调度前队列和首次调度后未完成请求；第二图逐 batch 显示 candidate/rollout 与 prefill/decode 组成。它们不是利用率推测。</p>
+    <div class="canvas-wrap"><canvas id="engine-pressure" role="img" aria-label="candidate rollout 请求队列和已调度生命周期"></canvas></div>
+    <div class="canvas-wrap"><canvas id="batch-composition" role="img" aria-label="每个 vLLM batch 的 candidate rollout prefill decode 组成"></canvas></div>
+    <div class="issues" id="global-issues"></div>
+  </section>
+
+  <section>
+    <h2>哪几个 job 在同一个 forward batch 里相遇</h2>
+    <p class="muted">行是顶层 job，列是原始 Service batch；粉色是 candidate，蓝色是 rollout，橙色表示同一 job 的两类分支同时出现在该 batch。高亮竖带是参与 job 数最多的混合 forward。</p>
+    <div class="legend" id="interleave-legend"></div>
+    <div class="canvas-wrap"><canvas id="job-batch-interleave" role="img" aria-label="多个 CIS job 在 vLLM batch 中的交错矩阵"></canvas></div>
+  </section>
+
+  <section id="npu-section">
+    <h2>相同双卡配置：TP rank 0/1 的 NPU、Attention 与 HCCL</h2>
+    <p class="muted">这是同配置独立 Torch pass 的 1ms 原始 kernel 覆盖。上方算法带显示 candidate/rollout 是否活跃；每个 TP rank 的计算带按主导 kernel 分类，下面窄带是 HCCL。红框直接标出最低 busy 的 200ms 设备空洞。</p>
+    <div class="legend" id="npu-legend"></div>
+    <div class="canvas-wrap"><canvas id="npu-timeline" role="img" aria-label="双卡 NPU 计算 attention HCCL 一毫秒时间线"></canvas></div>
+    <div class="canvas-wrap"><canvas id="kernel-pareto" role="img" aria-label="双卡 NPU kernel 累计设备时间排序"></canvas></div>
+    <div class="issues" id="npu-issues"></div>
+  </section>
+
+  <section>
+    <h2 id="tree-title">一个完整 block 的 candidate → rollout 请求森林</h2>
+    <p class="muted">每行是一条真实 engine request。横向严格使用请求时间戳；红色延伸表示请求已结束但仍在等待同一 block 的最后一条 rollout，直到 barrier 才能 reduce/resample。</p>
+    <div class="legend" id="lifecycle-legend"></div>
+    <div class="canvas-wrap"><canvas id="request-gantt" role="img" aria-label="Conditional IS candidate 和 rollout 请求生命周期"></canvas></div>
+    <div class="issues" id="request-issues"></div>
+  </section>
+
+  <section>
+    <h2>同一批请求进入了哪些 vLLM forward batch</h2>
+    <p class="muted">上方柱高为整个 engine batch size；下方矩阵中的每个短条来自 Service Profiler 的一条真实 request-batch membership，不是聚合推测。TP2 的两个 rank 共同执行这些 batch。</p>
+    <div class="legend" id="batch-legend"></div>
+    <div class="canvas-wrap"><canvas id="batch-membership" role="img" aria-label="每条 candidate 和 rollout 参加的真实 vLLM batch"></canvas></div>
+    <div class="issues" id="batch-issues"></div>
+  </section>
+
+  <section>
+    <h2>Candidate 级结果与关键路径</h2>
+    <p class="muted">winner、权重、candidate 完成后到首个 child submit 的等待，以及三个 sibling rollout 的完成跨度均来自该 job 的原始 trace。</p>
+    <div class="table-wrap" id="candidate-table"></div>
+    <div class="source" id="request-source"></div>
+  </section>
+
+  <div class="tooltip" id="request-tip"></div>
+  <script type="application/json" id="cis-request-data">__CIS_REQUEST_PROFILE_DATA__</script>
+  <script>
+  (()=>{
+    const root=document.getElementById('cis-request-flow');
+    const data=JSON.parse(document.getElementById('cis-request-data').textContent);
+    const tip=document.getElementById('request-tip');
+    const css=name=>{const probe=document.createElement('span');probe.style.color=`var(${name})`;root.appendChild(probe);const value=getComputedStyle(probe).color;probe.remove();return value;};
+    let colors={};
+    const refreshColors=()=>{colors={queue:css('--muted-foreground'),prefill:css('--viz-series-5'),decode:css('--viz-series-1'),wait:css('--destructive'),candidate:css('--viz-series-4'),rollout:css('--viz-series-1'),selected:css('--viz-series-2'),mixed:css('--viz-series-6'),grid:css('--border'),text:getComputedStyle(root).color,background:css('--background')};};
+    refreshColors();
+    const fmt=v=>v==null?'--':v>=1000?(v/1000).toFixed(2)+'s':v.toFixed(v<10?2:1)+'ms';
+    const pct=v=>v==null?'--':(100*v).toFixed(1)+'%';
+    const setup=(canvas,height)=>{const dpr=Math.min(devicePixelRatio||1,2),w=Math.max(320,canvas.parentElement.clientWidth);canvas.style.height=height+'px';canvas.width=Math.round(w*dpr);canvas.height=Math.round(height*dpr);const ctx=canvas.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);return{ctx,w,h:height};};
+    const hover=(canvas,regions)=>{canvas.onmousemove=e=>{const box=canvas.getBoundingClientRect(),x=e.clientX-box.left,y=e.clientY-box.top,hit=regions.findLast(item=>x>=item.x&&x<=item.x+item.w&&y>=item.y&&y<=item.y+item.h);if(!hit){tip.style.display='none';return;}tip.textContent=hit.text;tip.style.display='block';tip.style.left=Math.min(innerWidth-455,e.clientX+12)+'px';tip.style.top=Math.min(innerHeight-150,e.clientY+12)+'px';};canvas.onmouseleave=()=>tip.style.display='none';};
+    const legend=(id,items)=>{document.getElementById(id).innerHTML=items.map(([label,color])=>`<span><i class="swatch" style="background:${color}"></i>${label}</span>`).join('');};
+    const requests=data.requests;
+    const byCandidate=new Map();
+    for(const request of requests){if(!byCandidate.has(request.candidate))byCandidate.set(request.candidate,[]);byCandidate.get(request.candidate).push(request);}
+    const maxTime=Math.max(1,...requests.map(item=>item.finish_ms||0),data.job.last_rollout_ms||0);
+    const selected=data.job.selected_candidate;
+    const label=request=>request.kind==='candidate'?`C${String(request.candidate).padStart(2,'0')}`:`  R${request.rollout}`;
+    const longId=id=>id.replace(/^.*?:step:/,'step:');
+    document.getElementById('subtitle').textContent=`P0 C15/R3/B128/L512 · 双卡 TP2 · instance ${data.job.instance} · prompt ${data.job.prompt_tokens.toLocaleString()} tokens · block ${data.job.block_id} · winner C${selected}`;
+    const summary=data.summary;
+    document.getElementById('tree-title').textContent=`一个完整 block：${summary.selected_candidates} 个 candidate 实际产生 ${summary.selected_rollouts} 个 rollout`;
+    document.getElementById('request-facts').innerHTML=[
+      [summary.selected_block_requests,'底层请求'],
+      [fmt(summary.candidate_queue_p95_ms),'candidate queue P95'],
+      [fmt(summary.rollout_queue_p95_ms),'rollout queue P95'],
+      [fmt(summary.rollout_barrier_wait_p95_ms),'barrier wait P95'],
+      [pct(summary.rollout_sibling_cobatch_ratio),'sibling 同批率']
+    ].map(([value,name])=>`<div class="fact"><b>${value}</b><span class="muted">${name}</span></div>`).join('');
+    legend('lifecycle-legend',[["engine queue",colors.queue],["scheduled 到首 token",colors.prefill],["decode",colors.decode],["完成后等待 barrier",colors.wait],["winner subtree",colors.selected]]);
+    legend('batch-legend',[["candidate membership",colors.candidate],["rollout membership",colors.rollout],["winner subtree",colors.selected]]);
+    legend('global-legend',[["candidate stage",colors.candidate],["rollout stage",colors.rollout],["reward/reduce",colors.selected],["queue 峰值",colors.wait]]);
+    legend('interleave-legend',[["candidate",colors.candidate],["rollout",colors.rollout],["同一 job candidate+rollout",colors.mixed],["代表 job",colors.selected]]);
+    legend('npu-legend',[["Fused Attention",colors.selected],["MoE / GEMM",colors.prefill],["其他 compute",colors.decode],["HCCL",colors.wait],["设备空洞",colors.queue]]);
+
+    function drawAxis(ctx,w,h,left,top,right,bottom){const ticks=w<600?4:8;ctx.strokeStyle=colors.grid;ctx.fillStyle=colors.text;ctx.font='11px ui-monospace,monospace';ctx.textAlign='center';for(let i=0;i<=ticks;i++){const value=maxTime*i/ticks,x=left+(w-left-right)*i/ticks;ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,h-bottom);ctx.stroke();ctx.fillText(value>=1000?(value/1000).toFixed(0)+'s':value.toFixed(0)+'ms',x,h-5);}}
+    function vertical(ctx,x,top,bottom,label,color){ctx.save();ctx.strokeStyle=color;ctx.setLineDash([4,3]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.stroke();ctx.setLineDash([]);if(ctx.canvas.clientWidth>=600){ctx.fillStyle=color;ctx.font='11px ui-monospace,monospace';const rightSide=x>ctx.canvas.clientWidth/2;ctx.textAlign=rightSide?'right':'left';ctx.fillText(label,rightSide?x-4:x+4,top+11);}ctx.restore();}
+
+    function annotation(ctx,x,y,label,color,align='left'){
+      ctx.save();ctx.fillStyle=color;ctx.font='500 11px ui-monospace,monospace';ctx.textAlign=align;ctx.fillText(label,x,y);ctx.restore();
+    }
+
+    function drawGlobalJobs(){
+      const overview=data.overview,jobs=overview.jobs,canvas=document.getElementById('global-job-gantt'),left=62,right=12,top=30,bottom=24,rowH=14,height=top+jobs.length*rowH+bottom,{ctx,w,h}=setup(canvas,height),plot=w-left-right,x=value=>left+plot*value/overview.duration_ms,regions=[];
+      const oldMax=maxTime;for(let i=0;i<= (w<600?4:8);i++){const value=overview.duration_ms*i/(w<600?4:8),xx=x(value);ctx.strokeStyle=colors.grid;ctx.beginPath();ctx.moveTo(xx,top);ctx.lineTo(xx,h-bottom);ctx.stroke();ctx.fillStyle=colors.text;ctx.font='11px ui-monospace,monospace';ctx.textAlign='center';ctx.fillText((value/1000).toFixed(0)+'s',xx,h-5);}
+      const peak=overview.queue_samples.reduce((best,item)=>(item[1]+item[2])>(best[1]+best[2])?item:best,overview.queue_samples[0]),peakX=x(peak[0]),band=Math.max(3,plot*1000/overview.duration_ms);ctx.fillStyle=colors.wait;ctx.globalAlpha=.10;ctx.fillRect(peakX-band/2,top,band,jobs.length*rowH);ctx.globalAlpha=1;vertical(ctx,peakX,top,top+jobs.length*rowH,`queue 峰值 ${peak[1]+peak[2]}`,colors.wait);
+      jobs.forEach((job,index)=>{const y=top+index*rowH,isSelected=job.id===data.job.id;ctx.fillStyle=isSelected?colors.selected:colors.text;ctx.font='11px ui-monospace,monospace';ctx.textAlign='right';ctx.fillText(`J${String(job.index).padStart(2,'0')}`,left-5,y+10);for(const [start,duration,stage,block,count] of job.segments){const x0=x(start),ww=Math.max(1,x(start+duration)-x0),color=stage==='candidate'?'candidate':stage==='rollout'?'rollout':'selected';ctx.fillStyle=colors[color];ctx.globalAlpha=stage==='reward'||stage==='weight'||stage==='resample'?1:.82;ctx.fillRect(x0,y+2,ww,rowH-4);ctx.globalAlpha=1;regions.push({x:x0,y:y+1,w:Math.max(ww,3),h:rowH-2,text:`J${job.index} ${job.label}\n${stage} · block ${block} · ${fmt(duration)}\nprompt ${job.prompt_tokens} · completion ${job.completion_tokens}\n${count||0} sequences`});}if(isSelected){ctx.strokeStyle=colors.selected;ctx.strokeRect(left+.5,y+.5,plot-1,rowH-1);}});
+      const topology=w<600?`${overview.summary.active_jobs} jobs → 1 scheduler → TP0+TP1`:`${overview.workers} load slots → 1 EngineCore queue → TP rank 0+1；${overview.summary.active_jobs} 个 job 跨阶段交错`;
+      annotation(ctx,left+4,17,topology,colors.wait);
+      hover(canvas,regions);
+    }
+
+    function drawEnginePressure(){
+      const overview=data.overview,samples=overview.queue_samples,canvas=document.getElementById('engine-pressure'),left=58,right=12,top=26,bottom=24,height=190,{ctx,w,h}=setup(canvas,height),plot=w-left-right,x=value=>left+plot*value/overview.duration_ms,maxY=Math.max(1,...samples.map(item=>Math.max(item[1]+item[2],item[3]+item[4]))),panelH=58,regions=[];
+      const area=(baseY,aIndex,bIndex)=>{for(let pass=0;pass<2;pass++){ctx.beginPath();samples.forEach((item,index)=>{const value=pass===0?item[aIndex]:item[aIndex]+item[bIndex],xx=x(item[0]),yy=baseY-panelH*value/maxY;if(index===0)ctx.moveTo(xx,baseY);ctx.lineTo(xx,yy);});for(let index=samples.length-1;index>=0;index--){const item=samples[index],value=pass===0?0:item[aIndex],xx=x(item[0]),yy=baseY-panelH*value/maxY;ctx.lineTo(xx,yy);}ctx.closePath();ctx.fillStyle=colors[pass===0?'candidate':'rollout'];ctx.globalAlpha=.72;ctx.fill();ctx.globalAlpha=1;}};
+      area(82,1,2);area(158,3,4);ctx.fillStyle=colors.text;ctx.font='11px ui-monospace,monospace';ctx.textAlign='left';ctx.fillText('等待首次 scheduled',4,52);ctx.fillText('首次 scheduled 后未完成',4,128);ctx.textAlign='right';ctx.fillText(String(maxY),left-4,30);ctx.fillText('0',left-4,82);ctx.fillText(String(maxY),left-4,106);ctx.fillText('0',left-4,158);
+      for(let i=0;i<= (w<600?4:8);i++){const value=overview.duration_ms*i/(w<600?4:8),xx=x(value);ctx.strokeStyle=colors.grid;ctx.beginPath();ctx.moveTo(xx,top);ctx.lineTo(xx,158);ctx.stroke();ctx.fillStyle=colors.text;ctx.textAlign='center';ctx.fillText((value/1000).toFixed(0)+'s',xx,h-5);}
+      const peak=samples.reduce((best,item)=>(item[1]+item[2])>(best[1]+best[2])?item:best,samples[0]),px=x(peak[0]),py=82-panelH*(peak[1]+peak[2])/maxY;ctx.fillStyle=colors.wait;ctx.beginPath();ctx.arc(px,py,4,0,Math.PI*2);ctx.fill();annotation(ctx,px>left+plot*.6?px-7:px+7,Math.max(14,py-8),`排队峰值 ${peak[1]+peak[2]} = C${peak[1]} + R${peak[2]}`,colors.wait,px>left+plot*.6?'right':'left');
+      hover(canvas,regions);
+    }
+
+    function drawBatchComposition(){
+      const overview=data.overview,batches=overview.batches,canvas=document.getElementById('batch-composition'),left=58,right=12,top=34,bottom=24,height=150,{ctx,w,h}=setup(canvas,height),plot=w-left-right,x=value=>left+plot*value/overview.duration_ms,regions=[];
+      for(let i=0;i<= (w<600?4:8);i++){const value=overview.duration_ms*i/(w<600?4:8),xx=x(value);ctx.strokeStyle=colors.grid;ctx.beginPath();ctx.moveTo(xx,top);ctx.lineTo(xx,112);ctx.stroke();ctx.fillStyle=colors.text;ctx.font='11px ui-monospace,monospace';ctx.textAlign='center';ctx.fillText((value/1000).toFixed(0)+'s',xx,h-5);}
+      ctx.fillStyle=colors.text;ctx.textAlign='left';ctx.fillText('request kind',4,57);ctx.fillText('token phase',4,101);
+      batches.forEach(batch=>{const [id,start,duration,size,type,candidate,rollout,prefill,decode,jobs]=batch,xx=x(start),ww=Math.max(2,x(start+Math.max(duration,60))-xx),total=Math.max(1,candidate+rollout),tokenTotal=Math.max(1,prefill+decode),cH=36*candidate/total,pH=36*prefill/tokenTotal;ctx.fillStyle=colors.rollout;ctx.fillRect(xx,42,ww,36);ctx.fillStyle=colors.candidate;ctx.fillRect(xx,42,ww,cH);ctx.fillStyle=colors.decode;ctx.fillRect(xx,86,ww,36);ctx.fillStyle=colors.prefill;ctx.fillRect(xx,86,ww,pH);regions.push({x:xx,y:42,w:Math.max(ww,4),h:80,text:`batch ${id} · ${type}\nsize ${size} · ${jobs} CIS jobs\ncandidate ${candidate} / rollout ${rollout}\nprefill ${prefill} / decode ${decode}\nforward ${fmt(duration)}`});});
+      const mixedLabel=w<600?`C/R mixed ${pct(overview.summary.candidate_rollout_batch_ratio)} · P/D mixed ${pct(overview.summary.prefill_decode_batch_ratio)}`:`${pct(overview.summary.candidate_rollout_batch_ratio)} 的 batch 同时含 candidate+rollout；${pct(overview.summary.prefill_decode_batch_ratio)} 同时含 prefill+decode`;
+      annotation(ctx,left+4,20,mixedLabel,colors.wait);
+      hover(canvas,regions);
+    }
+
+    function drawJobInterleave(){
+      const overview=data.overview,jobs=overview.jobs,batches=overview.batches,canvas=document.getElementById('job-batch-interleave'),left=62,right=12,top=30,bottom=24,rowH=12,height=top+jobs.length*rowH+bottom,{ctx,w,h}=setup(canvas,height),plot=w-left-right,x=value=>left+plot*value/overview.duration_ms,regions=[];
+      const critical=batches.filter(item=>item[5]&&item[6]).reduce((best,item)=>!best||item[9]>best[9]?item:best,null);if(critical){const xx=x(critical[1]),ww=Math.max(4,x(critical[1]+Math.max(critical[2],200))-xx);ctx.fillStyle=colors.wait;ctx.globalAlpha=.12;ctx.fillRect(xx-2,top,ww+4,jobs.length*rowH);ctx.globalAlpha=1;vertical(ctx,xx,top,top+jobs.length*rowH,`${critical[9]} jobs / mixed forward`,colors.wait);}
+      jobs.forEach((job,index)=>{const y=top+index*rowH,isSelected=job.id===data.job.id;ctx.fillStyle=isSelected?colors.selected:colors.text;ctx.font='11px ui-monospace,monospace';ctx.textAlign='right';ctx.fillText(`J${String(job.index).padStart(2,'0')}`,left-5,y+10);if(isSelected){ctx.strokeStyle=colors.selected;ctx.strokeRect(left+.5,y+.5,plot-1,rowH-1);}});
+      batches.forEach(batch=>{const [id,start,duration,size,type,candidate,rollout,prefill,decode,jobCount,mix]=batch,xx=x(start),ww=Math.max(2,x(start+Math.max(duration,70))-xx);for(const [row,c,r] of mix){const y=top+row*rowH,color=c&&r?'mixed':c?'candidate':'rollout';ctx.fillStyle=colors[color];ctx.globalAlpha=.82;ctx.fillRect(xx,y+2,ww,rowH-4);ctx.globalAlpha=1;regions.push({x:xx,y:y+1,w:Math.max(ww,4),h:rowH-2,text:`J${jobs[row].index} ${jobs[row].label}\nbatch ${id} · ${type}\n该 job: candidate ${c} / rollout ${r}\n全 batch: ${size} requests · ${jobCount} jobs`});}});
+      for(let i=0;i<= (w<600?4:8);i++){const value=overview.duration_ms*i/(w<600?4:8),xx=x(value);ctx.strokeStyle=colors.grid;ctx.beginPath();ctx.moveTo(xx,top);ctx.lineTo(xx,top+jobs.length*rowH);ctx.stroke();ctx.fillStyle=colors.text;ctx.textAlign='center';ctx.fillText((value/1000).toFixed(0)+'s',xx,h-5);}
+      hover(canvas,regions);
+    }
+
+    function drawNpuTimeline(){
+      if(!data.npu)return;
+      const npu=data.npu,canvas=document.getElementById('npu-timeline'),left=86,right=12,top=34,bottom=24,height=190,{ctx,w,h}=setup(canvas,height),plot=w-left-right,x=value=>left+plot*value/npu.duration_ms,regions=[];
+      const categoryColors=[colors.selected,colors.prefill,colors.decode,colors.mixed,colors.candidate,colors.queue,colors.wait];
+      for(let i=0;i<= (w<600?4:8);i++){const value=npu.duration_ms*i/(w<600?4:8),xx=x(value);ctx.strokeStyle=colors.grid;ctx.beginPath();ctx.moveTo(xx,top);ctx.lineTo(xx,156);ctx.stroke();ctx.fillStyle=colors.text;ctx.font='11px ui-monospace,monospace';ctx.textAlign='center';ctx.fillText((value/1000).toFixed(0)+'s',xx,h-5);}
+      const byStage=npu.active_stages['profile-0']||{},drawStage=(segments,y,color)=>{for(const [start,duration,count] of segments||[]){ctx.fillStyle=color;ctx.globalAlpha=Math.min(.9,.20+count/40);ctx.fillRect(x(start),y,Math.max(1,x(start+duration)-x(start)),8);ctx.globalAlpha=1;}};drawStage(byStage.candidate,22,colors.candidate);drawStage(byStage.rollout,30,colors.rollout);ctx.fillStyle=colors.text;ctx.textAlign='right';ctx.fillText('算法活跃',left-5,31);
+      const rankYs=[56,112],laneH=24,hcclH=9;
+      npu.ranks.forEach((rank,rankIndex)=>{const y=rankYs[rankIndex],bins=rank.busy.length,binsPerPixel=Math.max(1,Math.ceil(bins/plot));for(let px=0;px<plot;px++){const first=Math.floor(px*bins/plot),last=Math.min(bins,Math.ceil((px+1)*bins/plot));if(last<=first)continue;let busy=0,hccl=0,weights=new Array(npu.categories.length).fill(0);for(let i=first;i<last;i++){busy+=rank.busy[i];hccl+=rank.hccl[i];const category=rank.dominant[i];if(category>=0)weights[category]+=rank.busy[i];}busy/=last-first;hccl/=last-first;const dominant=weights.indexOf(Math.max(...weights));ctx.fillStyle=categoryColors[dominant]||colors.decode;ctx.globalAlpha=Math.max(.06,busy/100);ctx.fillRect(left+px,y,1,laneH);ctx.globalAlpha=1;ctx.fillStyle=colors.wait;ctx.globalAlpha=Math.max(0,hccl/100);ctx.fillRect(left+px,y+laneH+3,1,hcclH);ctx.globalAlpha=1;}ctx.fillStyle=colors.text;ctx.font='11px ui-monospace,monospace';ctx.textAlign='right';ctx.fillText(`TP rank ${rank.rank}`,left-5,y+15);ctx.fillText('HCCL',left-5,y+laneH+11);});
+      const bins=npu.ranks[0].busy.length,windowBins=Math.max(1,Math.round(200/npu.ranks[0].bin_ms));let best={value:Infinity,index:0};for(let i=500;i+windowBins<bins-500;i++){let sum=0;for(const rank of npu.ranks)for(let j=i;j<i+windowBins;j++)sum+=rank.busy[j];const value=sum/(windowBins*npu.ranks.length);if(value<best.value)best={value,index:i};}const gapStart=best.index*npu.ranks[0].bin_ms,gx=x(gapStart),gw=Math.max(3,x(gapStart+200)-gx);ctx.strokeStyle=colors.wait;ctx.lineWidth=2;ctx.strokeRect(gx,50,gw,rankYs[1]+laneH+hcclH-48);annotation(ctx,gx>left+plot*.65?gx-5:gx+gw+5,49,`200ms 设备空洞 · avg busy ${best.value.toFixed(0)}%`,colors.wait,gx>left+plot*.65?'right':'left');
+      const hoverMs=250;
+      npu.ranks.forEach((rank,rankIndex)=>{const y=rankYs[rankIndex],hoverBins=Math.max(1,Math.round(hoverMs/rank.bin_ms));for(let first=0;first<rank.busy.length;first+=hoverBins){const last=Math.min(rank.busy.length,first+hoverBins),busy=rank.busy.slice(first,last).reduce((a,b)=>a+b,0)/(last-first),hccl=rank.hccl.slice(first,last).reduce((a,b)=>a+b,0)/(last-first),categoryWeight=new Array(npu.categories.length).fill(0);for(let i=first;i<last;i++){const category=rank.dominant[i];if(category>=0)categoryWeight[category]+=rank.busy[i];}const dominant=categoryWeight.indexOf(Math.max(...categoryWeight)),start=first*rank.bin_ms,end=last*rank.bin_ms;regions.push({x:x(start),y,w:Math.max(5,x(end)-x(start)),h:laneH+hcclH+3,text:`TP rank ${rank.rank} · ${fmt(start)}-${fmt(end)}\nbusy ${busy.toFixed(1)}% · HCCL ${hccl.toFixed(1)}%\n主导: ${npu.categories[dominant]||'idle'}\n全窗口 busy ${pct(npu.rank_summary[rankIndex].busy_ratio)}`});}});
+      const npuLabel=w<600?`FIA ${pct(npu.attention_busy_ratio)} busy · C/R mixed`:`FusedInferAttentionScore = ${pct(npu.attention_busy_ratio)} device busy；窗口几乎全程 candidate+rollout mixed`;
+      annotation(ctx,left+4,13,npuLabel,colors.wait);
+      hover(canvas,regions);
+    }
+
+    function drawKernelPareto(){
+      if(!data.npu)return;
+      const npu=data.npu,rows=npu.top_kernels.slice(0,8),canvas=document.getElementById('kernel-pareto'),narrow=canvas.parentElement.clientWidth<600,left=narrow?120:Math.min(250,Math.max(150,canvas.parentElement.clientWidth*.25)),right=narrow?42:92,top=28,bottom=18,rowH=26,height=top+rows.length*rowH+bottom,{ctx,w,h}=setup(canvas,height),max=Math.max(...rows.map(item=>item[1])),regions=[];
+      rows.forEach(([name,value],index)=>{const y=top+index*rowH,barW=(w-left-right)*value/max,isAttention=name.toLowerCase().includes('attention'),isHccl=name.toLowerCase().includes('hcom')||name.toLowerCase().includes('hccl');ctx.fillStyle=isAttention?colors.selected:isHccl?colors.wait:colors.decode;ctx.globalAlpha=(isAttention||isHccl)?0.9:0.58;ctx.fillRect(left,y+3,barW,rowH-8);ctx.globalAlpha=1;ctx.fillStyle=colors.text;ctx.font='11px ui-monospace,monospace';ctx.textAlign='right';const nameLimit=narrow?17:34,short=name.length>nameLimit?name.slice(0,nameLimit-3)+'...':name;ctx.fillText(short,left-7,y+16);const label=(value/1e6).toFixed(2)+(narrow?'s':' device-s'),inside=left+barW+58>w-right;ctx.textAlign=inside?'right':'left';ctx.fillText(label,inside?left+barW-5:left+barW+6,y+16);if(isAttention){ctx.strokeStyle=colors.wait;ctx.lineWidth=2;ctx.strokeRect(left-2,y+1,barW+4,rowH-4);if(!narrow)annotation(ctx,left+Math.min(barW*.52,barW-180),y-3,`Attention 主导 ${pct(npu.attention_busy_ratio)} device busy`,colors.wait);}regions.push({x:left,y,w:Math.max(barW,4),h:rowH,text:`${name}\n双 rank 累计 ${(value/1e6).toFixed(3)} device-seconds`});});
+      annotation(ctx,left,15,'双 TP rank 累计 kernel 时间',colors.text);hover(canvas,regions);
+    }
+
+    function drawRequests(){
+      const canvas=document.getElementById('request-gantt'),left=74,right=12,top=28,bottom=24,rowH=16,height=top+requests.length*rowH+bottom,{ctx,w,h}=setup(canvas,height),plot=w-left-right,x=value=>left+plot*value/maxTime,regions=[];
+      drawAxis(ctx,w,h,left,top,right,bottom);
+      const profileStart=data.job.profile_window_start_ms,profileEnd=data.job.profile_window_end_ms;
+      if(profileStart!=null&&profileEnd!=null){const x0=x(Math.max(0,profileStart)),x1=x(Math.min(maxTime,profileEnd));ctx.fillStyle=colors.prefill;ctx.globalAlpha=.05;ctx.fillRect(x0,top,Math.max(0,x1-x0),requests.length*rowH);ctx.globalAlpha=1;}
+      requests.forEach((request,index)=>{
+        const y=top+index*rowH;
+        if(request.kind==='candidate'){ctx.fillStyle=colors.text;ctx.globalAlpha=index%2?.025:.05;ctx.fillRect(left,y,plot,rowH);ctx.globalAlpha=1;}
+        ctx.fillStyle=request.selected?colors.selected:colors.text;ctx.textAlign='right';ctx.font=`${request.kind==='candidate'?'500':'400'} 11px ui-monospace,monospace`;ctx.fillText(label(request),left-5,y+12);
+        const segments=[];
+        if(request.submit_ms!=null&&request.scheduled_ms!=null)segments.push([request.submit_ms,request.scheduled_ms,'queue',`engine queue ${fmt(request.queue_ms)}`]);
+        if(request.scheduled_ms!=null&&request.first_token_ms!=null)segments.push([request.scheduled_ms,request.first_token_ms,'prefill',`scheduled → first token ${fmt(request.scheduled_to_first_token_ms)}`]);
+        if(request.first_token_ms!=null&&request.finish_ms!=null)segments.push([request.first_token_ms,request.finish_ms,'decode',`decode ${fmt(request.decode_ms)}`]);
+        if(!segments.length&&request.submit_ms!=null&&request.finish_ms!=null)segments.push([request.submit_ms,request.finish_ms,request.kind,'request lifetime']);
+        for(const [start,end,kind,description] of segments){const x0=x(start),ww=Math.max(1,x(end)-x0);ctx.fillStyle=colors[kind];ctx.globalAlpha=kind==='queue'?.45:.88;ctx.fillRect(x0,y+2,ww,rowH-4);ctx.globalAlpha=1;regions.push({x:x0,y:y+1,w:Math.max(ww,3),h:rowH-2,text:`${longId(request.id)}\n${description}\nprefix ${request.prefix_tokens} · cached ${request.cached_tokens}\noutput ${request.output_tokens} · ${request.finish_reason}\ninstance ${request.instance} → TP ranks 0,1`});}
+        if(request.kind==='rollout'&&request.finish_ms!=null&&data.job.last_rollout_ms!=null){const x0=x(request.finish_ms),ww=Math.max(0,x(data.job.last_rollout_ms)-x0);ctx.fillStyle=colors.wait;ctx.globalAlpha=.22;ctx.fillRect(x0,y+4,ww,rowH-8);ctx.globalAlpha=1;}
+        if(request.selected){ctx.strokeStyle=colors.selected;ctx.lineWidth=1;ctx.strokeRect(left+.5,y+.5,plot-1,rowH-1);}
+      });
+      const queueEnd=x(Math.min(maxTime,summary.candidate_queue_p95_ms)),rolloutStartIndex=requests.findIndex(item=>item.kind==='rollout'),barrierStart=Math.max(0,(data.job.last_rollout_ms||maxTime)-summary.rollout_finish_spread_ms),barrierX=x(barrierStart),barrierEnd=x(data.job.last_rollout_ms||maxTime);
+      ctx.save();ctx.strokeStyle=colors.wait;ctx.lineWidth=2;ctx.setLineDash([5,3]);ctx.strokeRect(left+1,top+1,Math.max(1,queueEnd-left-1),Math.max(1,Math.min(requests.length,summary.selected_candidates)*rowH-2));ctx.fillStyle=colors.wait;ctx.globalAlpha=.08;ctx.fillRect(barrierX,top+Math.max(0,rolloutStartIndex)*rowH,Math.max(1,barrierEnd-barrierX),Math.max(1,(requests.length-Math.max(0,rolloutStartIndex))*rowH));ctx.globalAlpha=1;ctx.strokeRect(barrierX,top+Math.max(0,rolloutStartIndex)*rowH,Math.max(1,barrierEnd-barrierX),Math.max(1,(requests.length-Math.max(0,rolloutStartIndex))*rowH));ctx.restore();
+      if(w>=600){annotation(ctx,left+5,top-7,`candidate queue P95 ${fmt(summary.candidate_queue_p95_ms)}`,colors.wait);annotation(ctx,barrierX+5,top+Math.max(0,rolloutStartIndex)*rowH+13,`rollout barrier tail ${fmt(summary.rollout_finish_spread_ms)}`,colors.wait);}
+      if(data.job.last_candidate_ms!=null)vertical(ctx,x(data.job.last_candidate_ms),top,top+requests.length*rowH,'全部 candidate 完成',colors.candidate);
+      if(data.job.last_rollout_ms!=null)vertical(ctx,x(data.job.last_rollout_ms),top,top+requests.length*rowH,'最后 rollout / barrier',colors.wait);
+      hover(canvas,regions);
+    }
+
+    function drawBatches(){
+      const canvas=document.getElementById('batch-membership'),left=74,right=12,top=78,bottom=24,rowH=12,height=top+requests.length*rowH+bottom,{ctx,w,h}=setup(canvas,height),plot=w-left-right,x=value=>left+plot*value/maxTime,regions=[],batchById=new Map(data.batches.map(item=>[item[0],item]));
+      drawAxis(ctx,w,h,left,top,right,bottom);
+      ctx.strokeStyle=colors.grid;ctx.beginPath();ctx.moveTo(left,58);ctx.lineTo(w-right,58);ctx.stroke();
+      for(const batch of data.batches){const [id,start,duration,size,type,related,candidate,rollout,tokens]=batch,x0=x(start),ww=Math.max(1,x(start+duration)-x0),barH=48*Math.min(1,size/256),kind=candidate&&rollout?'selected':candidate?'candidate':'rollout';ctx.fillStyle=colors[kind];ctx.globalAlpha=.7;ctx.fillRect(x0,58-barH,ww,barH);ctx.globalAlpha=1;regions.push({x:x0,y:58-barH,w:Math.max(ww,3),h:barH,text:`batch ${id} · ${type}\nstart ${fmt(start)} · forward ${fmt(duration)}\nengine batch ${size} · selected block ${related}\ncandidate ${candidate} · rollout ${rollout}\nscheduled tokens ${tokens}`});}
+      requests.forEach((request,index)=>{const y=top+index*rowH;ctx.fillStyle=request.selected?colors.selected:colors.text;ctx.textAlign='right';ctx.font='11px ui-monospace,monospace';ctx.fillText(label(request),left-5,y+10);for(const part of request.participation){const [start,duration,batchId,iteration,type,scheduled,computed,batchSize]=part,x0=x(start),ww=Math.max(1,x(start+duration)-x0),color=request.selected?'selected':request.kind;ctx.fillStyle=colors[color];ctx.globalAlpha=type===0?1:.72;ctx.fillRect(x0,y+2,ww,rowH-4);ctx.globalAlpha=1;regions.push({x:x0,y:y+1,w:Math.max(ww,3),h:rowH-2,text:`${longId(request.id)}\nbatch ${batchId} · iteration ${iteration}\n${type===0?'prefill':'decode'} · scheduled ${scheduled} tokens\ncomputed ${computed} · total batch ${batchSize}\nforward ${fmt(duration)}`});}
+        if(request.selected){ctx.strokeStyle=colors.selected;ctx.strokeRect(left+.5,y+.5,plot-1,rowH-1);}
+      });
+      annotation(ctx,left+4,72,w<600?`${pct(summary.selected_mixed_batch_ratio)} mixed · ${pct(summary.selected_full_batch_ratio)} full`:`${pct(summary.selected_mixed_batch_ratio)} mixed Prefill+Decode；${pct(summary.selected_full_batch_ratio)} 的相关 batch size=256`,colors.wait);
+      hover(canvas,regions);
+    }
+
+    const candidateDelay=fmt(summary.candidate_child_delay_p50_ms),candidateSpread=fmt(summary.candidate_finish_spread_ms),barrier=fmt(summary.rollout_barrier_wait_p95_ms),rolloutSpread=fmt(summary.rollout_finish_spread_ms);
+    document.getElementById('request-issues').innerHTML=[
+      [`问题 1 · engine queue 已是主要等待段`,`candidate queue P95=${fmt(summary.candidate_queue_p95_ms)}，rollout queue P95=${fmt(summary.rollout_queue_p95_ms)}。树的分支被当作普通请求，与其他 job 一起排队。`,'problem'],
+      [`问题 2 · rollout 长尾直接占住 block barrier`,`rollout 完成时间跨度=${rolloutSpread}，P95 请求在完成后仍等待 ${barrier} 才能 reduce；输出长度 P50/P95=${summary.rollout_output_p50}/${summary.rollout_output_p95} tokens，关键路径由少数长 rollout 决定。`,'problem'],
+      [`边界 · candidate 提前完成不能直接转化为收益`,`candidate 完成跨度=${candidateSpread}，candidate→首 child 中位=${candidateDelay}；已有 host streaming A/B 为负，说明要在 engine 内避免碎片化和重复 admission。`,'good']
+    ].map(([title,body,kind])=>`<div class="issue ${kind==='good'?'good':''}"><b>${title}</b><span class="muted">${body}</span></div>`).join('');
+    document.getElementById('batch-issues').innerHTML=[
+      [`证据 3 · sibling 已经高度同批，但共享 KV 没有进入 attention 语义`,`同一 candidate 的 rollout membership 同批率为 ${pct(summary.rollout_sibling_cobatch_ratio)}。这削弱“仅靠 bundle 调度”的空间，却为同批 shared-trunk Forest Attention 提供了理想形状。`],
+      [`问题 4 · 饱和 batch 中 candidate/rollout 相互干扰`,`该 block 在 ${data.batches.length} 个真实 batch 中出现，${pct(summary.selected_mixed_batch_ratio)} 是 Prefill+Decode 混合批，${pct(summary.selected_full_batch_ratio)} 达到 batch 256；继续加并发不能解决形状问题。`],
+      [`拓扑含义`,`所有条目进入 ${data.job.instance}，随后由 TP rank 0/1 共同前向；这里不存在“单条 rollout 只走一张卡”。`]
+    ].map(([title,body])=>`<div class="issue"><b>${title}</b><span class="muted">${body}</span></div>`).join('');
+    document.getElementById('global-issues').innerHTML=[
+      [`瓶颈 A · queue 并非单一 job 内等待`,`窗口内首次 scheduled 前的同时排队峰值为 ${data.overview.summary.queue_peak[1]+data.overview.summary.queue_peak[2]} 条（C${data.overview.summary.queue_peak[1]}+R${data.overview.summary.queue_peak[2]}）；它们来自 ${data.overview.summary.active_jobs} 个交错 CIS job。`],
+      [`瓶颈 B · 满 batch 仍有形状干扰`,`batch size P50/P95=${data.overview.summary.batch_size_p50}/${data.overview.summary.batch_size_p95}，每个 forward 同时承载 P50/P95=${data.overview.summary.jobs_per_batch_p50}/${data.overview.summary.jobs_per_batch_p95} 个 job。`],
+      [`执行边界`,`32 load workers 只负责发顶层请求；模型没有 32 条独立 worker lane。所有请求先进同一 scheduler，再由 TP rank 0/1 对同一 batch 做协同前向。`]
+    ].map(([title,body])=>`<div class="issue"><b>${title}</b><span class="muted">${body}</span></div>`).join('');
+    if(data.npu){const mixed=data.npu.phase_summary.map(item=>item.phases.mixed.busy_ratio);document.getElementById('npu-issues').innerHTML=[
+      [`瓶颈 C · Attention 是主导设备成本`,`FusedInferAttentionScore 占双 rank device busy 的 ${pct(data.npu.attention_busy_ratio)}；APC 只能省 prefill，不能让同时 decode 的 sibling 共享 trunk KV 读取。`],
+      [`瓶颈 D · mixed 阶段仍有设备空洞`,`candidate+rollout mixed 阶段 busy 为 rank0 ${pct(mixed[0])} / rank1 ${pct(mixed[1])}，说明 batch=256 不等于 AICore 全时忙碌。`],
+      [`瓶颈 E · 通信大多没有被覆盖`,`暴露 HCCL/profile 为 rank0 ${pct(data.npu.rank_summary[0].exposed_hccl_profile_ratio)} / rank1 ${pct(data.npu.rank_summary[1].exposed_hccl_profile_ratio)}；它是 TP2 配套成本，但不应冒充 CIS 专属创新。`]
+    ].map(([title,body])=>`<div class="issue"><b>${title}</b><span class="muted">${body}</span></div>`).join('');}else{document.getElementById('npu-section').hidden=true;}
+
+    document.getElementById('candidate-table').innerHTML=`<table><thead><tr><th>candidate</th><th>winner</th><th>tokens</th><th>log weight</th><th>finish→child</th><th>3 rollout finish span</th></tr></thead><tbody>${data.candidates.map(item=>`<tr class="${item.selected?'selected':''}"><td>C${String(item.candidate).padStart(2,'0')}</td><td>${item.selected?'yes':'no'}</td><td>${item.output_tokens}</td><td>${Number(item.log_weight).toFixed(3)}</td><td>${fmt(item.child_admission_delay_ms)}</td><td>${fmt(item.rollout_finish_spread_ms)}</td></tr>`).join('')}</tbody></table>`;
+    document.getElementById('request-source').textContent=`原始目录: ${data.source} | ${summary.algorithm_jobs} jobs | ${summary.lifecycle_requests} lifecycle requests | ${summary.service_batches} raw service batches | 当前展示 job ${data.job.id}`;
+    const drawAll=()=>{refreshColors();drawGlobalJobs();drawEnginePressure();drawBatchComposition();drawJobInterleave();drawNpuTimeline();drawKernelPareto();drawRequests();drawBatches();};
+    drawAll();setTimeout(drawAll,100);let frame=0;new ResizeObserver(()=>{cancelAnimationFrame(frame);frame=requestAnimationFrame(drawAll);}).observe(root);
+  })();
+  </script>
+</div>

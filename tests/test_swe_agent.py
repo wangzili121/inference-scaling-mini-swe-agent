@@ -150,6 +150,9 @@ def test_runner_executes_one_complete_cis_job_and_records_trace(tmp_path: Path) 
     record = json.loads(trace.read_text())
     assert record["request_id"] == "agent-call-1"
     assert record["messages"][0]["extra"] == {"private": True}
+    assert record["schema_version"] == 2
+    assert record["conditional_steps"][0]["selected_candidate"] in {0, 1}
+    assert len(record["conditional_steps"][0]["candidates"]) == 2
 
 
 def test_runner_coalesces_retry_equivalent_request_ids(tmp_path: Path) -> None:

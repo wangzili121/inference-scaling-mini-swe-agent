@@ -496,7 +496,10 @@ class _AsyncEngine(_Engine):
         await asyncio.sleep(0.02)
         token = int(sampling_params.seed % 5) + 3
         self.active -= 1
-        yield _Output([_Completion([token], [{token: _Logprob(-0.25)}])])
+        yield _Output(
+            [_Completion([token], [{token: _Logprob(-0.25)}])],
+            request_id=request_id,
+        )
 
     def generate(self, **kwargs):
         return self._stream(**kwargs)
@@ -573,3 +576,30 @@ def test_async_vllm_streams_completion_callbacks_and_draft_observations() -> Non
         assert backend.draft_cache_snapshot() is None
     finally:
         backend.close()
+
+
+def test_async_vllm_emits_algorithm_request_lifecycle() -> None:
+    engine = _AsyncEngine()
+    backend = AsyncVLLMBackend(
+        engine,
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+    )
+    events = []
+    backend.set_request_trace_observer(events.append)
+    request = GenerationRequest((1, 2), 1, SamplingConfig(), 7, "job:step:0:candidate:3")
+    try:
+        output = backend.sample_batch([request])
+    finally:
+        backend.close()
+
+    assert output[0].request_id == request.request_id
+    assert [event["event"] for event in events] == [
+        "submitted",
+        "first_output",
+        "finished",
+    ]
+    assert {event["engine_request_id"] for event in events} == {request.request_id}
+    assert events[-1]["output_tokens"] == 1

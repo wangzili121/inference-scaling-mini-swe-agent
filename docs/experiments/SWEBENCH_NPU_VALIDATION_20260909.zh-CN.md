@@ -254,7 +254,7 @@ pass。64 请求全部成功、零 KV preemption，原始目录为
 ## 跨配置结论
 
 - P0-P3 全部没有正式 scoring forward，CPU reward 不是剩余瓶颈。
-- APC 已保存大量重复 prefill，但 `FusedInferAttentionScore` 仍稳定占设备 busy 时间约 38%-61%；APC 不会合并不同 decode request 对共享 KV 的读取。
+- APC 已保存大量重复 prefill，但 `FusedInferAttentionScore` 在代表窗口中仍占设备 busy 时间约 38%-75%；APC 不会合并不同 decode request 对共享 KV 的读取。
 - 四卡的 work-normalized 扩展只有约 `1.28x-1.48x`，静态 job 数均分在四组配置中都出现实际工作偏斜。
 - 下一阶段优先验证 engine 内 branch-on-token、利用固定 `C -> R` 两层树的
   Ascend Forest Attention，以及执行中更新的 remaining-work routing；host
@@ -306,5 +306,25 @@ v0.18 源码包含 `MooncakeConnectorV1` 和单机 P/D 文档，但当前镜像�
 - 正式 native P0：`/data/disk/wangzili/cis-artifacts-e1396a6/profiles`
 - 四卡 native P0 无 profiler：`/data/disk/wangzili/cis-artifacts-e1396a6/validation/four-card-p0-none`
 - 四卡 P0 mixed-stage Torch：`/data/disk/wangzili/cis-mixed-profile/p0-four-card-torch`
+- 双卡 P0 request-aware Service：`/data/disk/wangzili/cis-request-profile/p0-two-card-service`
+- 双卡 P0 request-aware Torch：`/data/disk/wangzili/cis-request-profile/p0-two-card-torch`
+
+最后两组补采给每条 engine request 保留了结构化
+`job/block/candidate/rollout/parent` 身份和 submit/scheduled/first-token/finish
+生命周期。Service pass 可精确回放每条请求参加的 batch；Torch pass 使用相同
+双卡 TP2 配置和 30 秒窗口，用于对齐 rank 0/1 原始 NPU/HCCL 事件。Service
+代表 block 的 51 条请求中有 50 条落入窗口，同 candidate sibling 的 batch
+同批率为 `99.68%`，相关 batch 的 `93.26%` 为 Prefill+Decode 混合且全部达到
+size 256；rollout 完成跨度为 `180.65s`。这些数据把“普通并发不足”排除，并把
+后续重点收窄为 barrier 长尾、满批阶段干扰和同批 shared-trunk attention。
+
+同配置双卡 Torch 补采含 4,556 条原始 kernel 事件。完整 profiler span 的
+rank 0/1 busy 为 `82.48%/84.40%`，暴露 HCCL/profile 为 `8.78%/11.07%`；
+与算法 trace 对齐的 30 秒 mixed 窗口 busy 为 `73.46%/73.09%`。
+`FusedInferAttentionScore` 双 rank 累计 `33.83 device-seconds`，占 device-busy
+union 的 `67.3%`，`hcom_allReduce` 累计 `5.83 device-seconds`。因此新的逐请求
+查看器把 36-job 交错、193-request queue peak、逐 batch 成员、TP rank 0/1 的
+1ms compute/HCCL、FIA Pareto 和代表 block 的 180.65 秒 barrier tail 放在同一
+时间方向中；Service 与 Torch 是同配置独立 pass，绝不伪造成同一次采集。
 
 上述目录保存原始服务日志、算法 JSONL、Agent trajectory、prediction、exit status、部署 manifest、诊断快照与 SHA256 清单。正式性能结论只从后续相同 workload、饱和负载、独立 profiler pass 的实验产生。

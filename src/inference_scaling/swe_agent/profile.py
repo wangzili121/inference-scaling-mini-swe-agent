@@ -766,6 +766,11 @@ def main() -> None:
                         "endpoint": service.endpoint,
                         "profile_directory": str(service.profile_directory),
                         "algorithm_trace": str(service.trace_path),
+                        "request_trace": str(
+                            service.trace_path.parent.parent
+                            / "request-traces"
+                            / service.trace_path.name
+                        ),
                     }
                     for service in services
                 ],
