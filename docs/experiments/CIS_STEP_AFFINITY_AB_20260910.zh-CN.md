@@ -62,26 +62,81 @@ Step 指标分为两层，避免把 admission 排队隐藏掉：
 - P1：`C8/R3/B128/L512`，step-gang cap 为 `round(256/(8x3))=11`。
 - P2：`C4/R2/B128/L512`，step-gang cap 为 `256/(4x2)=32`。
 
-| Profile | 方案 | jobs/s | jobs/s 变化 | Step mean | Step mean 变化 | Step P95 变化 | Barrier-tail mean 变化 |
-|---|---|---:|---:|---:|---:|---:|---:|
-| P1 | Baseline | 0.2352 | - | 94.3 s | - | - | - |
-| P1 | Step gang 11 | 0.2248 | **-4.4%** | **84.9 s** | **-10.0%** | -25.0% | -53.8% |
-| P1 | Elastic | **0.2502** | **+6.4%** | 86.6 s | -8.2% | -4.2% | -14.3% |
-| P2 | Baseline | 0.3329 | - | 60.2 s | - | - | - |
-| P2 | Step gang 32 | 0.3564 | +7.0% | 55.3 s | -8.2% | -11.0% | -0.9% |
-| P2 | Elastic | **0.3663** | **+10.0%** | **55.1 s** | **-8.6%** | **-11.2%** | -9.5% |
+### P1 完整对照
 
-P1 的 hard cap 能显著缩短已获准 step 的 barrier，并把 preemption 从 28 降到 0，但限制过强使完整 burst 的 jobs/s 下降 4.4%。Elastic 将 preemption 降到 17，在不设 admission barrier 的情况下同时改善 jobs/s、job latency 和 step latency，因此是 P1 的胜出方案。P1 elastic 本轮生成 token 数少约 10.9%，所以 `+6.4% jobs/s` 不能单独归因于调度；更保守的证据是 engine requests/s 提升 2.9%、step mean 下降 8.2%。
+| 指标 | Baseline | Gang cap 11 | 相对 baseline | Elastic | 相对 baseline |
+|---|---:|---:|---:|---:|---:|
+| jobs/s | 0.2352 | 0.2248 | -4.4% | **0.2502** | **+6.4%** |
+| job mean | 110.7 s | **99.7 s** | -9.9% | 100.4 s | -9.4% |
+| job P50 | 95.6 s | 104.3 s | +9.1% | **87.6 s** | -8.4% |
+| job P95 | 223.6 s | **190.3 s** | **-14.9%** | 205.1 s | -8.3% |
+| end-to-end step mean | 94.3 s | **84.9 s** | **-10.0%** | 86.6 s | -8.2% |
+| end-to-end step P50 | 77.8 s | 91.9 s | +18.2% | **72.6 s** | -6.7% |
+| end-to-end step P95 | 210.6 s | **157.9 s** | **-25.0%** | 201.7 s | -4.2% |
+| barrier-tail mean | 45.5 s | **21.0 s** | **-53.8%** | 39.0 s | -14.3% |
+| barrier-tail P95 | 114.5 s | **54.7 s** | **-52.2%** | 130.0 s | +13.5% |
+| engine queue mean | 7.648 s | **0.185 s** | **-97.6%** | 5.513 s | -27.9% |
+| engine queue P95 | 27.726 s | **1.851 s** | **-93.3%** | 29.593 s | +6.7% |
+| preemptions | 28 | **0** | -100% | 17 | -39.3% |
+| APC hit ratio | 94.30% | **95.66%** | +1.36 pp | 94.54% | +0.24 pp |
+| max in-flight | 284 | **88** | -69.0% | 282 | -0.7% |
+| engine requests/s | 4.211 | 3.993 | -5.2% | **4.332** | +2.9% |
+| generated tokens/s | **475.0** | 464.8 | -2.2% | 450.1 | -5.2% |
 
-P2 的 fanout 较小，cap=32 实际不限制 32 个 worker；此时 step-gang 主要等价于 step FIFO priority。两种 priority 都有收益，elastic 的 jobs/s 提升 10.0%，而且本轮生成 token 数更多，收益不是由更短输出造成。不过 P2 的 barrier-tail P95 在 gang/elastic 下分别增加 19.1%/15.9%，说明其收益来自更好的队列、APC locality 和较少 preemption，不是 barrier 长尾改善。
+P1 `cap=11` 不是“step 捆绑策略失败”：它将 queue、barrier 和 preemption 大幅压低，但 `11 x C8 = 88` 恰好成为观察到的最大 in-flight。也就是说，按理论最大 `C x R` 推导 cap 高估了同时实际存在的 rollout，硬门限让 engine 长时间喂不满；吞吐损失来自 admission underfill，而不是 locality 本身。
+
+为分离 hard cap 与 step-FIFO priority，又固定 P1 运行了 `cap={16,22,32}`：
+
+| 指标 | Cap 11 | Cap 16 | Cap 22 | Cap 32 | Baseline |
+|---|---:|---:|---:|---:|---:|
+| jobs/s | 0.2248 | **0.2752** | 0.2687 | 0.2442 | 0.2352 |
+| 相对 baseline | -4.4% | **+17.0%** | +14.3% | +3.8% | - |
+| job mean | 99.7 s | 97.5 s | **93.1 s** | 104.9 s | 110.7 s |
+| job P95 | 190.3 s | **173.2 s** | 186.3 s | 212.1 s | 223.6 s |
+| step mean | 84.9 s | 85.2 s | **83.7 s** | 93.0 s | 94.3 s |
+| step P95 | **157.9 s** | 168.3 s | 179.0 s | 210.6 s | 210.6 s |
+| barrier mean | **21.0 s** | 29.7 s | 32.0 s | 44.5 s | 45.5 s |
+| barrier P95 | **54.7 s** | 75.4 s | 97.3 s | 121.5 s | 114.5 s |
+| admission wait mean | 50.5 s | 36.5 s | 21.4 s | 0.0 s | 0.0 s |
+| engine queue mean | **0.185 s** | 0.304 s | 0.753 s | 6.366 s | 7.648 s |
+| preemptions | **0** | **0** | **0** | 15 | 28 |
+| APC hit ratio | **95.66%** | 95.09% | 95.02% | 93.64% | 94.30% |
+| max in-flight | 88 | 114 | 172 | 286 | 284 |
+| forward-token-slots/s | 3464 | 4150 | 4019 | **4763** | 4604 |
+| generated tokens | 132349 | 117692 | 111523 | 122009 | 129267 |
+
+这个 sweep 形成清晰的折中曲线：cap 太小会把 engine 饿住；cap 太大则恢复长 engine queue、barrier 和 KV preemption。`16-22` 是当前 P1 的有效区间，但不能仅凭 jobs/s 宣称 cap 16 稳定快 17%，因为不同 batch shape 下的随机采样使生成 token 总量不同。更稳健的结论是：cap 16/22 都把 job/step tail 降低、preemption 清零且没有 cap 11 的明显 underfill；cap 32 的最高工作归一化吞吐说明 engine 本身更饱和，但端到端 barrier 和 queue 已回升。正式实现应采用 soft/elastic cap，而不是固定 11。
+
+### P2 完整对照
+
+| 指标 | Baseline | Gang cap 32 | 相对 baseline | Elastic | 相对 baseline |
+|---|---:|---:|---:|---:|---:|
+| jobs/s | 0.3329 | 0.3564 | +7.0% | **0.3663** | **+10.0%** |
+| job mean | 71.8 s | **64.2 s** | **-10.6%** | 65.6 s | -8.5% |
+| job P50 | 54.7 s | 55.3 s | +1.1% | **53.6 s** | -2.1% |
+| job P95 | 159.0 s | 151.6 s | -4.7% | **145.5 s** | **-8.5%** |
+| end-to-end step mean | 60.2 s | 55.3 s | -8.2% | **55.1 s** | **-8.6%** |
+| end-to-end step P50 | 50.1 s | 48.2 s | -3.8% | **47.4 s** | -5.3% |
+| end-to-end step P95 | 150.3 s | 133.7 s | -11.0% | **133.4 s** | **-11.2%** |
+| barrier-tail mean | 16.2 s | 16.0 s | -0.9% | **14.6 s** | -9.5% |
+| barrier-tail P95 | **45.8 s** | 54.5 s | +19.1% | 53.1 s | +15.9% |
+| engine queue mean | 3.082 s | 3.040 s | -1.4% | **2.847 s** | -7.6% |
+| engine queue P95 | 19.560 s | 19.136 s | -2.2% | **17.415 s** | -11.0% |
+| preemptions | 4 | 6 | +50.0% | **1** | -75.0% |
+| APC hit ratio | 88.28% | **90.55%** | +2.27 pp | 89.52% | +1.24 pp |
+| max in-flight | 113 | 124 | +9.7% | 124 | +9.7% |
+| engine requests/s | 2.487 | 2.673 | +7.5% | **2.747** | +10.5% |
+| generated tokens/s | 260.1 | 292.2 | +12.3% | **298.7** | +14.9% |
+
+P2 的 cap=32 没有限制 32 个 worker，因此 gang 方案实际上只是 step-FIFO priority，不是 hard bundle。它相对 baseline 的 jobs/s、job P95、step mean/P95 都改善，不能称为“捆绑不好”；elastic 又略胜一筹。P2 的 barrier P95 反而上升，说明收益主要来自队列顺序、APC locality、engine 吞吐和更少 preemption，而不是将单个 step 的最后一条 rollout 更快收齐。
 
 综合三种 profile：
 
 - 高 fanout P0：hard step locality 对平均/P95 step 和 barrier 最有效；elastic 的吞吐略高。
-- 中 fanout P1：使用 elastic；hard cap=11 会牺牲总吞吐。
-- 低 fanout P2：使用 elastic；hard admission 已无必要。
+- 中 fanout P1：cap 11 太紧；cap 16-22 能在消除 preemption 的同时改善端到端 tail，elastic/soft cap 是产品化方向。
+- 低 fanout P2：step-FIFO 与 elastic 都优于 baseline，hard admission 已无必要，elastic 最均衡。
 
-因此下一版不应提供一个固定 cap，而应依据 `C x R`、MNS、当前 ready frontier 和 barrier-critical work 动态选择：高 fanout 启用 soft cap，低/中 fanout 只保留 elastic priority。
+因此下一版不应提供一个由 `MNS/(C x R)` 静态算出的固定 cap，而应依据当前实际 ready candidate/rollout、engine runnable slots 和 barrier-critical work 动态借还容量：高 fanout 保持较强 locality，中 fanout 使用 soft cap，低 fanout 只保留 elastic priority。
 
 ## Attention 结果
 
@@ -99,10 +154,12 @@ Attention 探针保持 P0 的 `C15/R3`，candidate suffix 和 unique tail 均为
 
 - P0 调度原始目录：`/data/disk/wangzili/cis-step-affinity/ab-20260910/{baseline,step-gang-6,step-elastic}`。
 - P1 调度原始目录：`/data/disk/wangzili/cis-step-affinity/p1-ab-20260910/{baseline,step-gang,step-elastic}`。
+- P1 cap sweep 原始目录：`/data/disk/wangzili/cis-step-affinity/p1-cap-sweep-20260910/{cap-16,cap-22,cap-32}`。
 - P2 调度原始目录：`/data/disk/wangzili/cis-step-affinity/p2-ab-20260910/{baseline,step-gang,step-elastic}`。
 - 调度摘要：`docs/experiments/data/cis_step_affinity_ab_20260910.json`，SHA256 `1b5d213a4ac3d1c78789d7babd3d586d584369cb25291d673e84fb7fec3bef3a`。
 - P1 摘要：`docs/experiments/data/cis_step_affinity_p1_20260910.json`，SHA256 `8d9b577ce8a42097ca2373c6dfb1c4600566fdb0608abee9b65447556012dd37`。
 - P2 摘要：`docs/experiments/data/cis_step_affinity_p2_20260910.json`，SHA256 `3d92315b61cdef9f210bcf0b81d5739dfdd51ad0e741bf8892e296ac96a292e5`。
+- P1 cap sweep：`docs/experiments/data/cis_step_affinity_p1_cap_sweep_20260910.json`，SHA256 `06e97622fe848c0a73181c091ff5d46516094b9e26583cd44eb27488e73dfe1b`。
 - Attention 摘要：`docs/experiments/data/cis_forest_attention_rerun_20260910.json`，SHA256 `89df83228197b513b492471b212a36ebc98cb8dec548908d4481371e4a552792`。
 - 启动脚本：`experiments/swebench/run_cis_forest_ab_remote.sh`。
 - 汇总脚本：`experiments/swebench/summarize_cis_step_ab.py`。

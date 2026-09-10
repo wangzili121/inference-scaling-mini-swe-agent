@@ -1,0 +1,389 @@
+{
+  "baseline": {
+    "root": "/data/disk/wangzili/cis-step-affinity/p1-ab-20260910/baseline",
+    "wall_seconds": 272.1276580323465,
+    "success_rate": 1.0,
+    "jobs_per_second": 0.23518373862752542,
+    "job_latency_seconds": {
+      "mean": 110.74511976636131,
+      "p50": 95.58167551131919,
+      "p95": 223.64011483448553,
+      "p99": 261.1508358546113
+    },
+    "forward_token_slots_per_second": 4603.7253583797265,
+    "preemptions": 28.0,
+    "engine_requests": 1146.0,
+    "engine_requests_per_second": 4.211258819799127,
+    "generated_tokens": 129267.0,
+    "generated_tokens_per_second": 475.02338033069265,
+    "prefill_tokens": 1124680.0,
+    "shared_prefill_tokens_saved": 18597888.0,
+    "apc_token_hit_ratio": 0.9429749716162723,
+    "maximum_in_flight_requests": 284.0,
+    "steps": 75,
+    "step_completion_ms": {
+      "mean": 94272.37325712001,
+      "p50": 77757.12723,
+      "p95": 210583.70891719998
+    },
+    "step_end_to_end_ms": {
+      "mean": 94272.37325712001,
+      "p50": 77757.12723,
+      "p95": 210583.70891719998
+    },
+    "step_admission_wait_ms": {
+      "mean": 0.0,
+      "p95": 0.0
+    },
+    "rollout_barrier_tail_ms": {
+      "mean": 45459.90398904552,
+      "p95": 114542.37963867188
+    },
+    "engine_queue_ms": {
+      "mean": 7648.099042757418,
+      "p95": 27726.015
+    },
+    "active_steps": {
+      "mean": 26.001408555714228,
+      "peak": 32.0
+    },
+    "priority_range": [
+      0,
+      0
+    ],
+    "output_hash": "4de1c0fb71fee1fbc92482ebdc8224ec880f5ed05a838f39caca51fab6fc9aed",
+    "overrides": [
+      "generation.max_new_tokens=512",
+      "vllm.max_model_len=65536",
+      "vllm.max_num_seqs=256",
+      "vllm.max_num_batched_tokens=32768",
+      "vllm.gpu_memory_utilization=0.90",
+      "vllm.engine_kwargs.max_num_partial_prefills=1",
+      "vllm.engine_kwargs.max_long_partial_prefills=1"
+    ]
+  },
+  "step-gang": {
+    "root": "/data/disk/wangzili/cis-step-affinity/p1-ab-20260910/step-gang",
+    "wall_seconds": 284.75802608113736,
+    "success_rate": 1.0,
+    "jobs_per_second": 0.22475222518140436,
+    "job_latency_seconds": {
+      "mean": 99.73420004621585,
+      "p50": 104.27145148580894,
+      "p95": 190.30040980267788,
+      "p99": 206.72423103028905
+    },
+    "forward_token_slots_per_second": 3464.2991931645006,
+    "preemptions": 0.0,
+    "engine_requests": 1137.0,
+    "engine_requests_per_second": 3.992863750488387,
+    "generated_tokens": 132349.0,
+    "generated_tokens_per_second": 464.77706641458883,
+    "prefill_tokens": 855275.0,
+    "shared_prefill_tokens_saved": 18858240.0,
+    "apc_token_hit_ratio": 0.9566147893970203,
+    "maximum_in_flight_requests": 88.0,
+    "steps": 75,
+    "step_completion_ms": {
+      "mean": 34384.572281479996,
+      "p50": 25179.762871,
+      "p95": 79943.9377277
+    },
+    "step_end_to_end_ms": {
+      "mean": 84875.27235266667,
+      "p50": 91909.94699899999,
+      "p95": 157866.28324059997
+    },
+    "step_admission_wait_ms": {
+      "mean": 50490.700071186664,
+      "p95": 119719.30971219995
+    },
+    "rollout_barrier_tail_ms": {
+      "mean": 21019.034595246012,
+      "p95": 54737.04208984372
+    },
+    "engine_queue_ms": {
+      "mean": 184.54037203166226,
+      "p95": 1850.6346
+    },
+    "active_steps": {
+      "mean": 9.068163045204038,
+      "peak": 11.0
+    },
+    "priority_range": [
+      4,
+      78
+    ],
+    "output_hash": "6aef8b41599eba527fc3e5fb1139e21ed540ee5eadd8fdfb2c30ccb9505fdaa3",
+    "overrides": [
+      "generation.max_new_tokens=512",
+      "vllm.max_model_len=65536",
+      "vllm.max_num_seqs=256",
+      "vllm.max_num_batched_tokens=32768",
+      "vllm.gpu_memory_utilization=0.90",
+      "vllm.engine_kwargs.max_num_partial_prefills=1",
+      "vllm.engine_kwargs.max_long_partial_prefills=1",
+      "conditional_is.active_step_limit=11",
+      "vllm.request_priority_policy=\"step_fifo\""
+    ]
+  },
+  "step-elastic": {
+    "root": "/data/disk/wangzili/cis-step-affinity/p1-ab-20260910/step-elastic",
+    "wall_seconds": 255.75768015393987,
+    "success_rate": 1.0,
+    "jobs_per_second": 0.250236864681751,
+    "job_latency_seconds": {
+      "mean": 100.36939097053255,
+      "p50": 87.56676724855788,
+      "p95": 205.12185475195292,
+      "p99": 224.07909091882874
+    },
+    "forward_token_slots_per_second": 4554.549444219518,
+    "preemptions": 17.0,
+    "engine_requests": 1108.0,
+    "engine_requests_per_second": 4.332225719802814,
+    "generated_tokens": 115116.0,
+    "generated_tokens_per_second": 450.097920542257,
+    "prefill_tokens": 1050853.0,
+    "shared_prefill_tokens_saved": 18186112.0,
+    "apc_token_hit_ratio": 0.9453732436483614,
+    "maximum_in_flight_requests": 282.0,
+    "steps": 74,
+    "step_completion_ms": {
+      "mean": 86555.01427025677,
+      "p50": 72550.9541685,
+      "p95": 201744.5297756
+    },
+    "step_end_to_end_ms": {
+      "mean": 86555.01427025677,
+      "p50": 72550.9541685,
+      "p95": 201744.5297756
+    },
+    "step_admission_wait_ms": {
+      "mean": 0.0,
+      "p95": 0.0
+    },
+    "rollout_barrier_tail_ms": {
+      "mean": 38955.435704549156,
+      "p95": 129959.01373291016
+    },
+    "engine_queue_ms": {
+      "mean": 5512.902364620939,
+      "p95": 29592.64385
+    },
+    "active_steps": {
+      "mean": 25.07813657103568,
+      "peak": 32.0
+    },
+    "priority_range": [
+      -999996,
+      77
+    ],
+    "output_hash": "1230f8ed34b08473486a77bd058c62b3b0799ab1cc9ea4095c3620f505a2cd7b",
+    "overrides": [
+      "generation.max_new_tokens=512",
+      "vllm.max_model_len=65536",
+      "vllm.max_num_seqs=256",
+      "vllm.max_num_batched_tokens=32768",
+      "vllm.gpu_memory_utilization=0.90",
+      "vllm.engine_kwargs.max_num_partial_prefills=1",
+      "vllm.engine_kwargs.max_long_partial_prefills=1",
+      "vllm.request_priority_policy=\"rollout_first\""
+    ]
+  },
+  "cap-16": {
+    "root": "/data/disk/wangzili/cis-step-affinity/p1-cap-sweep-20260910/cap-16",
+    "wall_seconds": 232.58545170910656,
+    "success_rate": 1.0,
+    "jobs_per_second": 0.27516768366081845,
+    "job_latency_seconds": {
+      "mean": 97.49418015075207,
+      "p50": 96.50790735869668,
+      "p95": 173.17626769952471,
+      "p99": 206.48873835624187
+    },
+    "forward_token_slots_per_second": 4149.971517596034,
+    "preemptions": 0.0,
+    "engine_requests": 1052.0,
+    "engine_requests_per_second": 4.523068800174703,
+    "generated_tokens": 117692.0,
+    "generated_tokens_per_second": 506.0161722720163,
+    "prefill_tokens": 848583.0,
+    "shared_prefill_tokens_saved": 16436352.0,
+    "apc_token_hit_ratio": 0.9509062082096346,
+    "maximum_in_flight_requests": 114.0,
+    "steps": 73,
+    "step_completion_ms": {
+      "mean": 48718.98010715069,
+      "p50": 36141.665664,
+      "p95": 114767.42122779999
+    },
+    "step_end_to_end_ms": {
+      "mean": 85241.04687631507,
+      "p50": 84502.42980499999,
+      "p95": 168257.6204912
+    },
+    "step_admission_wait_ms": {
+      "mean": 36522.06676916438,
+      "p95": 81271.48845279988
+    },
+    "rollout_barrier_tail_ms": {
+      "mean": 29715.91664720618,
+      "p95": 75365.27618408203
+    },
+    "engine_queue_ms": {
+      "mean": 304.227177756654,
+      "p95": 3088.15195
+    },
+    "active_steps": {
+      "mean": 15.312061526495448,
+      "peak": 16.0
+    },
+    "priority_range": [
+      4,
+      76
+    ],
+    "output_hash": "525b6c6cfd5ed6030cd225acb90e9d5f935c1e9ba7030a62afcf688e4216558a",
+    "overrides": [
+      "generation.max_new_tokens=512",
+      "vllm.max_model_len=65536",
+      "vllm.max_num_seqs=256",
+      "vllm.max_num_batched_tokens=32768",
+      "vllm.gpu_memory_utilization=0.90",
+      "vllm.engine_kwargs.max_num_partial_prefills=1",
+      "vllm.engine_kwargs.max_long_partial_prefills=1",
+      "conditional_is.active_step_limit=16",
+      "vllm.request_priority_policy=\"step_fifo\""
+    ]
+  },
+  "cap-22": {
+    "root": "/data/disk/wangzili/cis-step-affinity/p1-cap-sweep-20260910/cap-22",
+    "wall_seconds": 238.1704969489947,
+    "success_rate": 1.0,
+    "jobs_per_second": 0.2687150626120829,
+    "job_latency_seconds": {
+      "mean": 93.126904445322,
+      "p50": 79.77559329359792,
+      "p95": 186.31188137454444,
+      "p99": 200.35899197807532
+    },
+    "forward_token_slots_per_second": 4018.6757480922324,
+    "preemptions": 0.0,
+    "engine_requests": 1030.0,
+    "engine_requests_per_second": 4.324633038913208,
+    "generated_tokens": 111523.0,
+    "generated_tokens_per_second": 468.2485926201143,
+    "prefill_tokens": 846637.0,
+    "shared_prefill_tokens_saved": 16169984.0,
+    "apc_token_hit_ratio": 0.9502464678504622,
+    "maximum_in_flight_requests": 172.0,
+    "steps": 71,
+    "step_completion_ms": {
+      "mean": 62270.44908605634,
+      "p50": 52348.221089,
+      "p95": 150667.2608745
+    },
+    "step_end_to_end_ms": {
+      "mean": 83689.28105042253,
+      "p50": 76114.99438300001,
+      "p95": 178995.387421
+    },
+    "step_admission_wait_ms": {
+      "mean": 21418.831964366196,
+      "p95": 46290.9785795
+    },
+    "rollout_barrier_tail_ms": {
+      "mean": 31982.247278091756,
+      "p95": 97279.13005371089
+    },
+    "engine_queue_ms": {
+      "mean": 753.3703466019418,
+      "p95": 4451.6356
+    },
+    "active_steps": {
+      "mean": 18.58882062794068,
+      "peak": 22.0
+    },
+    "priority_range": [
+      4,
+      74
+    ],
+    "output_hash": "ac9994b18b95a5b04589a9deebecaf72e8d4b025e3e9a2f0d7ef54b93dae8de3",
+    "overrides": [
+      "generation.max_new_tokens=512",
+      "vllm.max_model_len=65536",
+      "vllm.max_num_seqs=256",
+      "vllm.max_num_batched_tokens=32768",
+      "vllm.gpu_memory_utilization=0.90",
+      "vllm.engine_kwargs.max_num_partial_prefills=1",
+      "vllm.engine_kwargs.max_long_partial_prefills=1",
+      "conditional_is.active_step_limit=22",
+      "vllm.request_priority_policy=\"step_fifo\""
+    ]
+  },
+  "cap-32": {
+    "root": "/data/disk/wangzili/cis-step-affinity/p1-cap-sweep-20260910/cap-32",
+    "wall_seconds": 262.0512085868977,
+    "success_rate": 1.0,
+    "jobs_per_second": 0.24422707433832433,
+    "job_latency_seconds": {
+      "mean": 104.88277400296647,
+      "p50": 80.21966937370598,
+      "p95": 212.09095258752347,
+      "p99": 251.5209499368956
+    },
+    "forward_token_slots_per_second": 4762.672176671663,
+    "preemptions": 15.0,
+    "engine_requests": 1062.0,
+    "engine_requests_per_second": 4.0526430148015695,
+    "generated_tokens": 122009.0,
+    "generated_tokens_per_second": 465.59220488975956,
+    "prefill_tokens": 1127117.0,
+    "shared_prefill_tokens_saved": 16596736.0,
+    "apc_token_hit_ratio": 0.9364067734030518,
+    "maximum_in_flight_requests": 286.0,
+    "steps": 72,
+    "step_completion_ms": {
+      "mean": 92969.30523091667,
+      "p50": 74458.382012,
+      "p95": 210615.80365625
+    },
+    "step_end_to_end_ms": {
+      "mean": 92969.3153155,
+      "p50": 74458.3930865,
+      "p95": 210615.81380725
+    },
+    "step_admission_wait_ms": {
+      "mean": 0.010084583333333334,
+      "p95": 0.015318499999999999
+    },
+    "rollout_barrier_tail_ms": {
+      "mean": 44484.912286931816,
+      "p95": 121464.76645507815
+    },
+    "engine_queue_ms": {
+      "mean": 6365.985662900189,
+      "p95": 30861.3116
+    },
+    "active_steps": {
+      "mean": 25.583893716225607,
+      "peak": 32.0
+    },
+    "priority_range": [
+      4,
+      75
+    ],
+    "output_hash": "4676f3646b65c23ddca4810a86c70e68818d745a70b340fc7d73ef13c6691f0e",
+    "overrides": [
+      "generation.max_new_tokens=512",
+      "vllm.max_model_len=65536",
+      "vllm.max_num_seqs=256",
+      "vllm.max_num_batched_tokens=32768",
+      "vllm.gpu_memory_utilization=0.90",
+      "vllm.engine_kwargs.max_num_partial_prefills=1",
+      "vllm.engine_kwargs.max_long_partial_prefills=1",
+      "conditional_is.active_step_limit=32",
+      "vllm.request_priority_policy=\"step_fifo\""
+    ]
+  }
+}
