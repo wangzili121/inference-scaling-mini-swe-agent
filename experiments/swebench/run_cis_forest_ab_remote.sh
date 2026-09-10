@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
   echo "usage: $0 VARIANT DEVICES OUTPUT PORT CONTAINER" >&2
-  echo "VARIANT: baseline | step-gang-6 | step-elastic | streaming | bounded | frontier-CAPACITY-BATCH" >&2
+  echo "VARIANT: baseline | step-gang | step-gang-6 | step-elastic | streaming | bounded | frontier-CAPACITY-BATCH" >&2
   exit 2
 fi
 
@@ -22,6 +22,17 @@ categorical=${CIS_CATEGORICAL_DIR:-/data/disk/wangzili/vllm-categorical-runtime}
 cache=${CIS_VLLM_CACHE:-/data/disk/wangzili/vllm-cache-v018-cis-forest}
 limit=${CIS_LIMIT:-64}
 workers=${CIS_WORKERS:-32}
+candidate_count=${CIS_CANDIDATE_COUNT:-15}
+rollout_count=${CIS_ROLLOUT_COUNT:-3}
+block_size=${CIS_BLOCK_SIZE:-128}
+active_step_limit=${CIS_ACTIVE_STEP_LIMIT:-6}
+
+for value in "$limit" "$workers" "$candidate_count" "$rollout_count" "$block_size" "$active_step_limit"; do
+  [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
+    echo "workload and scheduling values must be positive integers" >&2
+    exit 2
+  }
+done
 
 for path in "$workspace" "$model" "$public_workload" "$self_workload" "$categorical"; do
   [[ -e "$path" ]] || { echo "missing dependency: $path" >&2; exit 1; }
@@ -32,9 +43,9 @@ case "$variant" in
   baseline)
     variant_args=()
     ;;
-  step-gang-6)
+  step-gang|step-gang-6)
     variant_args=(
-      --set conditional_is.active_step_limit=6
+      --set conditional_is.active_step_limit="$active_step_limit"
       --set 'vllm.request_priority_policy=\"step_fifo\"'
     )
     ;;
@@ -155,9 +166,9 @@ docker run -d \
       --port $port \
       --routing round_robin \
       --workers $workers \
-      --candidate-count 15 \
-      --rollout-count 3 \
-      --block-size 128 \
+      --candidate-count $candidate_count \
+      --rollout-count $rollout_count \
+      --block-size $block_size \
       > /artifacts/launcher.log 2>&1
   "
 

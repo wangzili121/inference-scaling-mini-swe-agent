@@ -47,13 +47,41 @@ Step 指标分为两层，避免把 admission 排队隐藏掉：
 
 `step-gang-6` 的 active step mean 只有 29.8 s，但 admission wait mean 为 89.7 s；因此不能把 29.8 s 当作用户观察到的 step latency。合并后的 119.5 s 才是正确主结果。
 
-## 判断
+## P0 判断
 
 若主目标是平均 step 完成时间和 barrier 长尾，`step-gang-6` 胜出：end-to-end step mean 降 18.9%，P95 降 24.6%，barrier tail mean 降 68.6%。它把 active step 峰值从 32 压到 6，将 engine queue 基本搬到可解释的 step admission queue，并消除了 KV preemption。
 
 若主目标是总体吞吐与 job P50，`step-elastic` 更均衡：jobs/s 比 gang 高约 1.1%，job P50 更低，但 step mean、job mean 和 barrier tail 明显不如 gang。下一版值得做的是 soft step cap：保留 gang 的 step locality，并仅在不会破坏 barrier-critical bundle 时借用空余容量。
 
 本轮是随机 `T=1` workload。相同 request seed 在 native categorical + 不同 batch shape 下没有得到逐 token 相同轨迹；两次纯 baseline 的最终 action 也只有 19/64 完全一致，因此不能把 exact-output mismatch 归因于调度策略。本文不作质量结论，并同时报告 requests/s、generated tokens/s、请求数和 prefill，以降低随机工作量差异带来的误判。两种调度收益均超过历史 baseline 吞吐波动约 2.4%，但正式质量验证仍需单独进行。
+
+## P1/P2 扩展
+
+使用完全相同的模型、runtime、engine 参数、64 个请求和 workers=32，进一步测试：
+
+- P1：`C8/R3/B128/L512`，step-gang cap 为 `round(256/(8x3))=11`。
+- P2：`C4/R2/B128/L512`，step-gang cap 为 `256/(4x2)=32`。
+
+| Profile | 方案 | jobs/s | jobs/s 变化 | Step mean | Step mean 变化 | Step P95 变化 | Barrier-tail mean 变化 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| P1 | Baseline | 0.2352 | - | 94.3 s | - | - | - |
+| P1 | Step gang 11 | 0.2248 | **-4.4%** | **84.9 s** | **-10.0%** | -25.0% | -53.8% |
+| P1 | Elastic | **0.2502** | **+6.4%** | 86.6 s | -8.2% | -4.2% | -14.3% |
+| P2 | Baseline | 0.3329 | - | 60.2 s | - | - | - |
+| P2 | Step gang 32 | 0.3564 | +7.0% | 55.3 s | -8.2% | -11.0% | -0.9% |
+| P2 | Elastic | **0.3663** | **+10.0%** | **55.1 s** | **-8.6%** | **-11.2%** | -9.5% |
+
+P1 的 hard cap 能显著缩短已获准 step 的 barrier，并把 preemption 从 28 降到 0，但限制过强使完整 burst 的 jobs/s 下降 4.4%。Elastic 将 preemption 降到 17，在不设 admission barrier 的情况下同时改善 jobs/s、job latency 和 step latency，因此是 P1 的胜出方案。P1 elastic 本轮生成 token 数少约 10.9%，所以 `+6.4% jobs/s` 不能单独归因于调度；更保守的证据是 engine requests/s 提升 2.9%、step mean 下降 8.2%。
+
+P2 的 fanout 较小，cap=32 实际不限制 32 个 worker；此时 step-gang 主要等价于 step FIFO priority。两种 priority 都有收益，elastic 的 jobs/s 提升 10.0%，而且本轮生成 token 数更多，收益不是由更短输出造成。不过 P2 的 barrier-tail P95 在 gang/elastic 下分别增加 19.1%/15.9%，说明其收益来自更好的队列、APC locality 和较少 preemption，不是 barrier 长尾改善。
+
+综合三种 profile：
+
+- 高 fanout P0：hard step locality 对平均/P95 step 和 barrier 最有效；elastic 的吞吐略高。
+- 中 fanout P1：使用 elastic；hard cap=11 会牺牲总吞吐。
+- 低 fanout P2：使用 elastic；hard admission 已无必要。
+
+因此下一版不应提供一个固定 cap，而应依据 `C x R`、MNS、当前 ready frontier 和 barrier-critical work 动态选择：高 fanout 启用 soft cap，低/中 fanout 只保留 elastic priority。
 
 ## Attention 结果
 
@@ -69,8 +97,12 @@ Attention 探针保持 P0 的 `C15/R3`，candidate suffix 和 unique tail 均为
 
 ## 复现与原始数据
 
-- 调度原始目录：`/data/disk/wangzili/cis-step-affinity/ab-20260910/{baseline,step-gang-6,step-elastic}`。
+- P0 调度原始目录：`/data/disk/wangzili/cis-step-affinity/ab-20260910/{baseline,step-gang-6,step-elastic}`。
+- P1 调度原始目录：`/data/disk/wangzili/cis-step-affinity/p1-ab-20260910/{baseline,step-gang,step-elastic}`。
+- P2 调度原始目录：`/data/disk/wangzili/cis-step-affinity/p2-ab-20260910/{baseline,step-gang,step-elastic}`。
 - 调度摘要：`docs/experiments/data/cis_step_affinity_ab_20260910.json`，SHA256 `1b5d213a4ac3d1c78789d7babd3d586d584369cb25291d673e84fb7fec3bef3a`。
+- P1 摘要：`docs/experiments/data/cis_step_affinity_p1_20260910.json`，SHA256 `8d9b577ce8a42097ca2373c6dfb1c4600566fdb0608abee9b65447556012dd37`。
+- P2 摘要：`docs/experiments/data/cis_step_affinity_p2_20260910.json`，SHA256 `3d92315b61cdef9f210bcf0b81d5739dfdd51ad0e741bf8892e296ac96a292e5`。
 - Attention 摘要：`docs/experiments/data/cis_forest_attention_rerun_20260910.json`，SHA256 `89df83228197b513b492471b212a36ebc98cb8dec548908d4481371e4a552792`。
 - 启动脚本：`experiments/swebench/run_cis_forest_ab_remote.sh`。
 - 汇总脚本：`experiments/swebench/summarize_cis_step_ab.py`。
