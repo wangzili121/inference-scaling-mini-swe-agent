@@ -57,19 +57,20 @@ Step 指标分为两层，避免把 admission 排队隐藏掉：
 
 ## 三组配置统一结果
 
-表中的 `Step` 使用各配置当前最佳的已测 hard-step cap：P0 为 6，P1 为 16，P2 为 32。P1 最初按 `MNS/(C x R)` 得到的 cap 11 已被后续 sweep 判定为过紧，不作为最终 Step 代表值。
+表中的百分比均相对未列出的原始 continuous-batching baseline。`Step` 使用各配置当前最佳的已测 hard-step cap：P0 为 6，P1 为 16，P2 为 32。P1 最初按 `MNS/(C x R)` 得到的 cap 11 已被后续 sweep 判定为过紧，不作为最终 Step 代表值。
 
 | 配置 | 调度 | jobs/s（变化） | Job mean / P95（变化） | Step E2E mean / P95（变化） | Barrier mean / P95（变化） | Preemptions（变化） |
 |---|---|---:|---:|---:|---:|---:|
-| P0 `C15/R3` | Baseline | 0.1463 | 168.5 / 333.9 s | 147.5 / 316.9 s | 71.0 / 189.4 s | 10 |
 | P0 `C15/R3` | Step cap 6 | 0.1688 (+15.3%) | **134.7 (-20.0%) / 246.1 s (-26.3%)** | **119.5 (-18.9%) / 238.9 s (-24.6%)** | **22.3 (-68.6%) / 43.1 s (-77.3%)** | **0 (-100%)** |
 | P0 `C15/R3` | Elastic | **0.1707 (+16.6%)** | 147.5 (-12.5%) / 279.5 s (-16.3%) | 130.8 (-11.3%) / 243.9 s (-23.0%) | 60.3 (-15.0%) / 153.6 s (-18.9%) | **0 (-100%)** |
-| P1 `C8/R3` | Baseline | 0.2352 | 110.7 / 223.6 s | 94.3 / 210.6 s | 45.5 / 114.5 s | 28 |
 | P1 `C8/R3` | Step cap 16 | **0.2752 (+17.0%)** | **97.5 (-12.0%) / 173.2 s (-22.6%)** | **85.2 (-9.6%) / 168.3 s (-20.1%)** | **29.7 (-34.6%) / 75.4 s (-34.2%)** | **0 (-100%)** |
 | P1 `C8/R3` | Elastic | 0.2502 (+6.4%) | 100.4 (-9.4%) / 205.1 s (-8.3%) | 86.6 (-8.2%) / 201.7 s (-4.2%) | 39.0 (-14.3%) / 130.0 s (+13.5%) | 17 (-39.3%) |
-| P2 `C4/R2` | Baseline | 0.3329 | 71.8 / 159.0 s | 60.2 / 150.3 s | 16.2 / **45.8 s** | 4 |
 | P2 `C4/R2` | Step cap 32 | 0.3564 (+7.0%) | **64.2 (-10.6%)** / 151.6 s (-4.7%) | 55.3 (-8.2%) / 133.7 s (-11.0%) | 16.0 (-0.9%) / 54.5 s (+19.1%) | 6 (+50.0%) |
 | P2 `C4/R2` | Elastic | **0.3663 (+10.0%)** | 65.6 (-8.5%) / **145.5 s (-8.5%)** | **55.1 (-8.6%) / 133.4 s (-11.2%)** | **14.6 (-9.5%)** / 53.1 s (+15.9%) | **1 (-75.0%)** |
+
+`Step` 方案由两部分组成。首先，`StepAdmissionController` 限制同一时刻获准执行的完整 CIS step 数；一个 step 从 candidate 开始占用名额，直到全部 rollout、reward 和 resample 完成才释放。其次，同一 `job_id + step_id` 的 candidate/rollout 被赋予相同的 step-FIFO priority，使较早 step 的整组子请求优先于较晚 step。它不是把请求合成一个 vLLM sequence，而是通过 hard admission 和共同 priority 提高 step locality。
+
+`Elastic` 不设置 active-step cap，也不阻止新 job/step 进入。每个 step 仍有 FIFO 次序，但所有已经就绪的 rollout 会获得高于普通 candidate 的优先级，从而优先排空接近 barrier 的工作；engine 的空闲容量可继续被其他 step 借用。它保留 continuous batching，因而更灵活，但不保证同一 step 集中完成。
 
 `Job latency` 是一次完整 Conditional IS 模型调用从进入到返回最终 assistant/tool-call 的时间。`Step latency` 是该 job 内一个 `B=128` block 的 candidate、rollout、reward 和 resample 完成时间，并包含本文单列的 step admission wait。一个 job 可顺序经历多个 step，因此两者不是同一指标；在聚合层面近似满足 `job mean ~= step mean x 总 step 数 / 总 job 数 + 非 step 开销`。Mean 与 P95 应同时报告：mean 描述总体平均，P95 描述最慢 5% 的尾延迟；P95 不参与 mean 的计算，也不应把多轮实验的 P95 简单再取平均。多次复验时应合并原始样本后重新计算，或同时报告各轮波动。
 
