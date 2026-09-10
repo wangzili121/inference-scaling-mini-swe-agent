@@ -32,7 +32,12 @@ class RequestMeasurement:
     transport_retries: int = 0
 
 
-ROUTING_MODES = ("round_robin", "least_outstanding", "cis_work_balanced")
+ROUTING_MODES = (
+    "round_robin",
+    "least_outstanding",
+    "least_cis_work",
+    "cis_work_balanced",
+)
 
 
 def estimate_cis_attention_work(
@@ -113,6 +118,7 @@ class EndpointRouter:
         *,
         assignments: Sequence[str] | None = None,
         estimated_loads: dict[str, float] | None = None,
+        work_estimates: Sequence[float] | None = None,
     ) -> None:
         if mode not in ROUTING_MODES:
             raise ValueError(f"unknown routing mode: {mode}")
@@ -121,15 +127,24 @@ class EndpointRouter:
                 raise ValueError("cis_work_balanced routing requires assignments")
             if any(endpoint not in endpoints for endpoint in assignments):
                 raise ValueError("routing assignment references an unknown endpoint")
+        if mode == "least_cis_work":
+            if work_estimates is None:
+                raise ValueError("least_cis_work routing requires work estimates")
+            if any(value <= 0 for value in work_estimates):
+                raise ValueError("CIS work estimates must be positive")
         self.endpoints = tuple(endpoints)
         self.mode = mode
         self._assignments = tuple(assignments or ())
         self._estimated_loads = dict(estimated_loads or {})
+        self._work_estimates = tuple(float(value) for value in (work_estimates or ()))
         self._lock = threading.Lock()
         self._cursor = 0
         self._outstanding = {endpoint: 0 for endpoint in endpoints}
+        self._outstanding_work = {endpoint: 0.0 for endpoint in endpoints}
         self._assigned = {endpoint: 0 for endpoint in endpoints}
+        self._assigned_work = {endpoint: 0.0 for endpoint in endpoints}
         self._maximum = {endpoint: 0 for endpoint in endpoints}
+        self._maximum_work = {endpoint: 0.0 for endpoint in endpoints}
 
     def acquire(self, request_index: int) -> str:
         with self._lock:
@@ -138,6 +153,20 @@ class EndpointRouter:
                 index = self.endpoints.index(endpoint)
             elif self.mode == "round_robin":
                 index = self._cursor % len(self.endpoints)
+            elif self.mode == "least_cis_work":
+                minimum = min(self._outstanding_work.values())
+                eligible = {
+                    endpoint
+                    for endpoint, work in self._outstanding_work.items()
+                    if work == minimum
+                }
+                index = next(
+                    offset % len(self.endpoints)
+                    for offset in range(
+                        self._cursor, self._cursor + len(self.endpoints)
+                    )
+                    if self.endpoints[offset % len(self.endpoints)] in eligible
+                )
             else:
                 minimum = min(self._outstanding.values())
                 eligible = {
@@ -156,14 +185,31 @@ class EndpointRouter:
             self._cursor = index + 1
             self._outstanding[endpoint] += 1
             self._assigned[endpoint] += 1
+            if self.mode == "least_cis_work":
+                work = self._work_estimates[request_index]
+                self._outstanding_work[endpoint] += work
+                self._assigned_work[endpoint] += work
+                self._maximum_work[endpoint] = max(
+                    self._maximum_work[endpoint], self._outstanding_work[endpoint]
+                )
             self._maximum[endpoint] = max(
                 self._maximum[endpoint], self._outstanding[endpoint]
             )
             return endpoint
 
-    def release(self, endpoint: str) -> None:
+    def release(self, endpoint: str, request_index: int | None = None) -> None:
         with self._lock:
             self._outstanding[endpoint] -= 1
+            if self.mode == "least_cis_work":
+                if request_index is None:
+                    raise ValueError(
+                        "least_cis_work release requires the request index"
+                    )
+                self._outstanding_work[endpoint] = max(
+                    0.0,
+                    self._outstanding_work[endpoint]
+                    - self._work_estimates[request_index],
+                )
 
     def diagnostics(self) -> dict[str, Any]:
         with self._lock:
@@ -172,7 +218,11 @@ class EndpointRouter:
                 "assigned": dict(self._assigned),
                 "maximum_outstanding": dict(self._maximum),
                 "final_outstanding": dict(self._outstanding),
-                "estimated_attention_work": dict(self._estimated_loads),
+                "estimated_attention_work": dict(
+                    self._estimated_loads or self._assigned_work
+                ),
+                "maximum_outstanding_attention_work": dict(self._maximum_work),
+                "final_outstanding_attention_work": dict(self._outstanding_work),
             }
 
 
@@ -271,15 +321,22 @@ def run_burst(
     release = threading.Event()
     assignments = None
     estimated_loads = None
+    work_estimates = None
     if routing == "cis_work_balanced":
         assignments, estimated_loads = balanced_cis_assignments(
             records, endpoints, conditional_overrides
+        )
+    elif routing == "least_cis_work":
+        work_estimates = tuple(
+            estimate_cis_attention_work(record, conditional_overrides)
+            for record in records
         )
     router = EndpointRouter(
         endpoints,
         routing,
         assignments=assignments,
         estimated_loads=estimated_loads,
+        work_estimates=work_estimates,
     )
     before_snapshots = {endpoint: _backend_snapshot(endpoint) for endpoint in endpoints}
 
@@ -342,7 +399,7 @@ def run_burst(
                 completed_retries,
             )
         finally:
-            router.release(endpoint)
+            router.release(endpoint, index)
 
     wall_started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:

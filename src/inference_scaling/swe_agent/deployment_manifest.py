@@ -30,6 +30,7 @@ def build_deployment_manifest(
     if routing not in {
         "round_robin",
         "least_outstanding",
+        "least_cis_work",
         "cis_work_balanced",
     }:
         raise ValueError(f"unknown routing: {routing}")
@@ -65,7 +66,12 @@ def main() -> None:
     parser.add_argument("--devices", action="append", required=True)
     parser.add_argument(
         "--routing",
-        choices=("round_robin", "least_outstanding", "cis_work_balanced"),
+        choices=(
+            "round_robin",
+            "least_outstanding",
+            "least_cis_work",
+            "cis_work_balanced",
+        ),
         default="round_robin",
     )
     parser.add_argument("--workers", type=int)

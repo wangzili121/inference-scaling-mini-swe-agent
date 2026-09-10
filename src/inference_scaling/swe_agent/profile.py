@@ -659,7 +659,12 @@ def main() -> None:
     parser.add_argument("--pipeline-parallel-size", type=int, default=1)
     parser.add_argument(
         "--routing",
-        choices=("round_robin", "least_outstanding", "cis_work_balanced"),
+        choices=(
+            "round_robin",
+            "least_outstanding",
+            "least_cis_work",
+            "cis_work_balanced",
+        ),
         default="round_robin",
     )
     parser.add_argument(

@@ -225,6 +225,30 @@ def test_cis_work_balanced_routing_pairs_long_and_short_jobs(monkeypatch) -> Non
     assert max(loads.values()) / min(loads.values()) < 1.1
 
 
+def test_least_cis_work_tracks_online_attention_pressure() -> None:
+    router = benchmark.EndpointRouter(
+        ("http://one", "http://two"),
+        "least_cis_work",
+        work_estimates=(100.0, 90.0, 10.0, 80.0),
+    )
+
+    assert router.acquire(0) == "http://one"
+    assert router.acquire(1) == "http://two"
+    assert router.acquire(2) == "http://two"
+    router.release("http://two", 1)
+    assert router.acquire(3) == "http://two"
+
+    diagnostics = router.diagnostics()
+    assert diagnostics["estimated_attention_work"] == {
+        "http://one": 100.0,
+        "http://two": 180.0,
+    }
+    assert diagnostics["final_outstanding_attention_work"] == {
+        "http://one": 100.0,
+        "http://two": 90.0,
+    }
+
+
 def test_burst_separates_execution_success_from_action_validity(monkeypatch) -> None:
     monkeypatch.setattr(
         benchmark,
