@@ -1,10 +1,13 @@
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from math import exp
-from threading import Event
+from threading import Event, Lock
+from time import sleep
 
 import pytest
 
 from inference_scaling.arllm.algorithms.conditional_is import (
+    RolloutAdmissionController,
     conditional_is_step,
     run_conditional_is,
 )
@@ -274,6 +277,94 @@ def test_rollout_submission_batches_preserve_logical_candidate_order() -> None:
 def test_rollout_submission_batch_size_must_be_positive() -> None:
     with pytest.raises(ValueError, match="rollout_submission_batch_size"):
         ConditionalISConfig(rollout_submission_batch_size=0)
+
+
+def test_shared_rollout_frontier_bounds_concurrent_engine_admission() -> None:
+    class FrontierBackend(TabularAutoregressiveBackend):
+        def __init__(self) -> None:
+            super().__init__({}, fallback=[0.5, 0.5])
+            self.lock = Lock()
+            self.active_rollouts = 0
+            self.peak_rollouts = 0
+
+        def sample_batch_with_callback(self, requests, on_complete):
+            samples = TabularAutoregressiveBackend.sample_batch(self, requests)
+            is_rollout = all(":rollout:" in request.request_id for request in requests)
+            if is_rollout:
+                with self.lock:
+                    self.active_rollouts += len(requests)
+                    self.peak_rollouts = max(
+                        self.peak_rollouts, self.active_rollouts
+                    )
+                sleep(0.01)
+            for index, sample in enumerate(samples):
+                if is_rollout:
+                    with self.lock:
+                        self.active_rollouts -= 1
+                on_complete(index, sample)
+            return samples
+
+    backend = FrontierBackend()
+    controller = RolloutAdmissionController(capacity=2, batch_size=2)
+    config = ConditionalISConfig(
+        candidate_count=3,
+        rollout_count=2,
+        block_size=1,
+        total_length=2,
+        rollout_frontier_capacity=2,
+        rollout_frontier_batch_size=2,
+    )
+
+    def run(seed: int):
+        return run_conditional_is(
+            backend,
+            (),
+            config,
+            _reward,
+            SeedStream(seed),
+            rollout_admission_controller=controller,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(run, (20260910, 20260911)))
+
+    assert all(len(result.steps) == 2 for result in results)
+    assert backend.peak_rollouts <= 2
+    snapshot = controller.snapshot()
+    assert snapshot.admitted == 0
+    assert snapshot.peak_admitted == 2
+    assert snapshot.acquisitions == 6
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"rollout_frontier_capacity": 0}, "rollout_frontier_capacity"),
+        (
+            {"rollout_frontier_capacity": 2, "rollout_frontier_batch_size": 3},
+            "cannot exceed",
+        ),
+        (
+            {
+                "rollout_frontier_capacity": 2,
+                "rollout_frontier_batch_size": 2,
+                "rollout_submission_batch_size": 1,
+            },
+            "mutually exclusive",
+        ),
+        (
+            {
+                "rollout_frontier_capacity": 2,
+                "rollout_frontier_batch_size": 2,
+                "stream_candidate_rollouts": True,
+            },
+            "mutually exclusive",
+        ),
+    ],
+)
+def test_rollout_frontier_rejects_invalid_configuration(overrides, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        ConditionalISConfig(**overrides)
 
 
 def test_streamed_candidate_rollouts_preserve_conditional_is_result() -> None:

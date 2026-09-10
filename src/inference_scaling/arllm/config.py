@@ -103,6 +103,8 @@ class ConditionalISConfig:
     stream_candidate_rollouts: bool = False
     rollout_stream_candidate_batch_size: int = 5
     rollout_stream_max_batches: int = 2
+    rollout_frontier_capacity: int | None = None
+    rollout_frontier_batch_size: int = 15
 
     def __post_init__(self) -> None:
         for name in ("candidate_count", "rollout_count", "block_size", "total_length"):
@@ -145,10 +147,39 @@ class ConditionalISConfig:
             "rollout_stream_max_batches",
             self.rollout_stream_max_batches,
         )
+        if self.rollout_frontier_capacity is not None:
+            require_positive(
+                "rollout_frontier_capacity",
+                self.rollout_frontier_capacity,
+            )
+        require_positive(
+            "rollout_frontier_batch_size",
+            self.rollout_frontier_batch_size,
+        )
+        if (
+            self.rollout_frontier_capacity is not None
+            and self.rollout_frontier_batch_size > self.rollout_frontier_capacity
+        ):
+            raise ValueError(
+                "rollout_frontier_batch_size cannot exceed "
+                "rollout_frontier_capacity"
+            )
         if self.stream_candidate_rollouts and self.rollout_submission_batch_size:
             raise ValueError(
                 "stream_candidate_rollouts and rollout_submission_batch_size "
                 "are mutually exclusive"
+            )
+        if self.rollout_frontier_capacity is not None and (
+            self.stream_candidate_rollouts
+            or self.rollout_submission_batch_size is not None
+        ):
+            raise ValueError(
+                "rollout_frontier_capacity is mutually exclusive with per-job "
+                "rollout submission controls"
+            )
+        if self.rollout_frontier_capacity is not None and self.exact_rollout_early_stop:
+            raise ValueError(
+                "rollout_frontier_capacity does not support exact rollout early stop"
             )
         if self.stream_candidate_rollouts and self.exact_rollout_early_stop:
             raise ValueError(

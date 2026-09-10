@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "workload": {
+    "algorithm": "conditional_is",
+    "profile": "P0",
+    "candidate_count": 15,
+    "rollout_count": 3,
+    "block_size": 128,
+    "max_new_tokens": 512,
+    "requests": 64,
+    "workers": 32,
+    "topology": "TP2",
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 32768
+  },
+  "scheduler": [
+    {
+      "variant": "all_at_once_baseline",
+      "path": "/data/disk/wangzili/cis-forest-ab/p0-baseline-paired",
+      "jobs_per_second": 0.149946667,
+      "forward_token_slots_per_second": 3804.576,
+      "p95_seconds": 335.395,
+      "p99_seconds": 359.650,
+      "maximum_in_flight_requests": 472,
+      "kv_preemptions": 4
+    },
+    {
+      "variant": "candidate_completion_streaming",
+      "path": "/data/disk/wangzili/cis-forest-ab/p0-streaming-paired",
+      "jobs_per_second": 0.135283391,
+      "forward_token_slots_per_second": 3326.420,
+      "p95_seconds": 367.346,
+      "p99_seconds": 399.030,
+      "maximum_in_flight_requests": 420,
+      "kv_preemptions": 39,
+      "jobs_per_second_change": -0.097788
+    },
+    {
+      "variant": "per_job_bounded_submission_15",
+      "path": "/data/disk/wangzili/cis-forest-ab/p0-bounded-paired",
+      "jobs_per_second": 0.130760390,
+      "forward_token_slots_per_second": 3204.727,
+      "p95_seconds": 399.171,
+      "p99_seconds": 419.045,
+      "maximum_in_flight_requests": 420,
+      "kv_preemptions": 30,
+      "jobs_per_second_change": -0.127944
+    }
+  ],
+  "streaming_timing": {
+    "candidate_to_rollout_median_seconds": 0.00585,
+    "candidate_to_rollout_p95_seconds": 2.527,
+    "candidate_to_rollout_sum_seconds": 25.35,
+    "candidate_stage_sum_seconds": 4810.8,
+    "interpretation": "Fixed-size candidate requests finish nearly together, so host-side completion streaming exposes negligible useful overlap."
+  },
+  "static_routing": [
+    {
+      "profile": "P1",
+      "path": "/data/disk/wangzili/cis-forest-ab/routing-p1-work-balanced",
+      "jobs_per_second": 0.44458,
+      "forward_token_slots_per_second": 6810.28,
+      "p95_seconds": 119.318,
+      "kv_preemptions": 0,
+      "normalized_change": 0.2265
+    },
+    {
+      "profile": "P3",
+      "path": "/data/disk/wangzili/cis-forest-ab/routing-p3-work-balanced",
+      "jobs_per_second": 0.327776,
+      "forward_token_slots_per_second": 5622.15,
+      "p95_seconds": 175.819,
+      "kv_preemptions": 0,
+      "normalized_change": -0.1139
+    }
+  ],
+  "global_rollout_frontier": [
+    {
+      "capacity": 128,
+      "batch_size": 15,
+      "path": "/data/disk/wangzili/cis-forest-ab/frontier-128",
+      "jobs_per_second": 0.137906200,
+      "forward_token_slots_per_second": 3649.175,
+      "p95_seconds": 400.448,
+      "kv_preemptions": 9,
+      "admission_wait_seconds": 577.210,
+      "work_normalized_change": -0.040846
+    },
+    {
+      "capacity": 192,
+      "batch_size": 15,
+      "path": "/data/disk/wangzili/cis-forest-ab/frontier-192",
+      "jobs_per_second": 0.116342023,
+      "forward_token_slots_per_second": 3834.310,
+      "p95_seconds": 425.421,
+      "kv_preemptions": 47,
+      "admission_wait_seconds": 2.751,
+      "work_normalized_change": 0.007815
+    },
+    {
+      "capacity": 240,
+      "batch_size": 15,
+      "path": "/data/disk/wangzili/cis-forest-ab-second/frontier-240",
+      "jobs_per_second": 0.127609826,
+      "forward_token_slots_per_second": 3676.020,
+      "p95_seconds": 372.645,
+      "kv_preemptions": 52,
+      "admission_wait_seconds": 0.000795,
+      "work_normalized_change": -0.033790
+    }
+  ]
+}

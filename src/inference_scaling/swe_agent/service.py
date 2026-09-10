@@ -14,7 +14,10 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from inference_scaling.arllm.algorithms import run_conditional_is
+from inference_scaling.arllm.algorithms import (
+    RolloutAdmissionController,
+    run_conditional_is,
+)
 from inference_scaling.arllm.backends import close_backend, load_backend_from_config
 from inference_scaling.arllm.config import ConditionalISConfig, SamplingConfig
 from inference_scaling.arllm.rewards import (
@@ -267,6 +270,22 @@ class ConditionalISRunner:
             rollout_stream_max_batches=int(
                 conditional.get("rollout_stream_max_batches", 2)
             ),
+            rollout_frontier_capacity=(
+                None
+                if conditional.get("rollout_frontier_capacity") in (None, 0)
+                else int(conditional["rollout_frontier_capacity"])
+            ),
+            rollout_frontier_batch_size=int(
+                conditional.get("rollout_frontier_batch_size", 15)
+            ),
+        )
+        self.rollout_admission_controller = (
+            None
+            if self.conditional.rollout_frontier_capacity is None
+            else RolloutAdmissionController(
+                capacity=self.conditional.rollout_frontier_capacity,
+                batch_size=self.conditional.rollout_frontier_batch_size,
+            )
         )
         reward_kind = str(reward.get("kind", "sequence_log_probability"))
         if reward_kind == "sequence_log_probability":
@@ -514,6 +533,7 @@ class ConditionalISRunner:
             base_sampling=self.sampling,
             rollout_backend=self.backend,
             rollout_sampling=self.sampling,
+            rollout_admission_controller=self.rollout_admission_controller,
             request_namespace=request_namespace,
             stage_observer=observe_stage,
         )

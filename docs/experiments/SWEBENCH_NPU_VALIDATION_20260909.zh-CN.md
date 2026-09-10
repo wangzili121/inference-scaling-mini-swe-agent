@@ -230,12 +230,66 @@ P3 四卡 none 的表观 jobs/s 扩展为 `2.26x`，但 forward-token-slots/s �
 - 两卡 Torch：`/data/disk/wangzili/cis-artifacts-5e895a9-first/profiles/two-card/p3/torch-w32`
 - 四卡三 pass：`/data/disk/wangzili/cis-artifacts-5e895a9-first/profiles/four-card/p3/`
 
+## P0 Mixed-stage 延迟采集
+
+原 P0-P3 Torch 的 10 秒窗口几乎只覆盖 candidate。为避免将 candidate-only
+行为误写成完整 CIS block 的瓶颈，新增 P0 四卡延迟 60 秒、持续 15 秒的 Torch
+pass。64 请求全部成功、零 KV preemption，原始目录为
+`/data/disk/wangzili/cis-mixed-profile/p0-four-card-torch`。
+
+- 396,158 条窗口内 kernel 记录与算法 `start_unix_us` 直接对齐，无估算偏移。
+- profile-0 有 11.13 秒 candidate+rollout；profile-1 有 7.02 秒 mixed，随后
+  7.98 秒 rollout-only。
+- profile-1 两 rank 的 mixed busy 平均 `71.8%`，rollout-only 为 `82.3%`，
+  mixed batch shape 对应 `10.5pp` 的设备利用率下降。
+- `FusedInferAttentionScore` 四 rank 累计 `41.03 device-seconds`，相当于
+  device-busy union 的 `75.4%`；同时 APC token hit 为 `97.69%`。
+- 暴露 HCCL/profile-window 从 candidate-only 的 `18.37%` 降到 mixed-stage
+  的 `6.10%`，通信压力随算法阶段迁移。
+
+可视化导出器将完整算法 Gantt、1ms NPU/HCCL 覆盖、阶段归一化统计、120ms
+逐 kernel 下钻和 Service batch 事件保留在同一查看器中，并标注 trace 支持的
+优化空间。
+
 ## 跨配置结论
 
 - P0-P3 全部没有正式 scoring forward，CPU reward 不是剩余瓶颈。
 - APC 已保存大量重复 prefill，但 `FusedInferAttentionScore` 仍稳定占设备 busy 时间约 38%-61%；APC 不会合并不同 decode request 对共享 KV 的读取。
 - 四卡的 work-normalized 扩展只有约 `1.28x-1.48x`，静态 job 数均分在四组配置中都出现实际工作偏斜。
-- 下一阶段优先验证 CIS work-aware routing、candidate-to-rollout bounded streaming，以及利用固定 `C -> R` 两层树的 Ascend Forest Attention；不继续把普通 MNS/MBT 扩边当作算法创新。
+- 下一阶段优先验证 engine 内 branch-on-token、利用固定 `C -> R` 两层树的
+  Ascend Forest Attention，以及执行中更新的 remaining-work routing；host
+  streaming/bounded/frontier 已被后续 A/B 排除，不继续把普通 MNS/MBT 扩边当作
+  算法创新。
+
+## 算法专属 Scheduler 初轮 A/B
+
+完成正式 profiling 后，在同一 P0、TP2、64-request burst 下比较了 host 侧 exact
+调度变体。它们保持 C/R/B/L、reward、seed 生成规则不变，只改变 rollout 的提交
+时机。该轮为同机并发筛选，作用是快速淘汰，不用来宣称小幅正收益。
+
+| 变体 | jobs/s | forward slots/s | P95 (s) | preemption | 相对 baseline |
+|---|---:|---:|---:|---:|---:|
+| all-at-once baseline | 0.149947 | 3,804.6 | 335.40 | 4 | - |
+| candidate completion streaming | 0.135283 | 3,326.4 | 367.35 | 39 | -9.78% jobs/s |
+| per-job bounded submission=15 | 0.130760 | 3,204.7 | 399.17 | 30 | -12.79% jobs/s |
+
+streaming 的 candidate-to-rollout 中位提前量仅为 `5.85ms`，P95 为 `2.527s`；
+而 candidate 阶段累计为 `4810.8s`。固定 B 的 candidate 本来就接近同步结束，
+host 回调几乎没有可利用的阶段重叠，反而把 rollout 拆成小批并增加 KV 过载。
+因此这两个方案已明确淘汰，不能再写成后续默认优化。
+
+静态 whole-job work routing 也不是稳定答案：P1 的 work-normalized throughput
+提升 `22.65%`，P3 却下降 `11.39%`。随机 EOS 使实际工作量不可预知，下一轮改为
+全 engine 共享的 rollout frontier 和执行中更新的 remaining-work routing。完整
+机器可读数据在 `docs/experiments/data/cis_scheduler_ab_20260910.json`。
+
+全局 rollout frontier 随后也完成 P0 筛选：capacity `128/192/240` 的
+work-normalized throughput 相对 paired baseline 分别为 `-4.08%/+0.78%/-3.38%`。
+192 产生 47 次 KV preemption，P95 为 `425.42s`；240 产生 52 次 preemption；
+128 虽把 preemption 降至 9 次，却累计等待 `577.21s` 并使 P95 增至 `400.45s`。
+三组均不满足 5% 收益与尾延迟门槛。结合前述 streaming/bounded 负结果，host
+层 admission 顺序已充分排除，下一步不再扩 capacity，而是验证 engine 内
+branch-on-token 与共享 KV decode attention。
 
 ## P/D Capability
 
@@ -251,5 +305,6 @@ v0.18 源码包含 `MooncakeConnectorV1` 和单机 P/D 文档，但当前镜像�
 - 四卡路由对照：`/data/disk/wangzili/cis-artifacts-8be6203/four-card/routing`
 - 正式 native P0：`/data/disk/wangzili/cis-artifacts-e1396a6/profiles`
 - 四卡 native P0 无 profiler：`/data/disk/wangzili/cis-artifacts-e1396a6/validation/four-card-p0-none`
+- 四卡 P0 mixed-stage Torch：`/data/disk/wangzili/cis-mixed-profile/p0-four-card-torch`
 
 上述目录保存原始服务日志、算法 JSONL、Agent trajectory、prediction、exit status、部署 manifest、诊断快照与 SHA256 清单。正式性能结论只从后续相同 workload、饱和负载、独立 profiler pass 的实验产生。

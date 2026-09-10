@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
 from math import exp, isfinite, log
+from threading import Condition
 from time import perf_counter
 from typing import Any
 
@@ -50,6 +51,75 @@ from inference_scaling.arllm.types import (
 RewardFunction = TokenReward
 RewardBatchFunction = TokenBatchReward
 StageObserver = Callable[[str, int, float, Mapping[str, Any]], None]
+
+
+@dataclass(frozen=True, slots=True)
+class RolloutFrontierSnapshot:
+    capacity: int
+    admitted: int
+    peak_admitted: int
+    acquisitions: int
+    wait_seconds: float
+    waiters: int
+
+
+class RolloutAdmissionController:
+    """Bound rollout admission across all CIS jobs sharing one engine."""
+
+    def __init__(self, *, capacity: int, batch_size: int) -> None:
+        if capacity <= 0:
+            raise ValueError("rollout frontier capacity must be positive")
+        if batch_size <= 0:
+            raise ValueError("rollout frontier batch size must be positive")
+        if batch_size > capacity:
+            raise ValueError("rollout frontier batch size cannot exceed capacity")
+        self.capacity = int(capacity)
+        self.batch_size = int(batch_size)
+        self._condition = Condition()
+        self._admitted = 0
+        self._peak_admitted = 0
+        self._acquisitions = 0
+        self._wait_seconds = 0.0
+        self._waiters = 0
+
+    def acquire(self, count: int) -> float:
+        if count <= 0 or count > self.capacity:
+            raise ValueError("rollout frontier acquisition exceeds capacity")
+        started = perf_counter()
+        with self._condition:
+            self._waiters += 1
+            try:
+                self._condition.wait_for(
+                    lambda: self._admitted + count <= self.capacity
+                )
+            finally:
+                self._waiters -= 1
+            waited = perf_counter() - started
+            self._admitted += count
+            self._peak_admitted = max(self._peak_admitted, self._admitted)
+            self._acquisitions += 1
+            self._wait_seconds += waited
+            return waited
+
+    def release(self, count: int) -> None:
+        if count <= 0:
+            raise ValueError("rollout frontier release must be positive")
+        with self._condition:
+            if count > self._admitted:
+                raise RuntimeError("rollout frontier released unadmitted work")
+            self._admitted -= count
+            self._condition.notify_all()
+
+    def snapshot(self) -> RolloutFrontierSnapshot:
+        with self._condition:
+            return RolloutFrontierSnapshot(
+                capacity=self.capacity,
+                admitted=self._admitted,
+                peak_admitted=self._peak_admitted,
+                acquisitions=self._acquisitions,
+                wait_seconds=self._wait_seconds,
+                waiters=self._waiters,
+            )
 
 
 @lru_cache(maxsize=1)
@@ -595,6 +665,7 @@ def estimate_conditional_weights(
     rollout_index_offset: int = 0,
     generated_prefix_statistics: GeneratedSequenceStatistics | None = None,
     rollout_submission_batch_size: int | None = None,
+    rollout_admission_controller: RolloutAdmissionController | None = None,
     precomputed_rollouts: _StreamedRollouts | None = None,
     request_namespace: str = "conditional-is",
     stage_observer: StageObserver | None = None,
@@ -650,17 +721,50 @@ def estimate_conditional_weights(
 
     if precomputed_rollouts is None:
         rollout_started = perf_counter()
-        submission_batch_size = rollout_submission_batch_size or len(requests) or 1
+        submission_batch_size = (
+            rollout_admission_controller.batch_size
+            if rollout_admission_controller is not None
+            else rollout_submission_batch_size or len(requests) or 1
+        )
         samples: list[SequenceSample] = []
         submission_batches = 0
+        admission_wait_seconds = 0.0
         with _profile_range("rollout"):
             for start in range(0, len(requests), submission_batch_size):
-                samples.extend(
-                    rollout_backend.sample_batch(
-                        requests[start : start + submission_batch_size]
+                request_batch = requests[start : start + submission_batch_size]
+                if rollout_admission_controller is None:
+                    samples.extend(rollout_backend.sample_batch(request_batch))
+                else:
+                    admission_wait_seconds += rollout_admission_controller.acquire(
+                        len(request_batch)
                     )
-                )
+                    completed = 0
+
+                    def release_completed(
+                        _index: int, _sample: SequenceSample
+                    ) -> None:
+                        nonlocal completed
+                        completed += 1
+                        rollout_admission_controller.release(1)
+
+                    try:
+                        samples.extend(
+                            sample_batch_with_callback(
+                                rollout_backend,
+                                request_batch,
+                                release_completed,
+                            )
+                        )
+                    finally:
+                        remaining = len(request_batch) - completed
+                        if remaining:
+                            rollout_admission_controller.release(remaining)
                 submission_batches += 1
+        frontier = (
+            rollout_admission_controller.snapshot()
+            if rollout_admission_controller is not None
+            else None
+        )
         _observe_stage(
             stage_observer,
             "rollout",
@@ -670,8 +774,18 @@ def estimate_conditional_weights(
             rollout_length=rollout_length,
             prefix_tokens=(len(rollout_prefixes[0]) if rollout_prefixes else 0),
             submission_batches=submission_batches,
-            submission_batch_size=rollout_submission_batch_size,
+            submission_batch_size=(
+                submission_batch_size
+                if rollout_admission_controller is not None
+                else rollout_submission_batch_size
+            ),
             candidate_overlap=False,
+            admission_wait_seconds=admission_wait_seconds,
+            frontier_capacity=(None if frontier is None else frontier.capacity),
+            frontier_peak_admitted=(
+                None if frontier is None else frontier.peak_admitted
+            ),
+            frontier_waiters=(None if frontier is None else frontier.waiters),
         )
     else:
         expected = {request.request_id for request in requests}
@@ -925,6 +1039,7 @@ class AutoregressiveStepwiseAdapter:
         rollout_sampling: SamplingConfig,
         reward: RewardFunction | None,
         reward_batch: RewardBatchFunction | None = None,
+        rollout_admission_controller: RolloutAdmissionController | None = None,
         request_namespace: str = "conditional-is",
         stage_observer: StageObserver | None = None,
     ) -> None:
@@ -936,6 +1051,7 @@ class AutoregressiveStepwiseAdapter:
         self.rollout_sampling = rollout_sampling
         self.reward = reward
         self.reward_batch = reward_batch
+        self.rollout_admission_controller = rollout_admission_controller
         self.request_namespace = request_namespace
         self.stage_observer = stage_observer
         self._step_started: dict[int, float] = {}
@@ -1035,6 +1151,7 @@ class AutoregressiveStepwiseAdapter:
             rollout_submission_batch_size=(
                 self.config.rollout_submission_batch_size
             ),
+            rollout_admission_controller=self.rollout_admission_controller,
             precomputed_rollouts=self._streamed_rollouts.pop(step_index, None),
             request_namespace=self.request_namespace,
             stage_observer=self.stage_observer,
@@ -1290,9 +1407,18 @@ def conditional_is_step(
     seeds: SeedStream,
     step_index: int,
     reward_batch: RewardBatchFunction | None = None,
+    rollout_admission_controller: RolloutAdmissionController | None = None,
     request_namespace: str = "conditional-is",
     stage_observer: StageObserver | None = None,
 ) -> ConditionalISStep:
+    if (
+        rollout_admission_controller is None
+        and config.rollout_frontier_capacity is not None
+    ):
+        rollout_admission_controller = RolloutAdmissionController(
+            capacity=config.rollout_frontier_capacity,
+            batch_size=config.rollout_frontier_batch_size,
+        )
     if config.exact_rollout_early_stop:
         return _bounded_conditional_is_step(
             base_backend=base_backend,
@@ -1318,6 +1444,7 @@ def conditional_is_step(
         rollout_sampling=rollout_sampling,
         reward=reward,
         reward_batch=reward_batch,
+        rollout_admission_controller=rollout_admission_controller,
         request_namespace=request_namespace,
         stage_observer=stage_observer,
     )
@@ -1351,6 +1478,7 @@ def run_conditional_is(
     rollout_backend: AutoregressiveBackend | None = None,
     rollout_sampling: SamplingConfig | None = None,
     reward_batch: RewardBatchFunction | None = None,
+    rollout_admission_controller: RolloutAdmissionController | None = None,
     request_namespace: str = "conditional-is",
     stage_observer: StageObserver | None = None,
 ) -> ConditionalISResult:
@@ -1363,6 +1491,14 @@ def run_conditional_is(
     _validate_rollout_sampling(rollout_sampling)
     if base_sampling.eos_token_id != rollout_sampling.eos_token_id:
         raise ValueError("candidate and rollout policies must agree on eos_token_id")
+    if (
+        rollout_admission_controller is None
+        and config.rollout_frontier_capacity is not None
+    ):
+        rollout_admission_controller = RolloutAdmissionController(
+            capacity=config.rollout_frontier_capacity,
+            batch_size=config.rollout_frontier_batch_size,
+        )
 
     if config.exact_rollout_early_stop:
         generated: TokenSequence = ()
@@ -1384,6 +1520,7 @@ def run_conditional_is(
                 seeds=seeds,
                 step_index=step_index,
                 reward_batch=reward_batch,
+                rollout_admission_controller=rollout_admission_controller,
                 request_namespace=request_namespace,
                 stage_observer=stage_observer,
             )
@@ -1407,6 +1544,7 @@ def run_conditional_is(
         rollout_sampling=rollout_sampling,
         reward=reward,
         reward_batch=reward_batch,
+        rollout_admission_controller=rollout_admission_controller,
         request_namespace=request_namespace,
         stage_observer=stage_observer,
     )

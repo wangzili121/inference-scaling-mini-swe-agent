@@ -39,6 +39,19 @@ SWE-bench 调用和已调优 general baseline 后，P0-P3 的共同结论为：
 - P0 `C15/R3` 的单位 forward-work 吞吐显著低于较小的 P1，且高扇出时
   candidate/prefill 与 rollout/decode 形状更容易相互干扰。
 
+已经完成的算法专属 A/B 也给出了两个重要的负结论：
+
+- host 侧 candidate completion streaming 相对同机 baseline 的 jobs/s 下降
+  `9.78%`，P95 从 `335.40s` 增至 `367.35s`；固定 B 的 candidate 本来就几乎
+  同时完成，candidate-to-rollout 的中位提前量只有 `5.85ms`，不足以覆盖新引入
+  的小批提交和 KV 压力。
+- 单 job rollout 分批提交相对 baseline 的 jobs/s 下降 `12.79%`，P95 增至
+  `399.17s`。这说明背压必须观察整个 engine 的 candidate/rollout 构成，不能
+  每棵树独立限流。
+- 静态 whole-job work routing 在 P1 的 work-normalized throughput 提升
+  `22.65%`，但在 P3 下降 `11.39%`。仅用请求开始前可见的 prompt/C/R/B/L
+  无法稳定预测随机 EOS 后的实际剩余工作，不能直接成为默认路由。
+
 因此，继续只调 MNS、MBT 或普通请求并发不会触及主要剩余问题。下一阶段需要
 让 runtime 显式理解 Conditional IS 的树结构。
 
@@ -112,16 +125,25 @@ kernel 与调度必须共同设计。只做 candidate completion streaming 会�
 但也可能把 sibling 拆散，损失 Forest Attention 的共享组；只等待完整 sibling
 则会增加尾延迟。因此 scheduler 的调度单位应是可调大小的 subtree bundle。
 
-第一版严格保持语义，按以下顺序 A/B：
+前两种直观方案已被真实 P0 饱和 A/B 排除：candidate streaming 和 per-job
+bounded submission 都会降低吞吐。静态 whole-job work balancing 也只在部分
+profile 生效。实验收敛与后续 scheduler 顺序据此收窄为：
 
-1. `whole-job work balancing`：根据 prompt、C/R/B/L 的 attention work 估计，
-   把完整 CIS 树分配给两个 TP2 instance；已实现，正在 NPU A/B。
-2. `candidate completion streaming`：candidate 完成后提前提交其 rollout，按
-   candidate bundle 限制 fanout；已实现，固定 seed 单元测试与基线完全一致。
-3. `bounded frontier`：限制每个 job 同时 admission 的 rollout bundle，避免
-   C x R 瞬间冲击 scheduler；已有独立 exact 原型，等待饱和负载 A/B。
-4. `barrier-critical priority`：仅在前两项 trace 证明 barrier tail 仍显著时，
-   对即将解除 reduce barrier 的最后一个 bundle 提高优先级。
+1. `global stage-aware frontier`：在同一个 engine 的所有 CIS job 之间共享 rollout
+   credit，根据全局 candidate/rollout 在途量做 admission；每次按完整 candidate
+   sibling bundle 获取 credit，完成一条释放一条。capacity `128/192/240` 已完成
+   P0 A/B，分别为 `-4.08%/+0.78%/-3.38%` work-normalized throughput；192 的
+   微小正值伴随 47 次 preemption 和更差 P95，不保留。至此 host admission 调整
+   已有三类负结果，不再继续扩网格。
+2. `in-engine branch-on-token`：candidate 生成到 B token 时，在 engine 内直接 fork
+   R 个 block-table child，避免 host 完成回调、重新 tokenize/hash/readmit 后代。
+   vLLM 的 `SamplingParams(n=R)` 在 admission 时展开为 R 个独立 EngineCoreRequest，
+   不是这种到达 branch point 后的 continuation fork。
+3. `online remaining-work routing`：路由代价由已完成 block、真实生成 token、当前
+   branch 数和剩余 barrier 数持续更新，不再只用请求开始前的静态长度估计。
+4. `barrier-critical priority`：不再作为独立 host admission 实验；只有 engine 内
+   fork 后仍观察到显著 barrier tail，才为即将解除 reduce 的最后一个 sibling
+   bundle 提高优先级。
 
 每项必须记录 candidate 完成到 child admission 的间隔、活跃 sibling 数、混合
 prefill/decode batch 比例、最后一个 rollout 的 barrier tail、jobs/s、P95 和
@@ -159,9 +181,10 @@ candidate/rollout 都重新进入普通请求生命周期：
 
 ## 7. 验收顺序
 
-1. 先完成 whole-job work balancing、streaming 和 bounded frontier 的真实 P0/P1
-   饱和 A/B，负结果也保留。
-2. 对有至少 5% jobs/s 或 P95 收益且无质量变化的原型做单独干净复验。
+1. 保留 whole-job routing、candidate streaming、per-job bounded 和 global
+   frontier 的真实负结果；停止继续微调 host admission。
+2. 实现 in-engine branch-on-token 原型，直接量化 host readmission、prefix hash 和
+   block-table fork 的开销；有至少 5% 端到端收益后再做干净复验。
 3. 实现 Forest Attention CANN microkernel；先过逐 token reference，再用真实
    branch shape 验证 attention latency，最后接 vLLM-Ascend attention backend。
 4. 只有 kernel 和 scheduler 均通过后，开发四卡单 job 的 candidate-subtree
@@ -178,6 +201,11 @@ candidate/rollout 都重新进入普通请求生命周期：
 - [PAT, ASPLOS 2026](https://arxiv.org/abs/2511.22333)：pack-forward-merge、lazy scheduling 与 multi-tile kernel。
 - [Preble](https://arxiv.org/abs/2407.00023)：prefix-aware distributed load cost。
 - [FlashTTS](https://arxiv.org/abs/2509.00195)：test-time scaling 的动态 prefix-aware scheduling。
+- [Competitive Non-Clairvoyant KV-Cache Scheduling](https://arxiv.org/abs/2601.22996)：
+  在未知输出长度下用 staggered pipeline 平滑 KV 内存增长；它启发了已经完成的
+  global frontier A/B，但真实 CIS 结果为负，不能直接照搬其结论。
+- [Regime-Aware Routing](https://arxiv.org/abs/2607.09248)：请求执行时逐步暴露行为，
+  再动态路由到不同子调度器；与本实验中 P1/P3 静态路由结论相反的现象一致。
 
 原始微基准结果保存在：
 
