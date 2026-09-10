@@ -217,6 +217,9 @@ def _screen_cis_forest_shape(
         .permute(0, 2, 1, 3)
         .contiguous()
     )
+    trunk_stream = torch.npu.Stream()
+    candidate_stream = torch.npu.Stream()
+    unique_stream = torch.npu.Stream()
 
     def baseline() -> tuple[torch.Tensor, torch.Tensor]:
         return _attention(
@@ -269,11 +272,64 @@ def _screen_cis_forest_shape(
         )
         return output, total_lse
 
+    def parallel_decomposed() -> tuple[torch.Tensor, torch.Tensor]:
+        with torch.npu.stream(trunk_stream):
+            trunk_output, trunk_lse = _attention(
+                trunk_query,
+                trunk_key,
+                trunk_value,
+                query_heads=query_heads,
+                kv_heads=kv_heads,
+            )
+        with torch.npu.stream(candidate_stream):
+            middle_output, middle_lse = _attention(
+                candidate_query,
+                candidate_key,
+                candidate_value,
+                query_heads=query_heads,
+                kv_heads=kv_heads,
+            )
+        with torch.npu.stream(unique_stream):
+            unique_output, unique_lse = _attention(
+                query,
+                unique_key,
+                unique_value,
+                query_heads=query_heads,
+                kv_heads=kv_heads,
+            )
+        current_stream = torch.npu.current_stream()
+        current_stream.wait_stream(trunk_stream)
+        current_stream.wait_stream(candidate_stream)
+        current_stream.wait_stream(unique_stream)
+        trunk_output = trunk_output.squeeze(0).permute(1, 0, 2).unsqueeze(2)
+        trunk_lse = trunk_lse.squeeze(0).permute(1, 0, 2).unsqueeze(2)
+        middle_output = (
+            middle_output.permute(0, 2, 1, 3)
+            .reshape(branches, query_heads, 1, head_dim)
+        )
+        middle_lse = (
+            middle_lse.permute(0, 2, 1, 3)
+            .reshape(branches, query_heads, 1, -1)
+        )
+        total_lse = torch.logaddexp(
+            torch.logaddexp(trunk_lse, middle_lse), unique_lse
+        )
+        output = (
+            torch.exp(trunk_lse - total_lse).to(dtype) * trunk_output
+            + torch.exp(middle_lse - total_lse).to(dtype) * middle_output
+            + torch.exp(unique_lse - total_lse).to(dtype) * unique_output
+        )
+        return output, total_lse
+
     baseline_output, baseline_lse = baseline()
     shared_output, shared_lse = decomposed()
+    parallel_output, parallel_lse = parallel_decomposed()
     _synchronize()
     baseline_latency = _measure(baseline, warmup=warmup, iterations=iterations)
     shared_latency = _measure(decomposed, warmup=warmup, iterations=iterations)
+    parallel_latency = _measure(
+        parallel_decomposed, warmup=warmup, iterations=iterations
+    )
     baseline_kv_tokens = branches * (
         trunk_tokens + candidate_tokens + unique_tokens
     )
@@ -291,13 +347,23 @@ def _screen_cis_forest_shape(
         "unique_tokens": unique_tokens,
         "baseline": baseline_latency,
         "cis_forest": shared_latency,
+        "cis_forest_parallel": parallel_latency,
         "p50_speedup": baseline_latency["p50_ms"] / shared_latency["p50_ms"],
+        "parallel_p50_speedup": (
+            baseline_latency["p50_ms"] / parallel_latency["p50_ms"]
+        ),
         "ideal_kv_read_reduction": baseline_kv_tokens / shared_kv_tokens,
         "maximum_output_error": float(
             (baseline_output.float() - shared_output.float()).abs().max().cpu()
         ),
         "maximum_lse_error": float(
             (baseline_lse.float() - shared_lse.float()).abs().max().cpu()
+        ),
+        "parallel_maximum_output_error": float(
+            (baseline_output.float() - parallel_output.float()).abs().max().cpu()
+        ),
+        "parallel_maximum_lse_error": float(
+            (baseline_lse.float() - parallel_lse.float()).abs().max().cpu()
         ),
     }
 
