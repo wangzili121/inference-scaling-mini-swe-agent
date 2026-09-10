@@ -18,6 +18,10 @@ candidate_count = 4
 rollout_count = 2
 block_size = 128
 reward_temperature = 1.0
+rollout_submission_batch_size = 0
+stream_candidate_rollouts = false
+rollout_stream_candidate_batch_size = 5
+rollout_stream_max_batches = 2
 
 [reward]
 kind = "sequence_log_probability"

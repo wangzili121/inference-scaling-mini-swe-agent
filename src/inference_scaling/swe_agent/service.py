@@ -255,7 +255,7 @@ class ConditionalISRunner:
             reward_temperature=float(conditional.get("reward_temperature", 1.0)),
             rollout_submission_batch_size=(
                 None
-                if conditional.get("rollout_submission_batch_size") is None
+                if conditional.get("rollout_submission_batch_size") in (None, 0)
                 else int(conditional["rollout_submission_batch_size"])
             ),
             stream_candidate_rollouts=bool(
