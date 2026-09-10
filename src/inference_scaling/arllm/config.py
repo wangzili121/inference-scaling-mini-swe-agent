@@ -105,6 +105,7 @@ class ConditionalISConfig:
     rollout_stream_max_batches: int = 2
     rollout_frontier_capacity: int | None = None
     rollout_frontier_batch_size: int = 15
+    active_step_limit: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("candidate_count", "rollout_count", "block_size", "total_length"):
@@ -156,6 +157,8 @@ class ConditionalISConfig:
             "rollout_frontier_batch_size",
             self.rollout_frontier_batch_size,
         )
+        if self.active_step_limit is not None:
+            require_positive("active_step_limit", self.active_step_limit)
         if (
             self.rollout_frontier_capacity is not None
             and self.rollout_frontier_batch_size > self.rollout_frontier_capacity

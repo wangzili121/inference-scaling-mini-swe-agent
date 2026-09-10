@@ -24,6 +24,7 @@ rollout_stream_candidate_batch_size = 5
 rollout_stream_max_batches = 2
 rollout_frontier_capacity = 0
 rollout_frontier_batch_size = 15
+active_step_limit = 0
 
 [reward]
 kind = "sequence_log_probability"
@@ -51,6 +52,7 @@ max_model_len = 32768
 max_num_seqs = 128
 max_num_batched_tokens = 32768
 enable_prefix_caching = true
+request_priority_policy = "none"
 
 [vllm.engine_kwargs]
 enable_chunked_prefill = true

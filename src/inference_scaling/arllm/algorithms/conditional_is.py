@@ -122,6 +122,31 @@ class RolloutAdmissionController:
             )
 
 
+class StepAdmissionController:
+    """Bound complete candidate-to-reduce steps across concurrent jobs."""
+
+    def __init__(self, limit: int) -> None:
+        if limit <= 0:
+            raise ValueError("active step limit must be positive")
+        self.limit = int(limit)
+        self._condition = Condition()
+        self._active = 0
+
+    def acquire(self) -> float:
+        started = perf_counter()
+        with self._condition:
+            self._condition.wait_for(lambda: self._active < self.limit)
+            self._active += 1
+        return perf_counter() - started
+
+    def release(self) -> None:
+        with self._condition:
+            if self._active <= 0:
+                raise RuntimeError("step admission released without acquisition")
+            self._active -= 1
+            self._condition.notify()
+
+
 @lru_cache(maxsize=1)
 def _record_function_factory() -> Any | None:
     try:
@@ -1040,6 +1065,7 @@ class AutoregressiveStepwiseAdapter:
         reward: RewardFunction | None,
         reward_batch: RewardBatchFunction | None = None,
         rollout_admission_controller: RolloutAdmissionController | None = None,
+        step_admission_controller: StepAdmissionController | None = None,
         request_namespace: str = "conditional-is",
         stage_observer: StageObserver | None = None,
     ) -> None:
@@ -1052,9 +1078,11 @@ class AutoregressiveStepwiseAdapter:
         self.reward = reward
         self.reward_batch = reward_batch
         self.rollout_admission_controller = rollout_admission_controller
+        self.step_admission_controller = step_admission_controller
         self.request_namespace = request_namespace
         self.stage_observer = stage_observer
         self._step_started: dict[int, float] = {}
+        self._admitted_steps: set[int] = set()
         self._streamed_rollouts: dict[int, _StreamedRollouts] = {}
         self._statistics_by_state: dict[TokenSequence, GeneratedSequenceStatistics] = {
             (): GeneratedSequenceStatistics()
@@ -1076,49 +1104,79 @@ class AutoregressiveStepwiseAdapter:
         step_index: int,
         seeds: SeedStream,
     ) -> Sequence[SequenceSample]:
+        admission_started = perf_counter()
+        if self.step_admission_controller is not None:
+            wait_seconds = self.step_admission_controller.acquire()
+            self._admitted_steps.add(step_index)
+            _observe_stage(
+                self.stage_observer,
+                "step_admission_wait",
+                step_index,
+                admission_started,
+                wait_seconds=wait_seconds,
+                active_step_limit=self.step_admission_controller.limit,
+            )
         self._step_started[step_index] = perf_counter()
-        _validate_base_sampling(self.base_sampling)
-        remaining = self.config.total_length - len(state)
-        if remaining <= 0:
-            raise ValueError("generated prefix has already reached total_length")
-        if self.config.stream_candidate_rollouts:
-            proposals, streamed = _sample_candidates_with_streamed_rollouts(
-                base_backend=self.base_backend,
-                rollout_backend=self.rollout_backend,
-                prompt=self.prompt,
-                generated_prefix=state,
-                candidate_count=self.config.candidate_count,
-                candidate_length=min(self.config.block_size, remaining),
-                remaining_length=remaining,
-                rollout_count=self.config.rollout_count,
-                base_sampling=self.base_sampling,
-                rollout_sampling=self.rollout_sampling,
-                seeds=seeds,
-                step_index=step_index,
-                candidate_batch_size=(
-                    self.config.rollout_stream_candidate_batch_size
-                ),
-                max_active_batches=self.config.rollout_stream_max_batches,
+        try:
+            _validate_base_sampling(self.base_sampling)
+            remaining = self.config.total_length - len(state)
+            if remaining <= 0:
+                raise ValueError("generated prefix has already reached total_length")
+            if self.config.stream_candidate_rollouts:
+                proposals, streamed = _sample_candidates_with_streamed_rollouts(
+                    base_backend=self.base_backend,
+                    rollout_backend=self.rollout_backend,
+                    prompt=self.prompt,
+                    generated_prefix=state,
+                    candidate_count=self.config.candidate_count,
+                    candidate_length=min(self.config.block_size, remaining),
+                    remaining_length=remaining,
+                    rollout_count=self.config.rollout_count,
+                    base_sampling=self.base_sampling,
+                    rollout_sampling=self.rollout_sampling,
+                    seeds=seeds,
+                    step_index=step_index,
+                    candidate_batch_size=(
+                        self.config.rollout_stream_candidate_batch_size
+                    ),
+                    max_active_batches=self.config.rollout_stream_max_batches,
+                    confidence_top_k=getattr(
+                        self.reward, "generation_confidence_top_k", None
+                    ),
+                    request_namespace=self.request_namespace,
+                    stage_observer=self.stage_observer,
+                )
+                self._streamed_rollouts[step_index] = streamed
+                return proposals
+            return _sample_candidates(
+                self.base_backend,
+                self.prompt + state,
+                self.config.candidate_count,
+                min(self.config.block_size, remaining),
+                self.base_sampling,
+                seeds,
+                step_index,
                 confidence_top_k=getattr(
                     self.reward, "generation_confidence_top_k", None
                 ),
                 request_namespace=self.request_namespace,
                 stage_observer=self.stage_observer,
             )
-            self._streamed_rollouts[step_index] = streamed
-            return proposals
-        return _sample_candidates(
-            self.base_backend,
-            self.prompt + state,
-            self.config.candidate_count,
-            min(self.config.block_size, remaining),
-            self.base_sampling,
-            seeds,
-            step_index,
-            confidence_top_k=getattr(self.reward, "generation_confidence_top_k", None),
-            request_namespace=self.request_namespace,
-            stage_observer=self.stage_observer,
-        )
+        except BaseException:
+            self._release_step(step_index)
+            raise
+
+    def _release_step(self, step_index: int) -> None:
+        if step_index in self._admitted_steps:
+            self._admitted_steps.remove(step_index)
+            assert self.step_admission_controller is not None
+            self.step_admission_controller.release()
+
+    def release_pending_steps(self) -> None:
+        """Release admissions left behind when a step aborts outside the adapter."""
+
+        for step_index in tuple(self._admitted_steps):
+            self._release_step(step_index)
 
     def evaluate(
         self,
@@ -1129,33 +1187,37 @@ class AutoregressiveStepwiseAdapter:
     ) -> Sequence[StepwiseCandidate[ConditionalCandidate]]:
         remaining = self.config.total_length - len(state)
         candidate_length = len(proposals[0].token_ids)
-        evaluated = estimate_conditional_weights(
-            base_backend=self.base_backend,
-            rollout_backend=self.rollout_backend,
-            prompt=self.prompt,
-            generated_prefix=state,
-            candidates=proposals,
-            rollout_length=max(0, remaining - candidate_length),
-            rollout_count=self.config.rollout_count,
-            base_sampling=self.base_sampling,
-            rollout_sampling=self.rollout_sampling,
-            reward_temperature=self.config.reward_temperature,
-            importance_log_ratio_clip=self.config.importance_log_ratio_clip,
-            apply_importance_correction=self.config.apply_importance_correction,
-            reward=self.reward,
-            seeds=seeds,
-            step_index=step_index,
-            reward_batch=self.reward_batch,
-            rollout_design=self.config.rollout_design,
-            generated_prefix_statistics=self._statistics_by_state.get(state),
-            rollout_submission_batch_size=(
-                self.config.rollout_submission_batch_size
-            ),
-            rollout_admission_controller=self.rollout_admission_controller,
-            precomputed_rollouts=self._streamed_rollouts.pop(step_index, None),
-            request_namespace=self.request_namespace,
-            stage_observer=self.stage_observer,
-        )
+        try:
+            evaluated = estimate_conditional_weights(
+                base_backend=self.base_backend,
+                rollout_backend=self.rollout_backend,
+                prompt=self.prompt,
+                generated_prefix=state,
+                candidates=proposals,
+                rollout_length=max(0, remaining - candidate_length),
+                rollout_count=self.config.rollout_count,
+                base_sampling=self.base_sampling,
+                rollout_sampling=self.rollout_sampling,
+                reward_temperature=self.config.reward_temperature,
+                importance_log_ratio_clip=self.config.importance_log_ratio_clip,
+                apply_importance_correction=self.config.apply_importance_correction,
+                reward=self.reward,
+                seeds=seeds,
+                step_index=step_index,
+                reward_batch=self.reward_batch,
+                rollout_design=self.config.rollout_design,
+                generated_prefix_statistics=self._statistics_by_state.get(state),
+                rollout_submission_batch_size=(
+                    self.config.rollout_submission_batch_size
+                ),
+                rollout_admission_controller=self.rollout_admission_controller,
+                precomputed_rollouts=self._streamed_rollouts.pop(step_index, None),
+                request_namespace=self.request_namespace,
+                stage_observer=self.stage_observer,
+            )
+        except BaseException:
+            self._release_step(step_index)
+            raise
         return tuple(
             StepwiseCandidate(candidate, candidate.log_weight)
             for candidate in evaluated
@@ -1199,6 +1261,7 @@ class AutoregressiveStepwiseAdapter:
                 generated_tokens_before=len(state),
                 generated_tokens_after=len(generated),
             )
+        self._release_step(step_index)
         return generated
 
 
@@ -1408,6 +1471,7 @@ def conditional_is_step(
     step_index: int,
     reward_batch: RewardBatchFunction | None = None,
     rollout_admission_controller: RolloutAdmissionController | None = None,
+    step_admission_controller: StepAdmissionController | None = None,
     request_namespace: str = "conditional-is",
     stage_observer: StageObserver | None = None,
 ) -> ConditionalISStep:
@@ -1445,16 +1509,20 @@ def conditional_is_step(
         reward=reward,
         reward_batch=reward_batch,
         rollout_admission_controller=rollout_admission_controller,
+        step_admission_controller=step_admission_controller,
         request_namespace=request_namespace,
         stage_observer=stage_observer,
     )
-    selection = stepwise_generation_step(
-        adapter,
-        generated_prefix,
-        step_index,
-        seeds,
-        selection_namespace=("conditional_is",),
-    )
+    try:
+        selection = stepwise_generation_step(
+            adapter,
+            generated_prefix,
+            step_index,
+            seeds,
+            selection_namespace=("conditional_is",),
+        )
+    finally:
+        adapter.release_pending_steps()
     evaluated_candidates = tuple(candidate.value for candidate in selection.candidates)
     performed = sum(len(candidate.rollouts) for candidate in evaluated_candidates)
     return ConditionalISStep(
@@ -1479,6 +1547,7 @@ def run_conditional_is(
     rollout_sampling: SamplingConfig | None = None,
     reward_batch: RewardBatchFunction | None = None,
     rollout_admission_controller: RolloutAdmissionController | None = None,
+    step_admission_controller: StepAdmissionController | None = None,
     request_namespace: str = "conditional-is",
     stage_observer: StageObserver | None = None,
 ) -> ConditionalISResult:
@@ -1521,6 +1590,7 @@ def run_conditional_is(
                 step_index=step_index,
                 reward_batch=reward_batch,
                 rollout_admission_controller=rollout_admission_controller,
+                step_admission_controller=step_admission_controller,
                 request_namespace=request_namespace,
                 stage_observer=stage_observer,
             )
@@ -1545,14 +1615,18 @@ def run_conditional_is(
         reward=reward,
         reward_batch=reward_batch,
         rollout_admission_controller=rollout_admission_controller,
+        step_admission_controller=step_admission_controller,
         request_namespace=request_namespace,
         stage_observer=stage_observer,
     )
-    generic = run_stepwise_generation(
-        adapter,
-        seeds,
-        selection_namespace=("conditional_is",),
-    )
+    try:
+        generic = run_stepwise_generation(
+            adapter,
+            seeds,
+            selection_namespace=("conditional_is",),
+        )
+    finally:
+        adapter.release_pending_steps()
     steps: list[ConditionalISStep] = []
     for step in generic.steps:
         candidates = tuple(candidate.value for candidate in step.candidates)

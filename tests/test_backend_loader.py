@@ -68,6 +68,7 @@ def test_loader_builds_one_active_batch_schedule_for_both_backends(monkeypatch) 
     assert schedule.stochastic_tree is True
 
     config["runtime"]["backend"] = "vllm"
+    config["vllm"] = {"request_priority_policy": "rollout_first"}
     vllm_calls = []
     monkeypatch.setattr(
         loader.AsyncVLLMBackend,
@@ -77,6 +78,7 @@ def test_loader_builds_one_active_batch_schedule_for_both_backends(monkeypatch) 
     assert loader.load_backend_from_config("base-model", config) == "vllm"
     assert vllm_calls[0][1]["speculation"] == schedule
     assert vllm_calls[0][1]["dynamic_speculation"] is False
+    assert vllm_calls[0][1]["request_priority_policy"] == "rollout_first"
 
 
 def test_vllm_dynamic_speculation_is_opt_in() -> None:

@@ -36,6 +36,7 @@ _VLLM_SETTINGS = {
     "parameter_count",
     "pipeline_parallel_size",
     "quantization",
+    "request_priority_policy",
     "revision",
     "seed",
     "tensor_parallel_size",
@@ -270,11 +271,16 @@ def load_backend_from_config(
     )
     loader = AsyncVLLMBackend if asynchronous else VLLMBackend
     acceleration_kwargs: dict[str, Any] = {}
+    request_priority_policy = str(settings.pop("request_priority_policy", "none"))
+    if request_priority_policy != "none":
+        if not asynchronous:
+            raise ValueError("request_priority_policy requires runtime.backend='vllm'")
+        acceleration_kwargs["request_priority_policy"] = request_priority_policy
     if speculation is not None:
-        acceleration_kwargs = {
-            "speculation": speculation,
-            "dynamic_speculation": dynamic_vllm_speculation,
-        }
+        acceleration_kwargs.update(
+            speculation=speculation,
+            dynamic_speculation=dynamic_vllm_speculation,
+        )
     if not asynchronous:
         acceleration_kwargs["enable_mh_fused_logprobs"] = mh_fused_logprobs
     try:

@@ -603,3 +603,29 @@ def test_async_vllm_emits_algorithm_request_lifecycle() -> None:
     ]
     assert {event["engine_request_id"] for event in events} == {request.request_id}
     assert events[-1]["output_tokens"] == 1
+
+
+def test_async_vllm_assigns_step_and_rollout_priorities() -> None:
+    backend = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        request_priority_policy="rollout_first",
+    )
+    try:
+        first = GenerationRequest(
+            (1,), 1, SamplingConfig(), 1, "job-a:step:0:candidate:0"
+        )
+        child = GenerationRequest(
+            (1,), 1, SamplingConfig(), 2, "job-a:step:0:candidate:0:rollout:0"
+        )
+        later = GenerationRequest(
+            (1,), 1, SamplingConfig(), 3, "job-b:step:0:candidate:0"
+        )
+        assert backend._request_priority(first) == 0
+        assert backend._request_priority(child) == -1_000_000
+        assert backend._request_priority(later) == 1
+    finally:
+        backend.close()

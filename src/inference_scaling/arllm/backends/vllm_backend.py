@@ -20,6 +20,7 @@ import importlib.metadata
 import inspect
 import itertools
 import os
+import re
 import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -75,6 +76,11 @@ _PROTECTED_ENGINE_KWARGS = frozenset(
 
 _MH_FUSED_WORKER = (
     "inference_scaling.arllm.backends.vllm_mh_worker.MHFusedLogprobWorker"
+)
+
+_CIS_STEP_REQUEST = re.compile(
+    r"^(?P<job>.*):step:(?P<step>\d+):candidate:(?P<candidate>\d+)"
+    r"(?::rollout:(?P<rollout>\d+))?$"
 )
 
 
@@ -1347,6 +1353,7 @@ class AsyncVLLMBackend(VLLMBackend):
         draft_tree: RolloutTokenTree | None = None,
         speculation: ActiveBatchSpeculationConfig | None = None,
         native_suffix_speculation: bool = False,
+        request_priority_policy: str = "none",
     ) -> None:
         if (engine is None) == (engine_factory is None):
             raise ValueError("provide exactly one of engine or engine_factory")
@@ -1370,6 +1377,12 @@ class AsyncVLLMBackend(VLLMBackend):
             native_suffix_speculation=native_suffix_speculation,
         )
         self._request_trace_observer: Callable[[Mapping[str, Any]], None] | None = None
+        if request_priority_policy not in {"none", "step_fifo", "rollout_first"}:
+            raise ValueError("unknown CIS request priority policy")
+        self._request_priority_policy = request_priority_policy
+        self._step_priority_lock = threading.Lock()
+        self._step_priorities: dict[str, int] = {}
+        self._next_step_priority = itertools.count()
 
     def set_request_trace_observer(
         self,
@@ -1383,6 +1396,25 @@ class AsyncVLLMBackend(VLLMBackend):
         observer = self._request_trace_observer
         if observer is not None:
             observer(event)
+
+    def _request_priority(self, request: GenerationRequest | None) -> int:
+        if request is None or self._request_priority_policy == "none":
+            return 0
+        match = _CIS_STEP_REQUEST.match(request.request_id)
+        if match is None:
+            return 0
+        step_key = f"{match.group('job')}:step:{match.group('step')}"
+        with self._step_priority_lock:
+            priority = self._step_priorities.get(step_key)
+            if priority is None:
+                priority = next(self._next_step_priority)
+                self._step_priorities[step_key] = priority
+        if (
+            self._request_priority_policy == "rollout_first"
+            and match.group("rollout") is not None
+        ):
+            return priority - 1_000_000
+        return priority
 
     @classmethod
     def from_pretrained(
@@ -1413,6 +1445,7 @@ class AsyncVLLMBackend(VLLMBackend):
         speculation: ActiveBatchSpeculationConfig | None = None,
         dynamic_speculation: bool = False,
         engine_kwargs: dict[str, Any] | None = None,
+        request_priority_policy: str = "none",
     ) -> "AsyncVLLMBackend":
         try:
             from transformers import AutoTokenizer
@@ -1468,6 +1501,8 @@ class AsyncVLLMBackend(VLLMBackend):
             kwargs["speculative_config"] = speculation.vllm_suffix_config(
                 dynamic=dynamic_speculation
             )
+        if request_priority_policy != "none":
+            kwargs["scheduling_policy"] = "priority"
         if engine_kwargs:
             if speculation is not None and "speculative_config" in engine_kwargs:
                 raise ValueError(
@@ -1516,6 +1551,7 @@ class AsyncVLLMBackend(VLLMBackend):
             draft_tree=draft_tree,
             speculation=speculation,
             native_suffix_speculation=speculation is not None,
+            request_priority_policy=request_priority_policy,
         )
 
     def _next_request_id(self) -> str:
@@ -1583,10 +1619,12 @@ class AsyncVLLMBackend(VLLMBackend):
         engine_request_id = (
             request.request_id if request is not None else self._next_request_id()
         )
+        priority = self._request_priority(request)
         kwargs = {
             "prompt": prompt,
             "sampling_params": params,
             "request_id": engine_request_id,
+            "priority": priority,
         }
         if self._lora_request is not None:
             kwargs["lora_request"] = self._lora_request
@@ -1600,6 +1638,7 @@ class AsyncVLLMBackend(VLLMBackend):
             "prefix_tokens": None if request is None else len(request.prefix),
             "max_new_tokens": None if request is None else request.max_new_tokens,
             "seed": None if request is None else request.seed,
+            "priority": priority,
         }
         self._observe_request(
             {

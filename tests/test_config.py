@@ -34,6 +34,7 @@ def test_policy_id_preserves_distinct_float_values() -> None:
         lambda: SamplingConfig(temperature=float("nan")),
         lambda: SamplingConfig(top_p=float("inf")),
         lambda: ConditionalISConfig(reward_temperature=float("inf")),
+        lambda: ConditionalISConfig(active_step_limit=0),
         lambda: ConditionalISConfig(rollout_design="unknown"),
         lambda: ConditionalISConfig(exact_rollout_early_stop=True),
         lambda: ConditionalISConfig(

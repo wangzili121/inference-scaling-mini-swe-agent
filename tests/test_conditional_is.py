@@ -8,6 +8,7 @@ import pytest
 
 from inference_scaling.arllm.algorithms.conditional_is import (
     RolloutAdmissionController,
+    StepAdmissionController,
     conditional_is_step,
     run_conditional_is,
 )
@@ -36,6 +37,29 @@ def _backend() -> TabularAutoregressiveBackend:
 
 def _reward(_prompt, generated) -> float:
     return 1.0 if tuple(generated) == (1, 1) else 0.0
+
+
+def test_step_admission_controller_bounds_complete_steps() -> None:
+    controller = StepAdmissionController(1)
+    entered = Event()
+    release = Event()
+
+    def hold() -> None:
+        controller.acquire()
+        entered.set()
+        release.wait()
+        controller.release()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(hold)
+        assert entered.wait(timeout=1)
+        second = executor.submit(controller.acquire)
+        sleep(0.02)
+        assert not second.done()
+        release.set()
+        first.result(timeout=1)
+        assert second.result(timeout=1) > 0
+        controller.release()
 
 
 def _exact_first_token_target() -> dict[int, float]:

@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from inference_scaling.arllm.algorithms import (
     RolloutAdmissionController,
+    StepAdmissionController,
     run_conditional_is,
 )
 from inference_scaling.arllm.backends import close_backend, load_backend_from_config
@@ -283,6 +284,11 @@ class ConditionalISRunner:
             rollout_frontier_batch_size=int(
                 conditional.get("rollout_frontier_batch_size", 15)
             ),
+            active_step_limit=(
+                None
+                if conditional.get("active_step_limit") in (None, 0)
+                else int(conditional["active_step_limit"])
+            ),
         )
         self.rollout_admission_controller = (
             None
@@ -291,6 +297,11 @@ class ConditionalISRunner:
                 capacity=self.conditional.rollout_frontier_capacity,
                 batch_size=self.conditional.rollout_frontier_batch_size,
             )
+        )
+        self.step_admission_controller = (
+            None
+            if self.conditional.active_step_limit is None
+            else StepAdmissionController(self.conditional.active_step_limit)
         )
         reward_kind = str(reward.get("kind", "sequence_log_probability"))
         if reward_kind == "sequence_log_probability":
@@ -607,6 +618,7 @@ class ConditionalISRunner:
             rollout_backend=self.backend,
             rollout_sampling=self.sampling,
             rollout_admission_controller=self.rollout_admission_controller,
+            step_admission_controller=self.step_admission_controller,
             request_namespace=request_namespace,
             stage_observer=observe_stage,
         )

@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
   echo "usage: $0 VARIANT DEVICES OUTPUT PORT CONTAINER" >&2
-  echo "VARIANT: baseline | streaming | bounded | frontier-CAPACITY-BATCH" >&2
+  echo "VARIANT: baseline | step-gang-6 | step-elastic | streaming | bounded | frontier-CAPACITY-BATCH" >&2
   exit 2
 fi
 
@@ -20,6 +20,8 @@ public_workload=${CIS_PUBLIC_WORKLOAD_DIR:-/data/disk/wangzili/cis-artifacts-fc1
 self_workload=${CIS_SELF_WORKLOAD_DIR:-/data/disk/wangzili/cis-artifacts-629451f/workloads/self-128}
 categorical=${CIS_CATEGORICAL_DIR:-/data/disk/wangzili/vllm-categorical-runtime}
 cache=${CIS_VLLM_CACHE:-/data/disk/wangzili/vllm-cache-v018-cis-forest}
+limit=${CIS_LIMIT:-64}
+workers=${CIS_WORKERS:-32}
 
 for path in "$workspace" "$model" "$public_workload" "$self_workload" "$categorical"; do
   [[ -e "$path" ]] || { echo "missing dependency: $path" >&2; exit 1; }
@@ -29,6 +31,17 @@ done
 case "$variant" in
   baseline)
     variant_args=()
+    ;;
+  step-gang-6)
+    variant_args=(
+      --set conditional_is.active_step_limit=6
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+    )
+    ;;
+  step-elastic)
+    variant_args=(
+      --set 'vllm.request_priority_policy=\"rollout_first\"'
+    )
     ;;
   streaming)
     variant_args=(
@@ -124,7 +137,7 @@ docker run -d \
       --tensor-parallel-size 2 \
       --pipeline-parallel-size 1 \
       --profiler none \
-      --limit 64 \
+      --limit $limit \
       --categorical-root /categorical \
       --set generation.max_new_tokens=512 \
       --set vllm.max_model_len=65536 \
@@ -141,7 +154,7 @@ docker run -d \
       --devices $logical_devices \
       --port $port \
       --routing round_robin \
-      --workers 32 \
+      --workers $workers \
       --candidate-count 15 \
       --rollout-count 3 \
       --block-size 128 \
