@@ -128,7 +128,7 @@ least-outstanding 未带来收益，反而使 jobs/s 降低约 14.8%。四卡 ge
 
 正确挂载后的两卡 P0 native 无 profiler 基线使用 64 个独立请求、32 workers：成功率 100%，无 preemption，`0.156288 jobs/s`，P95 `313.91s`，forward token slots/s 为 `3706.84`。两个 TP rank 均出现 native sampler 激活标记。对应原始目录为 `/data/disk/wangzili/cis-artifacts-f655118/validation/native-p0-none`。
 
-为排除启用 native sampler 后 MNS 最优点迁移，又只补测了相邻的 `MNS=384`，其余配置和 64 个请求保持不变。结果为 `0.138898 jobs/s`、P95 `331.32s`，成功率 100%；相对 `MNS=256` 吞吐下降 `11.13%`、P95 上升 `5.54%`。因此不再扩展 MNS，正式 profiling 锁定 `TP2、MNS=256、MBT=32768、memory=0.90、partial-prefill=(1,1)、workers=32`。原始目录为 `/data/disk/wangzili/cis-artifacts-53a19cf/validation/native-mns384-p0-none`。
+为排除启用 native sampler 后 MNS 最优点迁移，又只补测了相邻的 `MNS=384`，其余配置和 64 个请求保持不变。结果为 `0.138898 jobs/s`、P95 `331.32s`，成功率 100%，但出现 36 次 KV preemption；相对 `MNS=256` 吞吐下降 `11.13%`、P95 上升 `5.54%`。因此不再扩展 MNS，正式 profiling 锁定 `TP2、MNS=256、MBT=32768、memory=0.90、partial-prefill=(1,1)、workers=32`。原始目录为 `/data/disk/wangzili/cis-artifacts-53a19cf/validation/native-mns384-p0-none`。
 
 相同环境关闭 native 后，stock 对照为 `0.151602 jobs/s`、P95 `337.42s`，同样 100% 成功且无 preemption。native 的 jobs/s 高 `3.09%`，P95 低 `6.97%`。两种 sampler 采样分布相同但随机流不 bit-exact，导致 candidate 长度、APC 和总 forward work 不同，因此这组 SWE workload 只证明正确 native 路径没有端到端回退，不能把全部差异都归因给 sampler kernel；sampler 的直接收益仍以既有同卡正反序两组 A/B 的几何平均 `1.115x` 为主要证据。stock 原始目录为 `/data/disk/wangzili/cis-artifacts-f655118/validation/stock-p0-none`。
 
@@ -138,7 +138,7 @@ Service Profiler 的原始 SQLite 数据和 `batch.csv`、`kvcache.csv` 均可�
 
 ## Native P0 正式 Profiling
 
-正式 P0 固定 `C15/R3/B128/L512`、sequence-logprob、64 个独立请求；两卡为 `TP2 + workers=32`，四卡为 `2xTP2 + round-robin + workers=64`。所有 pass 均为 100% 成功、零 OOM、零 KV preemption，且每个实例的两个 TP rank 都出现 native sampler 激活标记。
+正式 P0 固定 `C15/R3/B128/L512`、sequence-logprob、64 个独立请求；两卡为 `TP2 + workers=32`，四卡为 `2xTP2 + round-robin + workers=64`。所有 pass 均为 100% 成功、零 OOM，且每个实例的两个 TP rank 都出现 native sampler 激活标记。无 profiler 基线和四卡两个 profiler pass 均为零 KV preemption；两卡 Service/Torch pass 在 profiler 扰动下分别观察到 35/5 次 preemption，因此只用于瓶颈归因。
 
 | 部署 | pass | jobs/s | P95 (s) | APC hit | NPU busy 中位数 | 暴露 HCCL/窗口 | 统一时间线事件 |
 |---|---|---:|---:|---:|---:|---:|---:|
@@ -187,6 +187,55 @@ P1 固定 `C8/R3/B128/L512` 和 sequence-logprob。其单个 CIS job 比 P0 轻�
 - P1 四卡 none/Service/Torch：`/data/disk/wangzili/cis-artifacts-e1396a6/profiles/four-card/p1/`
 
 Torch 两卡每个 rank 的原始 `trace_view.json` 约 2.05 GB，并各自保留 `analysis.db`、`kernel_details.csv` 和 `operator_details.csv`。Service exporter 仍受已记录的 request-id 列表转换问题影响，不生成厂商 `chrome_tracing.json`，但原始数据库、batch/KV CSV 和项目统一时间线完整。
+
+## Native P2 正式 Profiling
+
+P2 固定 `C4/R2/B128/L512` 和 sequence-logprob。两卡使用 32 workers，四卡使用 64 workers。无 profiler pass 均为 100% 成功、零 OOM、零 KV preemption：
+
+| 部署 | pass | jobs/s | P95 (s) | APC hit | NPU busy 中位数 | 暴露 HCCL/窗口 |
+|---|---|---:|---:|---:|---:|---:|
+| 两卡 TP2 | none | 0.405948 | 136.31 | - | - | - |
+| 两卡 TP2 | Service | 0.378150 | 144.40 | 89.34% | - | - |
+| 两卡 TP2 | Torch | 0.329767 | 167.35 | 88.64% | 95.88% | 18.10% |
+| 四卡 2xTP2 | none | 0.538301 | 98.22 | - | - | - |
+| 四卡 2xTP2 | Service | 0.644522 | 82.74 | 90.59% | - | - |
+| 四卡 2xTP2 | Torch | 0.642923 | 81.02 | 90.01% | 98.43% | 23.49% |
+
+P2 四卡 none 相对两卡 none 的 jobs/s 为 `1.33x`，forward-token-slots/s 也为 `1.31x`。Torch 两卡受 profiler 扰动出现 5 次 preemption，不用于性能结论。P2 的 candidate 占比在两卡/四卡 Torch 中为 `65.68%/84.30%`，rollout 为 `34.32%/15.70%`；四卡 endpoint mean latency skew 为 `16.92%`。即使低预算配置已把设备喂到 98%，通信暴露和 instance skew 仍然存在。
+
+原始目录：
+
+- 两卡 none：`/data/disk/wangzili/cis-artifacts-5e895a9/validation/p2-w32-none`
+- 两卡 Service/Torch：`/data/disk/wangzili/cis-artifacts-5e895a9/profiles/two-card/p2/`
+- 四卡三 pass：`/data/disk/wangzili/cis-artifacts-5e895a9-first/profiles/four-card/p2/`
+
+## Native P3 正式 Profiling
+
+P3 与 P0 使用相同 `C15/R3/B128/L512`，只把 reward 切换为 Consilience。generation-time top-5 statistics 已启用，全部 pass 的 `score_calls=0`，因此该对照不包含重复 scoring forward。
+
+| 部署 | pass | jobs/s | P95 (s) | APC hit | NPU busy 中位数 | 暴露 HCCL/窗口 |
+|---|---|---:|---:|---:|---:|---:|
+| 两卡 TP2 | none | 0.160988 | 344.65 | - | - | - |
+| 两卡 TP2 | Service | 0.146586 | 344.66 | 96.06% | - | - |
+| 两卡 TP2 | Torch | 0.152845 | 337.07 | 96.10% | 87.17% | 14.23% |
+| 四卡 2xTP2 | none | 0.363746 | 167.18 | - | - | - |
+| 四卡 2xTP2 | Service | 0.271396 | 198.30 | 97.37% | - | - |
+| 四卡 2xTP2 | Torch | 0.348749 | 176.90 | 96.97% | 82.41% | 13.99% |
+
+P3 四卡 none 的表观 jobs/s 扩展为 `2.26x`，但 forward-token-slots/s 只扩展 `1.48x`；不能把不同随机生成工作量带来的表观差异算作部署收益。两卡 candidate/rollout 接近 `49.07%/50.92%`，四卡变为 `63.30%/36.69%`。最新四卡 Torch 在严格 32/32 job 分配下仍有 `30.19%` endpoint mean latency skew，四个 rank 的 NPU busy 为 `75.13%-86.58%`，而 reward、weight、resample 合计远低于 `0.01%`。
+
+原始目录：
+
+- 两卡 none/Service：`/data/disk/wangzili/cis-artifacts-5e895a9/{validation/p3-w32-none,profiles/two-card/p3/service-w32}`
+- 两卡 Torch：`/data/disk/wangzili/cis-artifacts-5e895a9-first/profiles/two-card/p3/torch-w32`
+- 四卡三 pass：`/data/disk/wangzili/cis-artifacts-5e895a9-first/profiles/four-card/p3/`
+
+## 跨配置结论
+
+- P0-P3 全部没有正式 scoring forward，CPU reward 不是剩余瓶颈。
+- APC 已保存大量重复 prefill，但 `FusedInferAttentionScore` 仍稳定占设备 busy 时间约 38%-61%；APC 不会合并不同 decode request 对共享 KV 的读取。
+- 四卡的 work-normalized 扩展只有约 `1.28x-1.48x`，静态 job 数均分在四组配置中都出现实际工作偏斜。
+- 下一阶段优先验证 CIS work-aware routing、candidate-to-rollout bounded streaming，以及利用固定 `C -> R` 两层树的 Ascend Forest Attention；不继续把普通 MNS/MBT 扩边当作算法创新。
 
 ## P/D Capability
 
