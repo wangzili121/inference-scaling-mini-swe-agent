@@ -55,6 +55,24 @@ Step 指标分为两层，避免把 admission 排队隐藏掉：
 
 本轮是随机 `T=1` workload。相同 request seed 在 native categorical + 不同 batch shape 下没有得到逐 token 相同轨迹；两次纯 baseline 的最终 action 也只有 19/64 完全一致，因此不能把 exact-output mismatch 归因于调度策略。本文不作质量结论，并同时报告 requests/s、generated tokens/s、请求数和 prefill，以降低随机工作量差异带来的误判。两种调度收益均超过历史 baseline 吞吐波动约 2.4%，但正式质量验证仍需单独进行。
 
+## 三组配置统一结果
+
+表中的 `Step` 使用各配置当前最佳的已测 hard-step cap：P0 为 6，P1 为 16，P2 为 32。P1 最初按 `MNS/(C x R)` 得到的 cap 11 已被后续 sweep 判定为过紧，不作为最终 Step 代表值。
+
+| 配置 | 调度 | jobs/s（相对 baseline） | Job mean / P95 | Step E2E mean / P95 | Barrier mean / P95 | Preemptions |
+|---|---|---:|---:|---:|---:|---:|
+| P0 `C15/R3` | Baseline | 0.1463 | 168.5 / 333.9 s | 147.5 / 316.9 s | 71.0 / 189.4 s | 10 |
+| P0 `C15/R3` | Step cap 6 | 0.1688 (+15.3%) | **134.7 / 246.1 s** | **119.5 / 238.9 s** | **22.3 / 43.1 s** | **0** |
+| P0 `C15/R3` | Elastic | **0.1707 (+16.6%)** | 147.5 / 279.5 s | 130.8 / 243.9 s | 60.3 / 153.6 s | **0** |
+| P1 `C8/R3` | Baseline | 0.2352 | 110.7 / 223.6 s | 94.3 / 210.6 s | 45.5 / 114.5 s | 28 |
+| P1 `C8/R3` | Step cap 16 | **0.2752 (+17.0%)** | **97.5 / 173.2 s** | **85.2 / 168.3 s** | **29.7 / 75.4 s** | **0** |
+| P1 `C8/R3` | Elastic | 0.2502 (+6.4%) | 100.4 / 205.1 s | 86.6 / 201.7 s | 39.0 / 130.0 s | 17 |
+| P2 `C4/R2` | Baseline | 0.3329 | 71.8 / 159.0 s | 60.2 / 150.3 s | 16.2 / **45.8 s** | 4 |
+| P2 `C4/R2` | Step cap 32 | 0.3564 (+7.0%) | **64.2** / 151.6 s | 55.3 / 133.7 s | 16.0 / 54.5 s | 6 |
+| P2 `C4/R2` | Elastic | **0.3663 (+10.0%)** | 65.6 / **145.5 s** | **55.1 / 133.4 s** | **14.6** / 53.1 s | **1** |
+
+`Job latency` 是一次完整 Conditional IS 模型调用从进入到返回最终 assistant/tool-call 的时间。`Step latency` 是该 job 内一个 `B=128` block 的 candidate、rollout、reward 和 resample 完成时间，并包含本文单列的 step admission wait。一个 job 可顺序经历多个 step，因此两者不是同一指标；在聚合层面近似满足 `job mean ~= step mean x 总 step 数 / 总 job 数 + 非 step 开销`。Mean 与 P95 应同时报告：mean 描述总体平均，P95 描述最慢 5% 的尾延迟；P95 不参与 mean 的计算，也不应把多轮实验的 P95 简单再取平均。多次复验时应合并原始样本后重新计算，或同时报告各轮波动。
+
 ## P1/P2 扩展
 
 使用完全相同的模型、runtime、engine 参数、64 个请求和 workers=32，进一步测试：
