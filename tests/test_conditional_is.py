@@ -1,5 +1,6 @@
 from collections import Counter
 from math import exp
+from threading import Event
 
 import pytest
 
@@ -273,6 +274,96 @@ def test_rollout_submission_batches_preserve_logical_candidate_order() -> None:
 def test_rollout_submission_batch_size_must_be_positive() -> None:
     with pytest.raises(ValueError, match="rollout_submission_batch_size"):
         ConditionalISConfig(rollout_submission_batch_size=0)
+
+
+def test_streamed_candidate_rollouts_preserve_conditional_is_result() -> None:
+    common = dict(
+        candidate_count=4,
+        rollout_count=2,
+        block_size=1,
+        total_length=3,
+    )
+    baseline = run_conditional_is(
+        _backend(),
+        (),
+        ConditionalISConfig(**common),
+        _reward,
+        SeedStream(20260910),
+    )
+    streamed = run_conditional_is(
+        _backend(),
+        (),
+        ConditionalISConfig(
+            **common,
+            stream_candidate_rollouts=True,
+            rollout_stream_candidate_batch_size=2,
+            rollout_stream_max_batches=1,
+        ),
+        _reward,
+        SeedStream(20260910),
+    )
+
+    assert streamed == baseline
+
+
+def test_streamed_rollout_starts_before_candidate_batch_returns() -> None:
+    class OverlapBackend(TabularAutoregressiveBackend):
+        def __init__(self) -> None:
+            super().__init__({}, fallback=[0.5, 0.5])
+            self.rollout_started = Event()
+
+        def sample_batch(self, requests):
+            if any(":rollout:" in request.request_id for request in requests):
+                self.rollout_started.set()
+            return super().sample_batch(requests)
+
+        def sample_batch_with_callback(self, requests, on_complete):
+            samples = TabularAutoregressiveBackend.sample_batch(self, requests)
+            on_complete(0, samples[0])
+            assert self.rollout_started.wait(timeout=2)
+            for index, sample in enumerate(samples[1:], start=1):
+                on_complete(index, sample)
+            return samples
+
+    backend = OverlapBackend()
+    step = conditional_is_step(
+        base_backend=backend,
+        rollout_backend=backend,
+        prompt=(),
+        generated_prefix=(),
+        config=ConditionalISConfig(
+            candidate_count=3,
+            rollout_count=2,
+            block_size=1,
+            total_length=2,
+            stream_candidate_rollouts=True,
+            rollout_stream_candidate_batch_size=1,
+            rollout_stream_max_batches=1,
+        ),
+        base_sampling=SamplingConfig(),
+        rollout_sampling=SamplingConfig(),
+        reward=_reward,
+        seeds=SeedStream(20260910),
+        step_index=0,
+    )
+
+    assert backend.rollout_started.is_set()
+    assert [len(candidate.rollouts) for candidate in step.candidates] == [2, 2, 2]
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"rollout_submission_batch_size": 2}, "rollout_submission_batch_size"),
+        ({"exact_rollout_early_stop": True}, "exact_rollout_early_stop"),
+        ({"rollout_design": "scrambled_sobol"}, "requires iid"),
+    ],
+)
+def test_streamed_candidate_rollout_rejects_incompatible_modes(
+    overrides, message
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        ConditionalISConfig(stream_candidate_rollouts=True, **overrides)
 
 
 def test_conditional_is_never_exceeds_total_length() -> None:

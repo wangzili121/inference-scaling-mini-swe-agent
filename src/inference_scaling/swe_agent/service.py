@@ -258,6 +258,15 @@ class ConditionalISRunner:
                 if conditional.get("rollout_submission_batch_size") is None
                 else int(conditional["rollout_submission_batch_size"])
             ),
+            stream_candidate_rollouts=bool(
+                conditional.get("stream_candidate_rollouts", False)
+            ),
+            rollout_stream_candidate_batch_size=int(
+                conditional.get("rollout_stream_candidate_batch_size", 5)
+            ),
+            rollout_stream_max_batches=int(
+                conditional.get("rollout_stream_max_batches", 2)
+            ),
         )
         reward_kind = str(reward.get("kind", "sequence_log_probability"))
         if reward_kind == "sequence_log_probability":

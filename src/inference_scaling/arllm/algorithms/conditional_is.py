@@ -14,6 +14,7 @@ each candidate's future reward weighting under the rollout proposal itself.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -21,6 +22,7 @@ from math import exp, isfinite, log
 from time import perf_counter
 from typing import Any
 
+from inference_scaling.arllm.acceleration import sample_batch_with_callback
 from inference_scaling.arllm.config import ConditionalISConfig, SamplingConfig
 from inference_scaling.shared.importance import (
     MonteCarloRolloutWeightProvider,
@@ -108,6 +110,22 @@ class ConditionalCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class _RolloutRequestPlan:
+    requests: tuple[GenerationRequest, ...]
+    candidate_indices: tuple[int, ...]
+    prefixes: tuple[TokenSequence, ...]
+    terminal_candidates: frozenset[int]
+
+
+@dataclass(frozen=True, slots=True)
+class _StreamedRollouts:
+    samples_by_request_id: Mapping[str, SequenceSample]
+    submission_batches: int
+    candidate_batch_size: int
+    max_active_batches: int
+
+
+@dataclass(frozen=True, slots=True)
 class ConditionalISStep:
     generated_length_before: int
     candidates: tuple[ConditionalCandidate, ...]
@@ -185,7 +203,44 @@ def _sample_candidates(
     request_namespace: str = "conditional-is",
     stage_observer: StageObserver | None = None,
 ) -> list[SequenceSample]:
-    requests = [
+    requests = _candidate_requests(
+        prefix=prefix,
+        count=count,
+        block_length=block_length,
+        sampling=sampling,
+        seeds=seeds,
+        step_index=step_index,
+        confidence_top_k=confidence_top_k,
+        request_namespace=request_namespace,
+    )
+    started = perf_counter()
+    with _profile_range("candidate"):
+        candidates = base_backend.sample_batch(requests)
+    _observe_stage(
+        stage_observer,
+        "candidate",
+        step_index,
+        started,
+        sequence_count=count,
+        block_length=block_length,
+        prefix_tokens=len(prefix),
+    )
+    _validate_candidates(candidates, count, base_backend, sampling)
+    return candidates
+
+
+def _candidate_requests(
+    *,
+    prefix: TokenSequence,
+    count: int,
+    block_length: int,
+    sampling: SamplingConfig,
+    seeds: SeedStream,
+    step_index: int,
+    confidence_top_k: int | None,
+    request_namespace: str,
+) -> list[GenerationRequest]:
+    return [
         GenerationRequest(
             prefix=prefix,
             max_new_tokens=block_length,
@@ -200,18 +255,14 @@ def _sample_candidates(
         )
         for candidate_index in range(count)
     ]
-    started = perf_counter()
-    with _profile_range("candidate"):
-        candidates = base_backend.sample_batch(requests)
-    _observe_stage(
-        stage_observer,
-        "candidate",
-        step_index,
-        started,
-        sequence_count=count,
-        block_length=block_length,
-        prefix_tokens=len(prefix),
-    )
+
+
+def _validate_candidates(
+    candidates: Sequence[SequenceSample],
+    count: int,
+    base_backend: AutoregressiveBackend,
+    sampling: SamplingConfig,
+) -> None:
     if len(candidates) != count:
         raise RuntimeError("backend returned an invalid number of candidates")
     for candidate in candidates:
@@ -224,7 +275,302 @@ def _sample_candidates(
             raise RuntimeError(
                 "candidate was not sampled and scored by the requested base policy"
             )
-    return candidates
+
+
+def _rollout_requests_for_candidate(
+    *,
+    prompt: TokenSequence,
+    generated_prefix: TokenSequence,
+    candidate_index: int,
+    candidate: SequenceSample,
+    rollout_length: int,
+    rollout_count: int,
+    rollout_sampling: SamplingConfig,
+    seeds: SeedStream,
+    step_index: int,
+    rollout_design: str,
+    rollout_index_offset: int,
+    confidence_top_k: int | None,
+    request_namespace: str,
+) -> tuple[list[GenerationRequest], list[TokenSequence], bool]:
+    full_generated_candidate = generated_prefix + candidate.token_ids
+    eos = rollout_sampling.eos_token_id
+    terminal = rollout_length == 0 or (
+        eos is not None and candidate.token_ids[-1] == eos
+    )
+    if terminal:
+        return [], [], True
+    rollout_prefix = prompt + full_generated_candidate
+    if rollout_design == "scrambled_sobol":
+        from inference_scaling.experimental.shared.rqmc import (
+            scrambled_sobol_uniforms,
+        )
+
+        token_uniforms = scrambled_sobol_uniforms(
+            rollout_count,
+            rollout_length,
+            seed=seeds.derive(
+                "conditional_is",
+                step_index,
+                "candidate",
+                candidate_index,
+                "scrambled_sobol",
+            ),
+        )
+    else:
+        token_uniforms = (None,) * rollout_count
+    if rollout_design == "arithmetic_lattice":
+        from inference_scaling.experimental.shared.rqmc import (
+            randomized_lattice_uniforms,
+        )
+
+        arithmetic_uniforms = randomized_lattice_uniforms(
+            rollout_count,
+            seed=seeds.derive(
+                "conditional_is",
+                step_index,
+                "candidate",
+                candidate_index,
+                "arithmetic_lattice",
+            ),
+        )
+    else:
+        arithmetic_uniforms = (None,) * rollout_count
+    requests = []
+    for rollout_index in range(rollout_count):
+        global_rollout_index = rollout_index_offset + rollout_index
+        requests.append(
+            GenerationRequest(
+                prefix=rollout_prefix,
+                max_new_tokens=rollout_length,
+                sampling=rollout_sampling,
+                seed=seeds.derive(
+                    "conditional_is",
+                    step_index,
+                    "candidate",
+                    candidate_index,
+                    "rollout",
+                    global_rollout_index,
+                ),
+                request_id=(
+                    f"{request_namespace}:"
+                    f"step:{step_index}:candidate:{candidate_index}:"
+                    f"rollout:{global_rollout_index}"
+                ),
+                uniforms=token_uniforms[rollout_index],
+                arithmetic_uniform=arithmetic_uniforms[rollout_index],
+                confidence_top_k=confidence_top_k,
+            )
+        )
+    return requests, [rollout_prefix] * rollout_count, False
+
+
+def _prepare_rollout_requests(
+    *,
+    prompt: TokenSequence,
+    generated_prefix: TokenSequence,
+    candidates: Sequence[SequenceSample],
+    rollout_length: int,
+    rollout_count: int,
+    rollout_sampling: SamplingConfig,
+    seeds: SeedStream,
+    step_index: int,
+    rollout_design: str,
+    rollout_index_offset: int,
+    confidence_top_k: int | None,
+    request_namespace: str,
+) -> _RolloutRequestPlan:
+    requests: list[GenerationRequest] = []
+    candidate_indices: list[int] = []
+    prefixes: list[TokenSequence] = []
+    terminal_candidates: set[int] = set()
+    for candidate_index, candidate in enumerate(candidates):
+        candidate_requests, candidate_prefixes, terminal = (
+            _rollout_requests_for_candidate(
+                prompt=prompt,
+                generated_prefix=generated_prefix,
+                candidate_index=candidate_index,
+                candidate=candidate,
+                rollout_length=rollout_length,
+                rollout_count=rollout_count,
+                rollout_sampling=rollout_sampling,
+                seeds=seeds,
+                step_index=step_index,
+                rollout_design=rollout_design,
+                rollout_index_offset=rollout_index_offset,
+                confidence_top_k=confidence_top_k,
+                request_namespace=request_namespace,
+            )
+        )
+        if terminal:
+            terminal_candidates.add(candidate_index)
+        requests.extend(candidate_requests)
+        candidate_indices.extend([candidate_index] * len(candidate_requests))
+        prefixes.extend(candidate_prefixes)
+    return _RolloutRequestPlan(
+        tuple(requests),
+        tuple(candidate_indices),
+        tuple(prefixes),
+        frozenset(terminal_candidates),
+    )
+
+
+def _sample_candidates_with_streamed_rollouts(
+    *,
+    base_backend: AutoregressiveBackend,
+    rollout_backend: AutoregressiveBackend,
+    prompt: TokenSequence,
+    generated_prefix: TokenSequence,
+    candidate_count: int,
+    candidate_length: int,
+    remaining_length: int,
+    rollout_count: int,
+    base_sampling: SamplingConfig,
+    rollout_sampling: SamplingConfig,
+    seeds: SeedStream,
+    step_index: int,
+    candidate_batch_size: int,
+    max_active_batches: int,
+    confidence_top_k: int | None,
+    request_namespace: str,
+    stage_observer: StageObserver | None,
+) -> tuple[list[SequenceSample], _StreamedRollouts]:
+    """Start bounded rollout groups as candidate requests complete."""
+
+    requests = _candidate_requests(
+        prefix=prompt + generated_prefix,
+        count=candidate_count,
+        block_length=candidate_length,
+        sampling=base_sampling,
+        seeds=seeds,
+        step_index=step_index,
+        confidence_top_k=confidence_top_k,
+        request_namespace=request_namespace,
+    )
+    completed_candidates: list[SequenceSample | None] = [None] * candidate_count
+    pending: list[tuple[int, SequenceSample]] = []
+    futures: list[
+        Future[tuple[tuple[GenerationRequest, ...], list[SequenceSample]]]
+    ] = []
+    rollout_started: float | None = None
+    rollout_request_count = 0
+    executor = ThreadPoolExecutor(
+        max_workers=max_active_batches,
+        thread_name_prefix="conditional-is-rollout",
+    )
+
+    def sample_group(
+        group_requests: tuple[GenerationRequest, ...],
+    ) -> tuple[tuple[GenerationRequest, ...], list[SequenceSample]]:
+        with _profile_range("rollout"):
+            return group_requests, rollout_backend.sample_batch(group_requests)
+
+    def flush_ready(*, force: bool) -> None:
+        nonlocal rollout_started, rollout_request_count
+        first = completed_candidates[0]
+        if first is None:
+            return
+        fixed_rollout_length = max(0, remaining_length - len(first.token_ids))
+        while pending and (force or len(pending) >= candidate_batch_size):
+            count = min(candidate_batch_size, len(pending))
+            group = pending[:count]
+            del pending[:count]
+            group_requests: list[GenerationRequest] = []
+            for candidate_index, candidate in group:
+                candidate_requests, _, _ = _rollout_requests_for_candidate(
+                    prompt=prompt,
+                    generated_prefix=generated_prefix,
+                    candidate_index=candidate_index,
+                    candidate=candidate,
+                    rollout_length=fixed_rollout_length,
+                    rollout_count=rollout_count,
+                    rollout_sampling=rollout_sampling,
+                    seeds=seeds,
+                    step_index=step_index,
+                    rollout_design="iid",
+                    rollout_index_offset=0,
+                    confidence_top_k=confidence_top_k,
+                    request_namespace=request_namespace,
+                )
+                group_requests.extend(candidate_requests)
+            if not group_requests:
+                continue
+            if rollout_started is None:
+                rollout_started = perf_counter()
+            materialized = tuple(group_requests)
+            rollout_request_count += len(materialized)
+            futures.append(executor.submit(sample_group, materialized))
+
+    def candidate_completed(index: int, sample: SequenceSample) -> None:
+        completed_candidates[index] = sample
+        pending.append((index, sample))
+        flush_ready(force=False)
+
+    candidate_started = perf_counter()
+    try:
+        with _profile_range("candidate"):
+            candidates = sample_batch_with_callback(
+                base_backend, requests, candidate_completed
+            )
+        candidate_finished = perf_counter()
+        _observe_stage(
+            stage_observer,
+            "candidate",
+            step_index,
+            candidate_started,
+            sequence_count=candidate_count,
+            block_length=candidate_length,
+            prefix_tokens=len(prompt) + len(generated_prefix),
+            rollout_streaming=True,
+        )
+        _validate_candidates(candidates, candidate_count, base_backend, base_sampling)
+        if any(candidate is None for candidate in completed_candidates):
+            raise RuntimeError("candidate completion callback omitted a request")
+        flush_ready(force=True)
+        samples_by_request_id: dict[str, SequenceSample] = {}
+        for future in futures:
+            group_requests, samples = future.result()
+            if len(samples) != len(group_requests):
+                raise RuntimeError("streamed rollout batch returned an invalid size")
+            for request, sample in zip(group_requests, samples, strict=True):
+                if sample.request_id != request.request_id:
+                    raise RuntimeError("streamed rollout returned the wrong request")
+                samples_by_request_id[request.request_id] = sample
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    rollout_finished = perf_counter()
+    effective_rollout_started = rollout_started or rollout_finished
+    first_candidate = completed_candidates[0]
+    if first_candidate is None:
+        raise RuntimeError("candidate completion callback omitted the first request")
+    _observe_stage(
+        stage_observer,
+        "rollout",
+        step_index,
+        effective_rollout_started,
+        sequence_count=rollout_request_count,
+        rollout_length=max(0, remaining_length - len(first_candidate.token_ids)),
+        prefix_tokens=(
+            len(prompt) + len(generated_prefix) + candidate_length
+            if rollout_request_count
+            else 0
+        ),
+        submission_batches=len(futures),
+        submission_batch_size=None,
+        candidate_batch_size=candidate_batch_size,
+        max_active_batches=max_active_batches,
+        candidate_overlap=True,
+        overlap_seconds=max(
+            0.0, candidate_finished - effective_rollout_started
+        ),
+    )
+    return candidates, _StreamedRollouts(
+        samples_by_request_id,
+        len(futures),
+        candidate_batch_size,
+        max_active_batches,
+    )
 
 
 def estimate_conditional_weights(
@@ -249,6 +595,7 @@ def estimate_conditional_weights(
     rollout_index_offset: int = 0,
     generated_prefix_statistics: GeneratedSequenceStatistics | None = None,
     rollout_submission_batch_size: int | None = None,
+    precomputed_rollouts: _StreamedRollouts | None = None,
     request_namespace: str = "conditional-is",
     stage_observer: StageObserver | None = None,
 ) -> tuple[ConditionalCandidate, ...]:
@@ -282,108 +629,59 @@ def estimate_conditional_weights(
             "batch-coupled rewards change when rollout dependence changes"
         )
     confidence_top_k = getattr(reward, "generation_confidence_top_k", None)
-
-    requests: list[GenerationRequest] = []
-    request_candidates: list[int] = []
-    rollout_prefixes: list[TokenSequence] = []
-    terminal_candidates: set[int] = set()
-    eos = rollout_sampling.eos_token_id
-
-    for candidate_index, candidate in enumerate(candidates):
-        full_generated_candidate = generated_prefix + candidate.token_ids
-        terminal = rollout_length == 0 or (
-            eos is not None and candidate.token_ids[-1] == eos
-        )
-        if terminal:
-            terminal_candidates.add(candidate_index)
-            continue
-        rollout_prefix = prompt + full_generated_candidate
-        if rollout_design == "scrambled_sobol":
-            from inference_scaling.experimental.shared.rqmc import (
-                scrambled_sobol_uniforms,
-            )
-
-            token_uniforms = scrambled_sobol_uniforms(
-                rollout_count,
-                rollout_length,
-                seed=seeds.derive(
-                    "conditional_is",
-                    step_index,
-                    "candidate",
-                    candidate_index,
-                    "scrambled_sobol",
-                ),
-            )
-        else:
-            token_uniforms = (None,) * rollout_count
-        if rollout_design == "arithmetic_lattice":
-            from inference_scaling.experimental.shared.rqmc import (
-                randomized_lattice_uniforms,
-            )
-
-            arithmetic_uniforms = randomized_lattice_uniforms(
-                rollout_count,
-                seed=seeds.derive(
-                    "conditional_is",
-                    step_index,
-                    "candidate",
-                    candidate_index,
-                    "arithmetic_lattice",
-                ),
-            )
-        else:
-            arithmetic_uniforms = (None,) * rollout_count
-        for rollout_index in range(rollout_count):
-            global_rollout_index = rollout_index_offset + rollout_index
-            requests.append(
-                GenerationRequest(
-                    prefix=rollout_prefix,
-                    max_new_tokens=rollout_length,
-                    sampling=rollout_sampling,
-                    seed=seeds.derive(
-                        "conditional_is",
-                        step_index,
-                        "candidate",
-                        candidate_index,
-                        "rollout",
-                        global_rollout_index,
-                    ),
-                    request_id=(
-                        f"{request_namespace}:"
-                        f"step:{step_index}:candidate:{candidate_index}:"
-                        f"rollout:{global_rollout_index}"
-                    ),
-                    uniforms=token_uniforms[rollout_index],
-                    arithmetic_uniform=arithmetic_uniforms[rollout_index],
-                    confidence_top_k=confidence_top_k,
-                )
-            )
-            request_candidates.append(candidate_index)
-            rollout_prefixes.append(rollout_prefix)
-
-    rollout_started = perf_counter()
-    submission_batch_size = rollout_submission_batch_size or len(requests) or 1
-    samples: list[SequenceSample] = []
-    submission_batches = 0
-    with _profile_range("rollout"):
-        for start in range(0, len(requests), submission_batch_size):
-            samples.extend(
-                rollout_backend.sample_batch(
-                    requests[start : start + submission_batch_size]
-                )
-            )
-            submission_batches += 1
-    _observe_stage(
-        stage_observer,
-        "rollout",
-        step_index,
-        rollout_started,
-        sequence_count=len(requests),
+    plan = _prepare_rollout_requests(
+        prompt=prompt,
+        generated_prefix=generated_prefix,
+        candidates=candidates,
         rollout_length=rollout_length,
-        prefix_tokens=(len(rollout_prefixes[0]) if rollout_prefixes else 0),
-        submission_batches=submission_batches,
-        submission_batch_size=rollout_submission_batch_size,
+        rollout_count=rollout_count,
+        rollout_sampling=rollout_sampling,
+        seeds=seeds,
+        step_index=step_index,
+        rollout_design=rollout_design,
+        rollout_index_offset=rollout_index_offset,
+        confidence_top_k=confidence_top_k,
+        request_namespace=request_namespace,
     )
+    requests = plan.requests
+    request_candidates = plan.candidate_indices
+    rollout_prefixes = plan.prefixes
+    terminal_candidates = plan.terminal_candidates
+
+    if precomputed_rollouts is None:
+        rollout_started = perf_counter()
+        submission_batch_size = rollout_submission_batch_size or len(requests) or 1
+        samples: list[SequenceSample] = []
+        submission_batches = 0
+        with _profile_range("rollout"):
+            for start in range(0, len(requests), submission_batch_size):
+                samples.extend(
+                    rollout_backend.sample_batch(
+                        requests[start : start + submission_batch_size]
+                    )
+                )
+                submission_batches += 1
+        _observe_stage(
+            stage_observer,
+            "rollout",
+            step_index,
+            rollout_started,
+            sequence_count=len(requests),
+            rollout_length=rollout_length,
+            prefix_tokens=(len(rollout_prefixes[0]) if rollout_prefixes else 0),
+            submission_batches=submission_batches,
+            submission_batch_size=rollout_submission_batch_size,
+            candidate_overlap=False,
+        )
+    else:
+        expected = {request.request_id for request in requests}
+        observed = set(precomputed_rollouts.samples_by_request_id)
+        if observed != expected:
+            raise RuntimeError("streamed rollout request set does not match the plan")
+        samples = [
+            precomputed_rollouts.samples_by_request_id[request.request_id]
+            for request in requests
+        ]
     if len(samples) != len(requests):
         raise RuntimeError("backend returned an invalid number of rollouts")
     if rollout_backend is not base_backend:
@@ -641,6 +939,7 @@ class AutoregressiveStepwiseAdapter:
         self.request_namespace = request_namespace
         self.stage_observer = stage_observer
         self._step_started: dict[int, float] = {}
+        self._streamed_rollouts: dict[int, _StreamedRollouts] = {}
         self._statistics_by_state: dict[TokenSequence, GeneratedSequenceStatistics] = {
             (): GeneratedSequenceStatistics()
         }
@@ -666,6 +965,32 @@ class AutoregressiveStepwiseAdapter:
         remaining = self.config.total_length - len(state)
         if remaining <= 0:
             raise ValueError("generated prefix has already reached total_length")
+        if self.config.stream_candidate_rollouts:
+            proposals, streamed = _sample_candidates_with_streamed_rollouts(
+                base_backend=self.base_backend,
+                rollout_backend=self.rollout_backend,
+                prompt=self.prompt,
+                generated_prefix=state,
+                candidate_count=self.config.candidate_count,
+                candidate_length=min(self.config.block_size, remaining),
+                remaining_length=remaining,
+                rollout_count=self.config.rollout_count,
+                base_sampling=self.base_sampling,
+                rollout_sampling=self.rollout_sampling,
+                seeds=seeds,
+                step_index=step_index,
+                candidate_batch_size=(
+                    self.config.rollout_stream_candidate_batch_size
+                ),
+                max_active_batches=self.config.rollout_stream_max_batches,
+                confidence_top_k=getattr(
+                    self.reward, "generation_confidence_top_k", None
+                ),
+                request_namespace=self.request_namespace,
+                stage_observer=self.stage_observer,
+            )
+            self._streamed_rollouts[step_index] = streamed
+            return proposals
         return _sample_candidates(
             self.base_backend,
             self.prompt + state,
@@ -710,6 +1035,7 @@ class AutoregressiveStepwiseAdapter:
             rollout_submission_batch_size=(
                 self.config.rollout_submission_batch_size
             ),
+            precomputed_rollouts=self._streamed_rollouts.pop(step_index, None),
             request_namespace=self.request_namespace,
             stage_observer=self.stage_observer,
         )

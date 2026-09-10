@@ -100,6 +100,9 @@ class ConditionalISConfig:
     rollout_log_weight_bounds: tuple[float, float] | None = None
     rollout_evaluation_batch_size: int = 1
     rollout_submission_batch_size: int | None = None
+    stream_candidate_rollouts: bool = False
+    rollout_stream_candidate_batch_size: int = 5
+    rollout_stream_max_batches: int = 2
 
     def __post_init__(self) -> None:
         for name in ("candidate_count", "rollout_count", "block_size", "total_length"):
@@ -133,6 +136,28 @@ class ConditionalISConfig:
             require_positive(
                 "rollout_submission_batch_size",
                 self.rollout_submission_batch_size,
+            )
+        require_positive(
+            "rollout_stream_candidate_batch_size",
+            self.rollout_stream_candidate_batch_size,
+        )
+        require_positive(
+            "rollout_stream_max_batches",
+            self.rollout_stream_max_batches,
+        )
+        if self.stream_candidate_rollouts and self.rollout_submission_batch_size:
+            raise ValueError(
+                "stream_candidate_rollouts and rollout_submission_batch_size "
+                "are mutually exclusive"
+            )
+        if self.stream_candidate_rollouts and self.exact_rollout_early_stop:
+            raise ValueError(
+                "stream_candidate_rollouts and exact_rollout_early_stop "
+                "are mutually exclusive"
+            )
+        if self.stream_candidate_rollouts and self.rollout_design != "iid":
+            raise ValueError(
+                "stream_candidate_rollouts currently requires iid rollouts"
             )
         if self.rollout_log_weight_bounds is not None:
             if len(self.rollout_log_weight_bounds) != 2:
