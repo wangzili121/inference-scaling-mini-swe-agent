@@ -189,6 +189,7 @@ class RolloutEvaluation:
     proposal_model_id: str
     proposal_policy_id: str
     generation_statistics: GeneratedSequenceStatistics | None = None
+    request_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +203,8 @@ class ConditionalCandidate:
     log_weight_upper_bound: float | None = None
     base_token_topk_confidences: tuple[float, ...] | None = None
     base_confidence_top_k: int | None = None
+    request_id: str | None = None
+    rollout_request_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -888,6 +891,7 @@ def estimate_conditional_weights(
                 str,
                 TokenSequence,
                 GeneratedSequenceStatistics,
+                str | None,
             ]
         ]
     ] = [[] for _ in candidates]
@@ -902,6 +906,7 @@ def estimate_conditional_weights(
                 rollout_sampling.policy_id,
                 generated,
                 candidate_statistics[candidate_index],
+                None,
             )
         )
     for candidate_index, sample, base_logprob in zip(
@@ -927,11 +932,12 @@ def estimate_conditional_weights(
                     token_topk_confidences=sample.token_topk_confidences,
                     confidence_top_k=sample.confidence_top_k,
                 ),
+                sample.request_id,
             )
         )
 
     pending = [item for group in pending_by_candidate for item in group]
-    generated_statistics = [item[-1] for item in pending]
+    generated_statistics = [item[-2] for item in pending]
     generated_sequences = [item.token_ids for item in generated_statistics]
     reward_started = perf_counter()
     with _profile_range("reward"):
@@ -994,6 +1000,7 @@ def estimate_conditional_weights(
             policy_id,
             _,
             statistics,
+            request_id,
         ) in group:
             reward_value = rewards[reward_index]
             reward_index += 1
@@ -1020,6 +1027,7 @@ def estimate_conditional_weights(
                     proposal_model_id=model_id,
                     proposal_policy_id=policy_id,
                     generation_statistics=statistics,
+                    request_id=request_id,
                 )
             )
 
@@ -1042,6 +1050,12 @@ def estimate_conditional_weights(
                 log_weight_upper_bound=candidate_log_weight,
                 base_token_topk_confidences=candidate.token_topk_confidences,
                 base_confidence_top_k=candidate.confidence_top_k,
+                request_id=candidate.request_id,
+                rollout_request_ids=tuple(
+                    evaluation.request_id
+                    for evaluation in evaluations
+                    if evaluation.request_id is not None
+                ),
             )
         )
     result = tuple(evaluated)
@@ -1090,6 +1104,7 @@ class AutoregressiveStepwiseAdapter:
         self._step_started: dict[int, float] = {}
         self._admitted_steps: set[int] = set()
         self._streamed_rollouts: dict[int, _StreamedRollouts] = {}
+        self._evaluated_candidates: dict[int, tuple[ConditionalCandidate, ...]] = {}
         self._statistics_by_state: dict[TokenSequence, GeneratedSequenceStatistics] = {
             (): GeneratedSequenceStatistics()
         }
@@ -1225,6 +1240,7 @@ class AutoregressiveStepwiseAdapter:
         except BaseException:
             self._release_step(step_index)
             raise
+        self._evaluated_candidates[step_index] = tuple(evaluated)
         return tuple(
             StepwiseCandidate(candidate, candidate.log_weight)
             for candidate in evaluated
@@ -1237,6 +1253,25 @@ class AutoregressiveStepwiseAdapter:
         step_index: int,
     ) -> TokenSequence:
         started = perf_counter()
+        evaluated = self._evaluated_candidates.pop(step_index, ())
+        resolve_branches = getattr(self.base_backend, "resolve_cis_branches", None)
+        branch_gc: Mapping[str, int] | None = None
+        branch_gc_started: float | None = None
+        if callable(resolve_branches) and selected.request_id is not None:
+            branch_gc_started = perf_counter()
+            branch_gc = resolve_branches(
+                selected_candidate_id=selected.request_id,
+                candidate_ids=tuple(
+                    candidate.request_id
+                    for candidate in evaluated
+                    if candidate.request_id is not None
+                ),
+                rollout_ids=tuple(
+                    request_id
+                    for candidate in evaluated
+                    for request_id in candidate.rollout_request_ids
+                ),
+            )
         generated = state + selected.token_ids
         previous = self._statistics_by_state.get(state)
         if previous is not None:
@@ -1257,6 +1292,26 @@ class AutoregressiveStepwiseAdapter:
             step_index,
             started,
             selected_tokens=len(selected.token_ids),
+            kv_gc_seconds=(
+                0.0
+                if branch_gc_started is None
+                else perf_counter() - branch_gc_started
+            ),
+            kv_gc_recorded_requests=(
+                0 if branch_gc is None else branch_gc.get("recorded_requests", 0)
+            ),
+            kv_gc_evicted_blocks=(
+                0 if branch_gc is None else branch_gc.get("evicted_blocks", 0)
+            ),
+            kv_gc_stale_blocks=(
+                0 if branch_gc is None else branch_gc.get("stale_blocks", 0)
+            ),
+            kv_gc_active_blocks=(
+                0 if branch_gc is None else branch_gc.get("active_blocks", 0)
+            ),
+            kv_gc_protected_blocks=(
+                0 if branch_gc is None else branch_gc.get("protected_blocks", 0)
+            ),
         )
         block_started = self._step_started.pop(step_index, None)
         if block_started is not None:

@@ -1,17 +1,18 @@
 diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
-index 3a90b2a..8af4f7c 100644
+index 2c712a1..945bf94 100644
 --- a/vllm/v1/core/kv_cache_manager.py
 +++ b/vllm/v1/core/kv_cache_manager.py
-@@ -2,7 +2,8 @@
+@@ -2,15 +2,17 @@
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
+ 
  import itertools
 +from collections import OrderedDict
-+from time import monotonic
  from collections.abc import Sequence
  from dataclasses import dataclass
++from time import monotonic
  from typing import Literal, overload
-@@ -11,7 +12,7 @@ from typing import Literal, overload
+ 
+ from vllm.distributed.kv_events import KVCacheEvent
  from vllm.logger import init_logger
  from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
  from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -20,10 +21,10 @@ index 3a90b2a..8af4f7c 100644
  from vllm.v1.kv_cache_interface import KVCacheConfig
  from vllm.v1.metrics.stats import PrefixCacheStats
  from vllm.v1.request import Request
-@@ -103,7 +104,18 @@ class KVCacheBlocks:
+@@ -103,7 +105,32 @@ class KVCacheBlocks:
          return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
-
-
+ 
+ 
 +@dataclass
 +class _CISForkHint:
 +    blocks: tuple[KVCacheBlock, ...]
@@ -32,38 +33,62 @@ index 3a90b2a..8af4f7c 100644
 +    remaining_children: int
 +    leased_blocks: tuple[KVCacheBlock, ...]
 +    expires_at: float | None
++    lease_scope: str
++
++
++@dataclass(frozen=True)
++class _CISBranchRecord:
++    blocks: tuple[KVCacheBlock, ...]
++    block_hashes: tuple[object, ...]
++    branch_kind: str
 +
 +
  class KVCacheManager:
 +    cis_fork_supported = True
 +    cis_fork_lease_supported = True
++    cis_fork_full_parent_handoff_supported = True
++    cis_fork_lease_budget_supported = True
 +    cis_branch_eviction_supported = True
++    cis_resample_gc_supported = True
 +
      def __init__(
          self,
          kv_cache_config: KVCacheConfig,
-@@ -147,6 +159,9 @@ class KVCacheManager:
+@@ -142,6 +169,14 @@ class KVCacheManager:
+         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
          self.block_pool = self.coordinator.block_pool
          self.kv_cache_config = kv_cache_config
 +        self._cis_fork_hints: OrderedDict[str, _CISForkHint] = OrderedDict()
 +        self._cis_pending_forks: dict[str, str] = {}
 +        self._cis_failed_forks: set[str] = set()
++        self._cis_accounted_fork_children: set[str] = set()
++        self._cis_lease_ref_counts: dict[int, int] = {}
 +        self._cis_max_fork_hints = 4096
-
++        self._cis_branch_records: OrderedDict[str, _CISBranchRecord] = OrderedDict()
++        self._cis_max_branch_records = 16384
+ 
          # Pre-constructed KVCacheBlocks with no blocks, callers should use this
          # via create_kv_cache_blocks instead of creating new ones to avoid GC
-@@ -173,6 +188,91 @@ class KVCacheManager:
+@@ -173,6 +208,341 @@ class KVCacheManager:
          self.prefix_cache_stats = PrefixCacheStats()
          return stats
-
+ 
 +    def _release_cis_fork_hint(self, parent_id: str) -> _CISForkHint | None:
 +        hint = self._cis_fork_hints.pop(parent_id, None)
 +        if hint is not None and hint.leased_blocks:
++            for block in hint.leased_blocks:
++                remaining = self._cis_lease_ref_counts[block.block_id] - 1
++                if remaining:
++                    self._cis_lease_ref_counts[block.block_id] = remaining
++                else:
++                    del self._cis_lease_ref_counts[block.block_id]
 +            self.block_pool.free_blocks(reversed(hint.leased_blocks))
 +            logger.info(
-+                "CIS_KV_FORK lease_release parent=%s blocks=%d",
++                "CIS_KV_FORK lease_release parent=%s blocks=%d scope=%s held_unique=%d",
 +                parent_id,
 +                len(hint.leased_blocks),
++                hint.lease_scope,
++                len(self._cis_lease_ref_counts),
 +            )
 +        return hint
 +
@@ -79,7 +104,7 @@ index 3a90b2a..8af4f7c 100644
 +            logger.info("CIS_KV_FORK lease_expire parent=%s", parent_id)
 +
 +    def capture_cis_fork(self, request: Request) -> None:
-+        """Remember a candidate's blocks and optionally lease its unique suffix."""
++        """Capture a candidate's full blocks before its request is freed."""
 +        self._expire_cis_fork_hints()
 +        params = request.sampling_params
 +        extra_args = None if params is None else params.extra_args
@@ -88,6 +113,12 @@ index 3a90b2a..8af4f7c 100644
 +        if expected <= 0 or not self.enable_caching or self.num_kv_cache_groups != 1:
 +            return
 +        if not fork_handle:
++            return
++        if (
++            request.output_token_ids
++            and request.output_token_ids[-1] in params.all_stop_token_ids
++        ):
++            logger.info("CIS_KV_FORK terminal_parent parent=%s", fork_handle)
 +            return
 +        computed_tokens = min(request.num_computed_tokens, request.num_tokens - 1)
 +        num_blocks = computed_tokens // self.block_pool.hash_block_size
@@ -103,6 +134,9 @@ index 3a90b2a..8af4f7c 100644
 +            return
 +        fork_handle = str(fork_handle)
 +        lease_ms = int((extra_args or {}).get("cis_fork_lease_ms", 0))
++        lease_scope = str(
++            (extra_args or {}).get("cis_fork_lease_scope", "candidate_suffix")
++        )
 +        shared_prefix_tokens = int(
 +            (extra_args or {}).get("cis_fork_shared_prefix_tokens", 0)
 +        )
@@ -111,8 +145,50 @@ index 3a90b2a..8af4f7c 100644
 +            max(0, shared_prefix_tokens // self.block_pool.hash_block_size),
 +        )
 +        leased_blocks = blocks[first_lease_block:] if lease_ms > 0 else ()
++        max_lease_fraction = float(
++            (extra_args or {}).get("cis_fork_lease_max_fraction", 1.0)
++        )
++        max_lease_blocks = max(
++            1, int(self.block_pool.num_gpu_blocks * max_lease_fraction)
++        )
++        added_unique = sum(
++            block.block_id not in self._cis_lease_ref_counts
++            for block in leased_blocks
++        )
++        if (
++            lease_scope == "full_parent"
++            and len(self._cis_lease_ref_counts) + added_unique > max_lease_blocks
++        ):
++            candidate_prefix_tokens = int(
++                (extra_args or {}).get("cis_fork_candidate_prefix_tokens", 0)
++            )
++            suffix_start = min(
++                num_blocks,
++                max(
++                    0,
++                    candidate_prefix_tokens // self.block_pool.hash_block_size,
++                ),
++            )
++            suffix_blocks = blocks[suffix_start:]
++            suffix_added_unique = sum(
++                block.block_id not in self._cis_lease_ref_counts
++                for block in suffix_blocks
++            )
++            if (
++                len(self._cis_lease_ref_counts) + suffix_added_unique
++                <= max_lease_blocks
++            ):
++                leased_blocks = suffix_blocks
++                lease_scope = "candidate_suffix_fallback"
++            else:
++                leased_blocks = ()
++                lease_scope = "direct_fallback"
 +        if leased_blocks:
 +            self.block_pool.touch(leased_blocks)
++            for block in leased_blocks:
++                self._cis_lease_ref_counts[block.block_id] = (
++                    self._cis_lease_ref_counts.get(block.block_id, 0) + 1
++                )
 +        self._release_cis_fork_hint(fork_handle)
 +        self._cis_fork_hints[fork_handle] = _CISForkHint(
 +            blocks=blocks,
@@ -121,17 +197,22 @@ index 3a90b2a..8af4f7c 100644
 +            remaining_children=expected,
 +            leased_blocks=leased_blocks,
 +            expires_at=(monotonic() + lease_ms / 1_000.0 if lease_ms > 0 else None),
++            lease_scope=lease_scope,
 +        )
 +        self._cis_fork_hints.move_to_end(fork_handle)
 +        while len(self._cis_fork_hints) > self._cis_max_fork_hints:
 +            oldest = next(iter(self._cis_fork_hints))
 +            self._release_cis_fork_hint(oldest)
 +        logger.info(
-+            "CIS_KV_FORK capture parent=%s blocks=%d children=%d leased=%d",
++            "CIS_KV_FORK capture parent=%s blocks=%d children=%d leased=%d "
++            "scope=%s held_unique=%d budget=%d",
 +            fork_handle,
 +            num_blocks,
 +            expected,
 +            len(leased_blocks),
++            lease_scope,
++            len(self._cis_lease_ref_counts),
++            max_lease_blocks,
 +        )
 +
 +    def _get_cis_forked_blocks(
@@ -175,10 +256,11 @@ index 3a90b2a..8af4f7c 100644
 +            return None
 +        self._cis_pending_forks[request.request_id] = str(parent_id)
 +        logger.info(
-+            "CIS_KV_FORK hit child=%s parent=%s tokens=%d",
++            "CIS_KV_FORK hit child=%s parent=%s tokens=%d scope=%s",
 +            request.request_id,
 +            parent_id,
 +            hint.num_tokens,
++            hint.lease_scope,
 +        )
 +        return KVCacheBlocks((hint.blocks,)), hint.num_tokens
 +
@@ -187,6 +269,10 @@ index 3a90b2a..8af4f7c 100644
 +        parent_id = self._cis_pending_forks.pop(request_id, None)
 +        if parent_id is None:
 +            return
++        self._cis_accounted_fork_children.add(request_id)
++        self._consume_cis_fork_child(parent_id)
++
++    def _consume_cis_fork_child(self, parent_id: str) -> None:
 +        hint = self._cis_fork_hints.get(parent_id)
 +        if hint is None:
 +            return
@@ -194,13 +280,141 @@ index 3a90b2a..8af4f7c 100644
 +        if hint.remaining_children <= 0:
 +            self._release_cis_fork_hint(parent_id)
 +
++    def _capture_cis_branch_record(
++        self,
++        request: Request,
++        disposable_from_token: int,
++        branch_kind: str,
++    ) -> None:
++        if not self.enable_caching or self.num_kv_cache_groups != 1:
++            return
++        blocks = tuple(self.coordinator.get_blocks(request.request_id)[0])
++        start = min(
++            len(blocks),
++            max(
++                0,
++                (disposable_from_token + self.block_pool.hash_block_size - 1)
++                // self.block_pool.hash_block_size,
++            ),
++        )
++        disposable = tuple(
++            block
++            for block in blocks[start:]
++            if not block.is_null and block.block_hash is not None
++        )
++        if not disposable:
++            return
++        params = request.sampling_params
++        extra_args = None if params is None else params.extra_args
++        branch_handle = str(
++            (extra_args or {}).get("cis_branch_handle", request.request_id)
++        )
++        self._cis_branch_records[branch_handle] = _CISBranchRecord(
++            blocks=disposable,
++            block_hashes=tuple(block.block_hash for block in disposable),
++            branch_kind=branch_kind,
++        )
++        self._cis_branch_records.move_to_end(branch_handle)
++        while len(self._cis_branch_records) > self._cis_max_branch_records:
++            self._cis_branch_records.popitem(last=False)
++        logger.info(
++            "CIS_KV_BRANCH record request=%s kind=%s blocks=%d",
++            branch_handle,
++            branch_kind,
++            len(disposable),
++        )
++
++    def cis_resample_gc(
++        self,
++        selected_candidate_id: str | None,
++        candidate_ids: list[str],
++        rollout_ids: list[str],
++    ) -> dict[str, int]:
++        """Evict dead CIS branches after reduce while preserving the winner."""
++        protected_ids: set[int] = set()
++        selected = (
++            None
++            if selected_candidate_id is None
++            else self._cis_branch_records.get(selected_candidate_id)
++        )
++        if selected is not None:
++            protected_ids.update(
++                block.block_id
++                for block, recorded_hash in zip(
++                    selected.blocks, selected.block_hashes, strict=True
++                )
++                if block.block_hash == recorded_hash
++            )
++
++        dead_ids = [
++            request_id
++            for request_id in candidate_ids
++            if request_id != selected_candidate_id
++        ]
++        dead_ids.extend(rollout_ids)
++        evictable: list[KVCacheBlock] = []
++        stale_blocks = active_blocks = protected_blocks = 0
++        recorded_requests = 0
++        for request_id in dead_ids:
++            record = self._cis_branch_records.pop(request_id, None)
++            if record is None:
++                continue
++            recorded_requests += 1
++            for block, recorded_hash in zip(
++                record.blocks, record.block_hashes, strict=True
++            ):
++                if block.block_id in protected_ids:
++                    protected_blocks += 1
++                elif block.block_hash != recorded_hash:
++                    stale_blocks += 1
++                elif block.ref_cnt > 0:
++                    active_blocks += 1
++                else:
++                    evictable.append(block)
++
++        if selected_candidate_id is not None:
++            self._cis_branch_records.pop(selected_candidate_id, None)
++        unique_evictable = {block.block_id: block for block in evictable}
++        self.block_pool.evict_blocks(set(unique_evictable))
++        movable = [
++            block
++            for block in unique_evictable.values()
++            if block.ref_cnt == 0
++            and block.prev_free_block is not None
++            and block.next_free_block is not None
++        ]
++        if movable:
++            for block in movable:
++                self.block_pool.free_block_queue.remove(block)
++            self.block_pool.free_block_queue.prepend_n(movable)
++        result = {
++            "recorded_requests": recorded_requests,
++            "evicted_blocks": len(unique_evictable),
++            "stale_blocks": stale_blocks,
++            "active_blocks": active_blocks,
++            "protected_blocks": protected_blocks,
++        }
++        logger.info(
++            "CIS_KV_RESAMPLE_GC selected=%s candidates=%d rollouts=%d "
++            "recorded=%d evicted=%d stale=%d active=%d protected=%d",
++            selected_candidate_id,
++            len(candidate_ids),
++            len(rollout_ids),
++            recorded_requests,
++            len(unique_evictable),
++            stale_blocks,
++            active_blocks,
++            protected_blocks,
++        )
++        return result
++
      def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
          """Get the computed (cached) blocks for the request.
          Note that the computed blocks must be full.
-@@ -193,6 +293,13 @@ class KVCacheManager:
+@@ -192,6 +562,17 @@ class KVCacheManager:
          if not self.enable_caching or request.skip_reading_prefix_cache:
              return self.empty_kv_cache_blocks, 0
-
+ 
 +        cis_fork = self._get_cis_forked_blocks(request)
 +        if cis_fork is not None:
 +            if self.log_stats:
@@ -214,22 +428,45 @@ index 3a90b2a..8af4f7c 100644
 +
          # NOTE: When all tokens hit the cache, we must recompute the last token
          # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
-@@ -339,6 +446,7 @@ class KVCacheManager:
+         # This can trigger recomputation of an entire block, rather than just
+@@ -368,6 +749,7 @@ class KVCacheManager:
              num_tokens_main_model,
              num_encoder_tokens,
          )
 +        self._commit_cis_fork(request.request_id)
-
+ 
          # P/D: delay caching blocks if we have to recv from
          # remote. Update state for locally cached blocks.
-@@ -397,6 +505,47 @@ class KVCacheManager:
+@@ -395,7 +777,70 @@ class KVCacheManager:
+         Args:
              request: The request to free the blocks.
          """
-+        self._cis_pending_forks.pop(request.request_id, None)
++        pending_parent = self._cis_pending_forks.get(request.request_id)
++        if pending_parent is not None:
++            self._commit_cis_fork(request.request_id)
 +        self._cis_failed_forks.discard(request.request_id)
 +        params = request.sampling_params
 +        extra_args = None if params is None else params.extra_args
++        parent_id = (extra_args or {}).get("cis_fork_parent_request_id")
++        if (
++            parent_id
++            and request.request_id not in self._cis_accounted_fork_children
++        ):
++            self._consume_cis_fork_child(str(parent_id))
++            logger.info(
++                "CIS_KV_FORK child_abandon child=%s parent=%s",
++                request.request_id,
++                parent_id,
++            )
++        self._cis_accounted_fork_children.discard(request.request_id)
 +        disposable_from = (extra_args or {}).get("cis_disposable_from_token")
++        branch_record_from = (extra_args or {}).get("cis_branch_record_from_token")
++        if branch_record_from is not None and request.is_finished():
++            self._capture_cis_branch_record(
++                request,
++                int(branch_record_from),
++                str((extra_args or {}).get("cis_branch_kind", "unknown")),
++            )
 +        disposable_blocks: tuple[KVCacheBlock, ...] = ()
 +        if (
 +            disposable_from is not None
@@ -268,29 +505,17 @@ index 3a90b2a..8af4f7c 100644
 +                request.request_id,
 +                len(movable),
 +            )
-
+ 
      def remove_skipped_blocks(
          self, request_id: str, total_computed_tokens: int
-diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 98e16b6..0446250 100644
---- a/vllm/v1/core/sched/scheduler.py
-+++ b/vllm/v1/core/sched/scheduler.py
-@@ -1802,6 +1802,7 @@ class Scheduler(SchedulerInterface):
-
-         delay_free_blocks |= connector_delay_free_blocks
-         if not delay_free_blocks:
-+            self.kv_cache_manager.capture_cis_fork(request)
-             self._free_blocks(request)
-
-         return kv_xfer_params
 diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
-index 4ccdcda..8ccdcda 100644
+index 3da3d7e..83a358b 100644
 --- a/vllm/v1/core/kv_cache_utils.py
 +++ b/vllm/v1/core/kv_cache_utils.py
-@@ -316,6 +316,31 @@ class FreeKVCacheBlockQueue:
-
+@@ -345,6 +345,24 @@ class FreeKVCacheBlockQueue:
+ 
          self.num_free_blocks += len(blocks)
-
+ 
 +    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
 +        """Put free blocks at the front in their eviction order."""
 +        if not blocks:
@@ -311,3 +536,58 @@ index 4ccdcda..8ccdcda 100644
 +
      def get_all_free_blocks(self) -> list[KVCacheBlock]:
          """Get all free blocks in the free list. Mainly used for testing.
+ 
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index ea2c2a6..fb8e3a2 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1801,6 +1801,7 @@ class Scheduler(SchedulerInterface):
+ 
+         delay_free_blocks |= connector_delay_free_blocks
+         if not delay_free_blocks:
++            self.kv_cache_manager.capture_cis_fork(request)
+             self._free_blocks(request)
+ 
+         return kv_xfer_params
+@@ -1878,6 +1879,18 @@ class Scheduler(SchedulerInterface):
+ 
+         return reset_successful
+ 
++    def cis_resample_gc(
++        self,
++        selected_candidate_id: str | None,
++        candidate_ids: list[str],
++        rollout_ids: list[str],
++    ) -> dict[str, int]:
++        return self.kv_cache_manager.cis_resample_gc(
++            selected_candidate_id,
++            candidate_ids,
++            rollout_ids,
++        )
++
+     def reset_connector_cache(self) -> bool:
+         if self.connector is None:
+             logger.warning("reset_connector called but no KV connector is configured.")
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 2f2acdd..d72cd6c 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -576,6 +576,18 @@ class EngineCore:
+             reset_running_requests, reset_connector
+         )
+ 
++    def cis_resample_gc(
++        self,
++        selected_candidate_id: str | None,
++        candidate_ids: list[str],
++        rollout_ids: list[str],
++    ) -> dict[str, int]:
++        return self.scheduler.cis_resample_gc(
++            selected_candidate_id,
++            candidate_ids,
++            rollout_ids,
++        )
++
+     def reset_encoder_cache(self) -> None:
+         """Reset the encoder cache to invalidate all cached encoder outputs.
+ 

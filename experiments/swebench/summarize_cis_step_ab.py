@@ -19,7 +19,8 @@ REQUEST_ID = re.compile(
 FORK_CAPTURE = re.compile(
     r"CIS_KV_FORK capture parent=(?P<parent>\S+) "
     r"blocks=(?P<blocks>\d+) children=(?P<children>\d+)"
-    r"(?: leased=(?P<leased>\d+))?"
+    r"(?: leased=(?P<leased>\d+))?(?: scope=(?P<scope>\S+))?"
+    r"(?: held_unique=(?P<held_unique>\d+) budget=(?P<budget>\d+))?"
 )
 FORK_HIT = re.compile(
     r"CIS_KV_FORK hit child=(?P<child>\S+) parent=(?P<parent>\S+) "
@@ -33,8 +34,22 @@ FORK_LEASE_RELEASE = re.compile(
     r"CIS_KV_FORK lease_release parent=(?P<parent>\S+) blocks=(?P<blocks>\d+)"
 )
 FORK_LEASE_EXPIRE = re.compile(r"CIS_KV_FORK lease_expire parent=(?P<parent>\S+)")
+FORK_TERMINAL_PARENT = re.compile(
+    r"CIS_KV_FORK terminal_parent parent=(?P<parent>\S+)"
+)
 BRANCH_DEMOTE = re.compile(
     r"CIS_KV_BRANCH demote request=(?P<request>\S+) blocks=(?P<blocks>\d+)"
+)
+BRANCH_RECORD = re.compile(
+    r"CIS_KV_BRANCH record request=(?P<request>\S+) "
+    r"kind=(?P<kind>\S+) blocks=(?P<blocks>\d+)"
+)
+RESAMPLE_GC = re.compile(
+    r"CIS_KV_RESAMPLE_GC selected=(?P<selected>\S+) "
+    r"candidates=(?P<candidates>\d+) rollouts=(?P<rollouts>\d+) "
+    r"recorded=(?P<recorded>\d+) evicted=(?P<evicted>\d+) "
+    r"stale=(?P<stale>\d+) active=(?P<active>\d+) "
+    r"protected=(?P<protected>\d+)"
 )
 
 
@@ -110,6 +125,8 @@ def summarize(root: Path) -> dict[str, Any]:
     admission_wait_ms = []
     candidate_rollout_overlap_ms = []
     streamed_rollout_submission_batches = []
+    kv_gc_ms = []
+    kv_gc_evicted_blocks = []
     intervals = []
     output_hash = hashlib.sha256()
     for record in sorted(
@@ -149,6 +166,11 @@ def summarize(root: Path) -> dict[str, Any]:
                 )
                 streamed_rollout_submission_batches.append(
                     float(event.get("submission_batches", 0.0))
+                )
+            elif name == "resample" and event.get("kv_gc_seconds") is not None:
+                kv_gc_ms.append(float(event.get("kv_gc_seconds", 0.0)) * 1_000.0)
+                kv_gc_evicted_blocks.append(
+                    float(event.get("kv_gc_evicted_blocks", 0.0))
                 )
         end_to_end_step_ms.extend(
             stages["block"] + stages.get("step_admission_wait", 0.0)
@@ -209,6 +231,23 @@ def summarize(root: Path) -> dict[str, Any]:
     ]
     fork_lease_release_records = list(FORK_LEASE_RELEASE.finditer(runtime_log))
     fork_lease_expire_records = list(FORK_LEASE_EXPIRE.finditer(runtime_log))
+    fork_terminal_parent_records = list(FORK_TERMINAL_PARENT.finditer(runtime_log))
+    fork_lease_scopes = sorted(
+        {
+            scope
+            for match in fork_capture_by_parent.values()
+            if (scope := match.group("scope")) is not None
+        }
+    )
+    fork_lease_scope_counts: dict[str, int] = defaultdict(int)
+    fork_held_unique_blocks = []
+    fork_lease_budgets = set()
+    for match in fork_capture_by_parent.values():
+        fork_lease_scope_counts[match.group("scope") or "unreported"] += 1
+        if match.group("held_unique") is not None:
+            fork_held_unique_blocks.append(int(match.group("held_unique")))
+        if match.group("budget") is not None:
+            fork_lease_budgets.add(int(match.group("budget")))
     fork_miss_reasons: dict[str, int] = defaultdict(int)
     for reasons in fork_miss_by_child.values():
         reason = (
@@ -223,6 +262,10 @@ def summarize(root: Path) -> dict[str, Any]:
     branch_demoted_blocks = [
         int(match.group("blocks")) for match in branch_demote_by_request.values()
     ]
+    branch_record_by_request = {
+        match.group("request"): match for match in BRANCH_RECORD.finditer(runtime_log)
+    }
+    resample_gc_records = list(RESAMPLE_GC.finditer(runtime_log))
     wall_seconds = float(benchmark.get("wall_seconds", 0.0) or 0.0)
     prefill_tokens = float(backend.get("prefill_tokens", 0.0) or 0.0)
     cached_tokens = float(
@@ -260,6 +303,9 @@ def summarize(root: Path) -> dict[str, Any]:
         "native_parallel_children": backend.get("native_parallel_children"),
         "kv_fork": {
             "captures": fork_captures,
+            "lease_scopes": fork_lease_scopes,
+            "lease_scope_counts": dict(sorted(fork_lease_scope_counts.items())),
+            "terminal_parents": len(fork_terminal_parent_records),
             "hits": fork_hits,
             "misses": fork_misses,
             "hit_rate": (
@@ -294,6 +340,8 @@ def summarize(root: Path) -> dict[str, Any]:
                 "p95": _percentile(fork_leased_blocks, 0.95),
                 "release_events": len(fork_lease_release_records),
                 "expire_events": len(fork_lease_expire_records),
+                "peak_unique": max(fork_held_unique_blocks, default=None),
+                "budgets": sorted(fork_lease_budgets),
             },
             "miss_reasons": dict(sorted(fork_miss_reasons.items())),
         },
@@ -306,6 +354,38 @@ def summarize(root: Path) -> dict[str, Any]:
                 else None
             ),
             "blocks_per_request_p95": _percentile(branch_demoted_blocks, 0.95),
+        },
+        "kv_resample_gc": {
+            "recorded_requests": len(branch_record_by_request),
+            "candidate_records": sum(
+                match.group("kind") == "candidate"
+                for match in branch_record_by_request.values()
+            ),
+            "rollout_records": sum(
+                match.group("kind") == "rollout"
+                for match in branch_record_by_request.values()
+            ),
+            "transitions": len(resample_gc_records),
+            "matched_records": sum(
+                int(match.group("recorded")) for match in resample_gc_records
+            ),
+            "evicted_blocks": sum(
+                int(match.group("evicted")) for match in resample_gc_records
+            ),
+            "stale_blocks": sum(
+                int(match.group("stale")) for match in resample_gc_records
+            ),
+            "active_blocks": sum(
+                int(match.group("active")) for match in resample_gc_records
+            ),
+            "protected_blocks": sum(
+                int(match.group("protected")) for match in resample_gc_records
+            ),
+            "latency_ms": {
+                "mean": statistics.fmean(kv_gc_ms) if kv_gc_ms else None,
+                "p95": _percentile(kv_gc_ms, 0.95),
+            },
+            "algorithm_trace_evicted_blocks": sum(kv_gc_evicted_blocks),
         },
         "steps": len(block_ms),
         "step_completion_ms": {

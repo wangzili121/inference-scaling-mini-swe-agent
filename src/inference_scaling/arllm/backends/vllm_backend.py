@@ -1398,7 +1398,10 @@ class AsyncVLLMBackend(VLLMBackend):
         native_parallel_sampling: bool = False,
         native_kv_fork: bool = False,
         native_kv_fork_lease: bool = False,
+        native_kv_fork_lease_scope: str = "candidate_suffix",
+        native_kv_fork_lease_max_fraction: float | None = None,
         native_kv_branch_eviction: bool = False,
+        native_kv_resample_gc: bool = False,
     ) -> None:
         if (engine is None) == (engine_factory is None):
             raise ValueError("provide exactly one of engine or engine_factory")
@@ -1428,9 +1431,34 @@ class AsyncVLLMBackend(VLLMBackend):
         self._native_parallel_sampling = bool(native_parallel_sampling)
         self._native_kv_fork = bool(native_kv_fork)
         self._native_kv_fork_lease = bool(native_kv_fork_lease)
+        if native_kv_fork_lease_scope not in {"candidate_suffix", "full_parent"}:
+            raise ValueError("unknown native KV fork lease scope")
+        self._native_kv_fork_lease_scope = native_kv_fork_lease_scope
+        if native_kv_fork_lease_max_fraction is not None and not (
+            0.0 < native_kv_fork_lease_max_fraction <= 1.0
+        ):
+            raise ValueError("native KV fork lease fraction must be in (0, 1]")
+        self._native_kv_fork_lease_max_fraction = (
+            native_kv_fork_lease_max_fraction
+        )
         self._native_kv_branch_eviction = bool(native_kv_branch_eviction)
+        self._native_kv_resample_gc = bool(native_kv_resample_gc)
         if self._native_kv_fork_lease and not self._native_kv_fork:
             raise ValueError("native_kv_fork_lease requires native_kv_fork")
+        if (
+            self._native_kv_fork_lease_scope != "candidate_suffix"
+            and not self._native_kv_fork_lease
+        ):
+            raise ValueError(
+                "native_kv_fork_lease_scope requires native_kv_fork_lease"
+            )
+        if (
+            self._native_kv_fork_lease_max_fraction is not None
+            and not self._native_kv_fork_lease
+        ):
+            raise ValueError(
+                "native_kv_fork_lease_max_fraction requires native_kv_fork_lease"
+            )
         if self._native_parallel_sampling and self._native_kv_fork:
             raise ValueError(
                 "native_parallel_sampling and native_kv_fork are separate experiments"
@@ -1504,7 +1532,10 @@ class AsyncVLLMBackend(VLLMBackend):
         native_parallel_sampling: bool = False,
         native_kv_fork: bool = False,
         native_kv_fork_lease: bool = False,
+        native_kv_fork_lease_scope: str = "candidate_suffix",
+        native_kv_fork_lease_max_fraction: float | None = None,
         native_kv_branch_eviction: bool = False,
+        native_kv_resample_gc: bool = False,
     ) -> "AsyncVLLMBackend":
         try:
             from transformers import AutoTokenizer
@@ -1534,11 +1565,33 @@ class AsyncVLLMBackend(VLLMBackend):
             raise RuntimeError(
                 "native_kv_fork_lease requires the CIS KV fork lease runtime patch"
             )
+        if native_kv_fork_lease_scope == "full_parent" and not bool(
+            getattr(
+                KVCacheManager,
+                "cis_fork_full_parent_handoff_supported",
+                False,
+            )
+        ):
+            raise RuntimeError(
+                "full-parent KV handoff requires the matching CIS runtime patch"
+            )
+        if native_kv_fork_lease_max_fraction is not None and not bool(
+            getattr(KVCacheManager, "cis_fork_lease_budget_supported", False)
+        ):
+            raise RuntimeError(
+                "bounded KV fork handoff requires the matching CIS runtime patch"
+            )
         if native_kv_branch_eviction and not bool(
             getattr(KVCacheManager, "cis_branch_eviction_supported", False)
         ):
             raise RuntimeError(
                 "native_kv_branch_eviction requires the CIS branch eviction runtime patch"
+            )
+        if native_kv_resample_gc and not bool(
+            getattr(KVCacheManager, "cis_resample_gc_supported", False)
+        ):
+            raise RuntimeError(
+                "native_kv_resample_gc requires the CIS resample GC runtime patch"
             )
 
         tokenizer = AutoTokenizer.from_pretrained(
@@ -1638,12 +1691,19 @@ class AsyncVLLMBackend(VLLMBackend):
             native_parallel_sampling=native_parallel_sampling,
             native_kv_fork=native_kv_fork,
             native_kv_fork_lease=native_kv_fork_lease,
+            native_kv_fork_lease_scope=native_kv_fork_lease_scope,
+            native_kv_fork_lease_max_fraction=native_kv_fork_lease_max_fraction,
             native_kv_branch_eviction=native_kv_branch_eviction,
+            native_kv_resample_gc=native_kv_resample_gc,
         )
 
     def _sampling_params(self, request: GenerationRequest) -> Any:
         params = super()._sampling_params(request)
-        if not self._native_kv_fork and not self._native_kv_branch_eviction:
+        if (
+            not self._native_kv_fork
+            and not self._native_kv_branch_eviction
+            and not self._native_kv_resample_gc
+        ):
             return params
         extra_args = dict(getattr(params, "extra_args", None) or {})
         if self._native_kv_fork and request.fork_expected_children:
@@ -1652,14 +1712,29 @@ class AsyncVLLMBackend(VLLMBackend):
                 request.fork_expected_children
             )
             if self._native_kv_fork_lease:
-                extra_args["cis_fork_shared_prefix_tokens"] = len(request.prefix)
+                extra_args["cis_fork_shared_prefix_tokens"] = (
+                    0
+                    if self._native_kv_fork_lease_scope == "full_parent"
+                    else len(request.prefix)
+                )
+                extra_args["cis_fork_lease_scope"] = self._native_kv_fork_lease_scope
+                extra_args["cis_fork_candidate_prefix_tokens"] = len(request.prefix)
+                if self._native_kv_fork_lease_max_fraction is not None:
+                    extra_args["cis_fork_lease_max_fraction"] = (
+                        self._native_kv_fork_lease_max_fraction
+                    )
                 # A saturated CIS step can queue a child for well over a minute.
-                # The lease covers only the candidate-specific full suffix blocks
-                # and is released as soon as every rollout child is admitted.
+                # The hold is released as soon as every rollout child is admitted.
                 extra_args["cis_fork_lease_ms"] = 300_000
         if self._native_kv_fork and request.fork_parent_request_id is not None:
             extra_args["cis_fork_parent_request_id"] = request.fork_parent_request_id
         match = _CIS_STEP_REQUEST.match(request.request_id)
+        if self._native_kv_resample_gc and match is not None:
+            extra_args["cis_branch_handle"] = request.request_id
+            extra_args["cis_branch_record_from_token"] = len(request.prefix)
+            extra_args["cis_branch_kind"] = (
+                "rollout" if match.group("rollout") is not None else "candidate"
+            )
         if (
             self._native_kv_branch_eviction
             and match is not None
@@ -1668,6 +1743,35 @@ class AsyncVLLMBackend(VLLMBackend):
             extra_args["cis_disposable_from_token"] = len(request.prefix)
         params.extra_args = extra_args or None
         return params
+
+    def resolve_cis_branches(
+        self,
+        *,
+        selected_candidate_id: str,
+        candidate_ids: Sequence[str],
+        rollout_ids: Sequence[str],
+    ) -> Mapping[str, int] | None:
+        """Apply the algorithm's exact winner/loser transition to cached KV."""
+
+        if not self._native_kv_resample_gc:
+            return None
+
+        async def resolve() -> Mapping[str, int]:
+            engine_core = getattr(self._engine, "engine_core", None)
+            callback = getattr(engine_core, "call_utility_async", None)
+            if callback is None:
+                raise RuntimeError("AsyncLLM does not expose EngineCore utility calls")
+            result = await callback(
+                "cis_resample_gc",
+                selected_candidate_id,
+                list(candidate_ids),
+                list(rollout_ids),
+            )
+            if not isinstance(result, Mapping):
+                raise RuntimeError("CIS resample GC returned an invalid result")
+            return result
+
+        return self._runner.run(resolve())
 
     def _next_request_id(self) -> str:
         with self._request_counter_lock:

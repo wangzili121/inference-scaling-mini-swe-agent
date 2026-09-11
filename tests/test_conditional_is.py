@@ -131,6 +131,41 @@ def test_off_policy_ratio_scores_only_rollout_suffix() -> None:
             )
 
 
+def test_resample_reports_exact_winner_and_dead_branch_ids() -> None:
+    class TrackingBackend(TabularAutoregressiveBackend):
+        def __init__(self):
+            super().__init__({}, fallback=[0.5, 0.5])
+            self.transitions = []
+
+        def resolve_cis_branches(self, **transition):
+            self.transitions.append(transition)
+
+    backend = TrackingBackend()
+    result = run_conditional_is(
+        backend,
+        (),
+        ConditionalISConfig(
+            candidate_count=3,
+            rollout_count=2,
+            block_size=1,
+            total_length=2,
+        ),
+        lambda _prompt, generated: float(sum(generated)),
+        SeedStream(42),
+    )
+
+    assert len(backend.transitions) == len(result.steps)
+    transition = backend.transitions[0]
+    assert transition["selected_candidate_id"] == (
+        result.steps[0].selected.request_id
+    )
+    assert len(transition["candidate_ids"]) == 3
+    assert len(transition["rollout_ids"]) == 6
+    assert set(transition["candidate_ids"]) == {
+        candidate.request_id for candidate in result.steps[0].candidates
+    }
+
+
 def test_temperature_scaled_base_policy_is_used_in_off_policy_ratio() -> None:
     backend = _backend()
     base_sampling = SamplingConfig(temperature=0.8)

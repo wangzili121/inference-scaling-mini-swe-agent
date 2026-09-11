@@ -542,6 +542,15 @@ class _ParallelAsyncEngine(_AsyncEngine):
             )
 
 
+class _UtilityCore:
+    def __init__(self):
+        self.calls = []
+
+    async def call_utility_async(self, method, *args):
+        self.calls.append((method, args))
+        return {"evicted_blocks": 7}
+
+
 def test_async_vllm_overlaps_requests_from_independent_callers() -> None:
     engine = _AsyncEngine()
     backend = AsyncVLLMBackend(
@@ -720,6 +729,44 @@ def test_async_vllm_native_kv_fork_lease_marks_candidate_suffix() -> None:
         "cis_fork_handle": "job-a:step:0:candidate:0",
         "cis_fork_expected_children": 3,
         "cis_fork_shared_prefix_tokens": 3,
+        "cis_fork_lease_scope": "candidate_suffix",
+        "cis_fork_candidate_prefix_tokens": 3,
+        "cis_fork_lease_ms": 300_000,
+    }
+
+
+def test_async_vllm_native_kv_fork_full_parent_handoff() -> None:
+    backend = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        native_kv_fork=True,
+        native_kv_fork_lease=True,
+        native_kv_fork_lease_scope="full_parent",
+        native_kv_fork_lease_max_fraction=0.2,
+    )
+    try:
+        request = GenerationRequest(
+            (1, 2, 3),
+            1,
+            SamplingConfig(),
+            7,
+            "job-a:step:0:candidate:0",
+            fork_expected_children=3,
+        )
+        params = backend._sampling_params(request)
+    finally:
+        backend.close()
+
+    assert params.extra_args == {
+        "cis_fork_handle": "job-a:step:0:candidate:0",
+        "cis_fork_expected_children": 3,
+        "cis_fork_shared_prefix_tokens": 0,
+        "cis_fork_lease_scope": "full_parent",
+        "cis_fork_candidate_prefix_tokens": 3,
+        "cis_fork_lease_max_fraction": 0.2,
         "cis_fork_lease_ms": 300_000,
     }
 
@@ -755,6 +802,80 @@ def test_async_vllm_branch_eviction_marks_rollout_tail() -> None:
 
     assert candidate_params.extra_args is None
     assert rollout_params.extra_args == {"cis_disposable_from_token": 4}
+
+
+def test_async_vllm_resample_gc_records_candidate_and_rollout_suffixes() -> None:
+    backend = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        native_kv_resample_gc=True,
+    )
+    try:
+        candidate = GenerationRequest(
+            (1, 2),
+            1,
+            SamplingConfig(),
+            7,
+            "job-a:step:0:candidate:0",
+        )
+        rollout = GenerationRequest(
+            (1, 2, 3, 4),
+            1,
+            SamplingConfig(),
+            8,
+            "job-a:step:0:candidate:0:rollout:0",
+        )
+        candidate_params = backend._sampling_params(candidate)
+        rollout_params = backend._sampling_params(rollout)
+    finally:
+        backend.close()
+
+    assert candidate_params.extra_args == {
+        "cis_branch_handle": "job-a:step:0:candidate:0",
+        "cis_branch_record_from_token": 2,
+        "cis_branch_kind": "candidate",
+    }
+    assert rollout_params.extra_args == {
+        "cis_branch_handle": "job-a:step:0:candidate:0:rollout:0",
+        "cis_branch_record_from_token": 4,
+        "cis_branch_kind": "rollout",
+    }
+
+
+def test_async_vllm_resample_gc_calls_engine_core_utility() -> None:
+    engine = _AsyncEngine()
+    engine.engine_core = _UtilityCore()
+    backend = AsyncVLLMBackend(
+        engine,
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        native_kv_resample_gc=True,
+    )
+    try:
+        result = backend.resolve_cis_branches(
+            selected_candidate_id="candidate:1",
+            candidate_ids=("candidate:0", "candidate:1"),
+            rollout_ids=("rollout:0", "rollout:1"),
+        )
+    finally:
+        backend.close()
+
+    assert result == {"evicted_blocks": 7}
+    assert engine.engine_core.calls == [
+        (
+            "cis_resample_gc",
+            (
+                "candidate:1",
+                ["candidate:0", "candidate:1"],
+                ["rollout:0", "rollout:1"],
+            ),
+        )
+    ]
 
 
 def test_async_vllm_emits_algorithm_request_lifecycle() -> None:

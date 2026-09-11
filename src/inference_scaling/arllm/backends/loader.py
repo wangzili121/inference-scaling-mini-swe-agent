@@ -36,7 +36,10 @@ _VLLM_SETTINGS = {
     "native_parallel_sampling",
     "native_kv_fork",
     "native_kv_fork_lease",
+    "native_kv_fork_lease_max_fraction",
+    "native_kv_fork_lease_scope",
     "native_kv_branch_eviction",
+    "native_kv_resample_gc",
     "parameter_count",
     "pipeline_parallel_size",
     "quantization",
@@ -299,6 +302,24 @@ def load_backend_from_config(
         if not native_kv_fork:
             raise ValueError("native_kv_fork_lease requires native_kv_fork=true")
         acceleration_kwargs["native_kv_fork_lease"] = True
+    native_kv_fork_lease_scope = str(
+        settings.pop("native_kv_fork_lease_scope", "candidate_suffix")
+    )
+    if native_kv_fork_lease_scope != "candidate_suffix":
+        if not native_kv_fork_lease:
+            raise ValueError(
+                "native_kv_fork_lease_scope requires native_kv_fork_lease=true"
+            )
+        acceleration_kwargs["native_kv_fork_lease_scope"] = (
+            native_kv_fork_lease_scope
+        )
+    native_kv_fork_lease_max_fraction = settings.pop(
+        "native_kv_fork_lease_max_fraction", 1.0
+    )
+    if native_kv_fork_lease:
+        acceleration_kwargs["native_kv_fork_lease_max_fraction"] = float(
+            native_kv_fork_lease_max_fraction
+        )
     native_kv_branch_eviction = bool(
         settings.pop("native_kv_branch_eviction", False)
     )
@@ -308,6 +329,13 @@ def load_backend_from_config(
                 "native_kv_branch_eviction requires runtime.backend='vllm'"
             )
         acceleration_kwargs["native_kv_branch_eviction"] = True
+    native_kv_resample_gc = bool(settings.pop("native_kv_resample_gc", False))
+    if native_kv_resample_gc:
+        if not asynchronous:
+            raise ValueError(
+                "native_kv_resample_gc requires runtime.backend='vllm'"
+            )
+        acceleration_kwargs["native_kv_resample_gc"] = True
     if speculation is not None:
         acceleration_kwargs.update(
             speculation=speculation,

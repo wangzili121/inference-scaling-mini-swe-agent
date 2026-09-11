@@ -185,7 +185,10 @@ def test_async_vllm_loader_enables_kv_fork_lease(monkeypatch) -> None:
     config["vllm"] = {
         "native_kv_fork": True,
         "native_kv_fork_lease": True,
+        "native_kv_fork_lease_scope": "full_parent",
+        "native_kv_fork_lease_max_fraction": 0.2,
         "native_kv_branch_eviction": True,
+        "native_kv_resample_gc": True,
     }
     calls = []
     monkeypatch.setattr(
@@ -197,7 +200,10 @@ def test_async_vllm_loader_enables_kv_fork_lease(monkeypatch) -> None:
     assert loader.load_backend_from_config("base-model", config) == "async-vllm"
     assert calls[0][1]["native_kv_fork"] is True
     assert calls[0][1]["native_kv_fork_lease"] is True
+    assert calls[0][1]["native_kv_fork_lease_scope"] == "full_parent"
+    assert calls[0][1]["native_kv_fork_lease_max_fraction"] == 0.2
     assert calls[0][1]["native_kv_branch_eviction"] is True
+    assert calls[0][1]["native_kv_resample_gc"] is True
 
 
 def test_vllm_mh_fused_logprobs_require_sync_without_speculation(monkeypatch) -> None:

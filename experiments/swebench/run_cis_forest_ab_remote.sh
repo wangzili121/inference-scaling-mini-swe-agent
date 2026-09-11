@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
   echo "usage: $0 VARIANT DEVICES OUTPUT PORT CONTAINER" >&2
-  echo "VARIANT: baseline | step-gang | step-gang-6 | step-elastic | step-window-rollout-first | step-fork | step-fork-lease | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
+  echo "VARIANT: baseline | step-gang | step-gang-6 | step-elastic | step-window-rollout-first | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
   exit 2
 fi
 
@@ -26,6 +26,7 @@ candidate_count=${CIS_CANDIDATE_COUNT:-15}
 rollout_count=${CIS_ROLLOUT_COUNT:-3}
 block_size=${CIS_BLOCK_SIZE:-128}
 active_step_limit=${CIS_ACTIVE_STEP_LIMIT:-6}
+fork_lease_max_fraction=${CIS_FORK_LEASE_MAX_FRACTION:-0.20}
 native_runtime_setup=:
 
 for value in "$limit" "$workers" "$candidate_count" "$rollout_count" "$block_size" "$active_step_limit"; do
@@ -77,6 +78,56 @@ case "$variant" in
       --set vllm.native_kv_fork_lease=true
     )
     native_runtime_setup='cd /vllm-workspace/vllm && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch'
+    ;;
+  step-fork-handoff)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_kv_fork=true
+      --set vllm.native_kv_fork_lease=true
+      --set 'vllm.native_kv_fork_lease_scope=\"full_parent\"'
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --check /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch && git apply /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch'
+    ;;
+  step-fork-handoff-bounded)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_kv_fork=true
+      --set vllm.native_kv_fork_lease=true
+      --set 'vllm.native_kv_fork_lease_scope=\"full_parent\"'
+      --set vllm.native_kv_fork_lease_max_fraction="$fork_lease_max_fraction"
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --check /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch && git apply /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch'
+    ;;
+  step-streaming-fork-handoff|step-streaming-fork-handoff-bounded)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set conditional_is.stream_candidate_rollouts=true
+      --set conditional_is.rollout_stream_candidate_batch_size=1
+      --set conditional_is.rollout_stream_max_batches="$candidate_count"
+      --set vllm.native_kv_fork=true
+      --set vllm.native_kv_fork_lease=true
+      --set 'vllm.native_kv_fork_lease_scope=\"full_parent\"'
+    )
+    if [[ "$variant" == step-streaming-fork-handoff-bounded ]]; then
+      variant_args+=(
+        --set vllm.native_kv_fork_lease_max_fraction="$fork_lease_max_fraction"
+      )
+    fi
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --check /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch && git apply /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch'
+    ;;
+  step-resample-gc|step-fork-resample-gc)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_kv_resample_gc=true
+    )
+    if [[ "$variant" == step-fork-resample-gc ]]; then
+      variant_args+=(--set vllm.native_kv_fork=true)
+    fi
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --check /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch && git apply /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch'
     ;;
   step-branch-evict)
     variant_args=(
@@ -196,9 +247,26 @@ if [[ -e "$output" ]] && ! rm -rf "$output" 2>/dev/null; then
 fi
 mkdir -p "$output" "$cache"
 docker rm -f "$container" >/dev/null 2>&1 || true
+/usr/local/bin/npu-smi info >"$output/npu-before.txt"
 
 printf '%q ' "$0" "$@" >"$output/launch-command.txt"
 printf '\n' >>"$output/launch-command.txt"
+cat >"$output/run-environment.txt" <<EOF
+CIS_IMAGE=$image
+CIS_WORKSPACE=$workspace
+CIS_MODEL_DIR=$model
+CIS_PUBLIC_WORKLOAD_DIR=$public_workload
+CIS_SELF_WORKLOAD_DIR=$self_workload
+CIS_CATEGORICAL_DIR=$categorical
+CIS_VLLM_CACHE=$cache
+CIS_LIMIT=$limit
+CIS_WORKERS=$workers
+CIS_CANDIDATE_COUNT=$candidate_count
+CIS_ROLLOUT_COUNT=$rollout_count
+CIS_BLOCK_SIZE=$block_size
+CIS_ACTIVE_STEP_LIMIT=$active_step_limit
+CIS_FORK_LEASE_MAX_FRACTION=$fork_lease_max_fraction
+EOF
 
 docker run -d \
   --name "$container" \

@@ -56,6 +56,9 @@ request_priority_policy = "none"
 native_parallel_sampling = false
 native_kv_fork = false
 native_kv_fork_lease = false
+native_kv_fork_lease_scope = "candidate_suffix"
+native_kv_fork_lease_max_fraction = 1.0
+native_kv_resample_gc = false
 native_kv_branch_eviction = false
 
 [vllm.engine_kwargs]
