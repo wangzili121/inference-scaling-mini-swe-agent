@@ -88,6 +88,8 @@ def summarize(root: Path) -> dict[str, Any]:
     block_ms = []
     end_to_end_step_ms = []
     admission_wait_ms = []
+    candidate_rollout_overlap_ms = []
+    streamed_rollout_submission_batches = []
     intervals = []
     output_hash = hashlib.sha256()
     for record in sorted(
@@ -121,6 +123,13 @@ def summarize(root: Path) -> dict[str, Any]:
                 intervals.append((start, start + duration_ms))
             elif name == "step_admission_wait":
                 admission_wait_ms.append(duration_ms)
+            elif name == "rollout" and event.get("candidate_overlap"):
+                candidate_rollout_overlap_ms.append(
+                    float(event.get("overlap_seconds", 0.0)) * 1_000.0
+                )
+                streamed_rollout_submission_batches.append(
+                    float(event.get("submission_batches", 0.0))
+                )
         end_to_end_step_ms.extend(
             stages["block"] + stages.get("step_admission_wait", 0.0)
             for stages in stages_by_step.values()
@@ -202,6 +211,27 @@ def summarize(root: Path) -> dict[str, Any]:
             if admission_wait_ms
             else 0.0,
             "p95": _percentile(admission_wait_ms, 0.95) or 0.0,
+        },
+        "candidate_rollout_overlap_ms": {
+            "mean": (
+                statistics.fmean(candidate_rollout_overlap_ms)
+                if candidate_rollout_overlap_ms
+                else 0.0
+            ),
+            "p50": _percentile(candidate_rollout_overlap_ms, 0.50) or 0.0,
+            "p95": _percentile(candidate_rollout_overlap_ms, 0.95) or 0.0,
+            "max": max(candidate_rollout_overlap_ms, default=0.0),
+        },
+        "streamed_rollout_submission_batches": {
+            "mean": (
+                statistics.fmean(streamed_rollout_submission_batches)
+                if streamed_rollout_submission_batches
+                else 0.0
+            ),
+            "p95": (
+                _percentile(streamed_rollout_submission_batches, 0.95) or 0.0
+            ),
+            "max": max(streamed_rollout_submission_batches, default=0.0),
         },
         "rollout_barrier_tail_ms": {
             "mean": statistics.fmean(barrier_tail_ms) if barrier_tail_ms else None,
