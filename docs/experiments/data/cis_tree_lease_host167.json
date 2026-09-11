@@ -1,0 +1,227 @@
+{
+  "smoke-p2-step-fork-lease-host167": {
+    "root": "/data/disk/wangzili/cis-tree-ab-20260911/smoke-p2-step-fork-lease-host167",
+    "wall_seconds": 9.928387604886666,
+    "success_rate": 1.0,
+    "jobs_per_second": 0.20144257855279718,
+    "job_latency_seconds": {
+      "mean": 6.7292053694836795,
+      "p50": 6.7292053694836795,
+      "p95": 9.607281078933738,
+      "p99": 9.863110030884854
+    },
+    "forward_token_slots_per_second": 2549.960880610583,
+    "preemptions": 0.0,
+    "engine_requests": 14.0,
+    "engine_requests_per_second": 1.4100980498695803,
+    "generated_tokens": 955.0,
+    "generated_tokens_per_second": 96.18883125896065,
+    "prefill_tokens": 24376.0,
+    "shared_prefill_tokens_saved": 158336.0,
+    "apc_token_hit_ratio": 0.8665878541091991,
+    "maximum_in_flight_requests": 0.0,
+    "native_parallel_groups": 0.0,
+    "native_parallel_children": 0.0,
+    "kv_fork": {
+      "captures": 24,
+      "hits": 16,
+      "misses": 0,
+      "hit_rate": 1.0,
+      "hit_tokens": {
+        "total": 185344,
+        "mean": 11584.0,
+        "p50": 10176.0,
+        "p95": 18816.0
+      },
+      "captured_blocks": {
+        "total": 1941,
+        "mean": 80.875,
+        "p95": 147.0
+      },
+      "leased_blocks": {
+        "total": 13,
+        "mean": 0.5416666666666666,
+        "p95": 1.0,
+        "release_events": 8,
+        "expire_events": 0
+      },
+      "miss_reasons": {}
+    },
+    "kv_branch_eviction": {
+      "demoted_requests": 0,
+      "demoted_blocks": 0,
+      "blocks_per_request_mean": null,
+      "blocks_per_request_p95": null
+    },
+    "steps": 2,
+    "step_completion_ms": {
+      "mean": 4942.689703,
+      "p50": 4942.689703,
+      "p95": 6248.4102286
+    },
+    "step_end_to_end_ms": {
+      "mean": 6658.601224,
+      "p50": 6658.601224,
+      "p95": 9508.6275034
+    },
+    "step_admission_wait_ms": {
+      "mean": 1715.911521,
+      "p95": 3260.2172748
+    },
+    "candidate_rollout_overlap_ms": {
+      "mean": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    },
+    "streamed_rollout_submission_batches": {
+      "mean": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    },
+    "rollout_barrier_tail_ms": {
+      "mean": 302.22802734375,
+      "p95": 558.4157958984375
+    },
+    "engine_queue_ms": {
+      "mean": 0.01685714285714286,
+      "p95": 0.0337
+    },
+    "active_steps": {
+      "mean": 0.9999818973221546,
+      "peak": 1.0
+    },
+    "priority_range": [
+      4,
+      5
+    ],
+    "output_hash": "a235ef78a3245778bb5625876e8c332d2aef129b3ecd838174ccedea861257cc",
+    "overrides": [
+      "generation.max_new_tokens=512",
+      "vllm.max_model_len=65536",
+      "vllm.max_num_seqs=256",
+      "vllm.max_num_batched_tokens=32768",
+      "vllm.gpu_memory_utilization=0.90",
+      "vllm.engine_kwargs.max_num_partial_prefills=1",
+      "vllm.engine_kwargs.max_long_partial_prefills=1",
+      "conditional_is.active_step_limit=1",
+      "vllm.request_priority_policy=\"step_fifo\"",
+      "vllm.native_kv_fork=true",
+      "vllm.native_kv_fork_lease=true"
+    ]
+  },
+  "p2-step-fork-lease-300s-host167": {
+    "root": "/data/disk/wangzili/cis-tree-ab-20260911/p2-step-fork-lease-300s-host167",
+    "wall_seconds": 168.61079393606633,
+    "success_rate": 1.0,
+    "jobs_per_second": 0.37957237793606174,
+    "job_latency_seconds": {
+      "mean": 64.73113522029962,
+      "p50": 52.25740921346005,
+      "p95": 139.63419595882297,
+      "p99": 154.14563218248773
+    },
+    "forward_token_slots_per_second": 5510.258141316214,
+    "preemptions": 2.0,
+    "engine_requests": 472.0,
+    "engine_requests_per_second": 2.7993462872784556,
+    "generated_tokens": 49717.0,
+    "generated_tokens_per_second": 294.86249865386225,
+    "prefill_tokens": 879844.0,
+    "shared_prefill_tokens_saved": 7103616.0,
+    "apc_token_hit_ratio": 0.889791644224434,
+    "maximum_in_flight_requests": 116.0,
+    "native_parallel_groups": 0.0,
+    "native_parallel_children": 0.0,
+    "kv_fork": {
+      "captures": 320,
+      "hits": 148,
+      "misses": 30,
+      "hit_rate": 0.8314606741573034,
+      "hit_tokens": {
+        "total": 3120384,
+        "mean": 21083.675675675677,
+        "p50": 17024.0,
+        "p95": 57555.2
+      },
+      "captured_blocks": {
+        "total": 35719,
+        "mean": 111.621875,
+        "p95": 241.50000000000057
+      },
+      "leased_blocks": {
+        "total": 199,
+        "mean": 0.621875,
+        "p95": 1.0,
+        "release_events": 89,
+        "expire_events": 0
+      },
+      "miss_reasons": {
+        "no_hint": 15,
+        "stale_or_mismatch": 15
+      }
+    },
+    "kv_branch_eviction": {
+      "demoted_requests": 0,
+      "demoted_blocks": 0,
+      "blocks_per_request_mean": null,
+      "blocks_per_request_p95": null
+    },
+    "steps": 76,
+    "step_completion_ms": {
+      "mean": 54285.380846223685,
+      "p50": 47759.0199725,
+      "p95": 136447.5911095
+    },
+    "step_end_to_end_ms": {
+      "mean": 54285.389780960526,
+      "p50": 47759.030817,
+      "p95": 136447.59924925
+    },
+    "step_admission_wait_ms": {
+      "mean": 0.008934736842105263,
+      "p95": 0.012332250000000001
+    },
+    "candidate_rollout_overlap_ms": {
+      "mean": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    },
+    "streamed_rollout_submission_batches": {
+      "mean": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    },
+    "rollout_barrier_tail_ms": {
+      "mean": 18902.498894585504,
+      "p95": 57847.305114746094
+    },
+    "engine_queue_ms": {
+      "mean": 3594.7710868644067,
+      "p95": 19594.77605
+    },
+    "active_steps": {
+      "mean": 24.50391863099446,
+      "peak": 32.0
+    },
+    "priority_range": [
+      4,
+      79
+    ],
+    "output_hash": "2d6d76f2cbe95e03fa33f5f8ea80067f48517cbd5837365b9c8645c5bf96684d",
+    "overrides": [
+      "generation.max_new_tokens=512",
+      "vllm.max_model_len=65536",
+      "vllm.max_num_seqs=256",
+      "vllm.max_num_batched_tokens=32768",
+      "vllm.gpu_memory_utilization=0.90",
+      "vllm.engine_kwargs.max_num_partial_prefills=1",
+      "vllm.engine_kwargs.max_long_partial_prefills=1",
+      "conditional_is.active_step_limit=32",
+      "vllm.request_priority_policy=\"step_fifo\"",
+      "vllm.native_kv_fork=true",
+      "vllm.native_kv_fork_lease=true"
+    ]
+  }
+}

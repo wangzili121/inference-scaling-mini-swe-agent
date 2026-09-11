@@ -189,6 +189,61 @@ candidate/rollout 都重新进入普通请求生命周期：
 是否开发该层取决于后续 trace 中 request lifecycle、block-table 操作与 Host bubble
 的占比。当前数据已经排除了 CPU reward，却还不足以声称 lifecycle 是主瓶颈。
 
+### 6.1 Branch-aware KV 生命周期
+
+请求完成和 KV 真正失效不是同一件事。vLLM 会在请求结束时释放 request 对
+block 的引用；`ref_cnt` 归零后，完整 block 仍作为 APC 条目留在 free queue，
+直到内存分配需要它时才按 LRU 淘汰。vLLM 还会逆序释放同一请求的 blocks，使
+包含更多尾部 token 的 block 更早被淘汰。因此，普通 rollout unique tail 已经
+具有较低的默认保留价值，不能把重复实现这条规则当成 CIS 优化。
+
+CIS 在 reduce 后有框架看不到的更强语义：
+
+- selected trunk 和 winner candidate suffix 会被下一 block 的 C 个 candidate
+  确定复用；
+- loser candidate suffix 与所有 rollout unique tail 永远不会被算法回访；
+- shared trunk 可能同时被多个仍在运行或即将提交的 sibling 引用，不能因某个
+  loser 完成而删除；
+- 只有 `ref_cnt == 0` 的完整 block 才允许改变缓存淘汰顺序，任何活跃或共享
+  block 都不能强制释放。
+
+因此候选方案不是按 request id 盲目 `free`，而是维护 page-granular ownership：
+
+```text
+block -> {job_id, step_id, candidate_id, rollout_id, segment, ref_cnt}
+segment = shared_trunk | candidate_suffix | rollout_tail
+```
+
+reduce 时发出一次 branch transition：winner 的 trunk/suffix 获得短期 retain，
+loser 的独占 suffix/tail 被 demote 到 free queue 的优先淘汰端；如果块仍有活跃
+引用则仅记录 pending demotion，待引用归零后生效。它是软优先级而非永久 pin，
+内存不足时 winner 仍可被淘汰，因而不会把可运行请求变成 OOM。
+
+这一设计分别借鉴：
+
+- ArborKV 的 active-branch/ancestor 优先与 inactive-subtree 淘汰；CIS 不支持
+  backtracking，所以 loser 无需 lazy rehydration，生命周期判定更确定；
+- TensorRT-LLM 的 token-range/decode retention priority 和 duration；
+- KVFlow 的 workflow step graph、KV-node priority propagation，以及动态 suffix
+  优先淘汰；CIS 的 block barrier 给出了比通用 agent workflow 更准确的
+  next-use distance；
+- SGLang 的 radix-tree leaf eviction、`lock_ref` 活跃保护和 session soft retain；
+- vLLM queue-informed LRU RFC 的原则：只改变 free cached blocks 的淘汰次序，
+  不改变 admission 与 refcount。
+
+第一阶段先观测而不改变策略：记录每个 branch 的独占/共享 blocks、reduce 后
+loser cache residency、winner 下一 block 命中、因 pressure 导致的 stale fork、
+KV preemption 与 recompute tokens。只有 loser 污染造成 winner miss/preemption
+时，才进行 `LRU vs branch-demotion` A/B。无压力下两者理论上应几乎相同；若在
+这种情况下出现大收益，应优先排查统计口径或错误释放。
+
+2026-09-11 的 P2 压力 A/B 已完成：rollout-tail demotion 实际移动 108 个请求的
+175 个纯独占 block，但 jobs/s 下降 3.7%，Job P95 增加 8.5%，preemption 从 1
+增至 4，因此该策略不保留为默认优化。candidate suffix 的 300 秒短租约把 direct
+fork 命中率从 77.9% 提高到 83.1%，但仍有 30 个 child 因共享 parent path stale
+而 miss，jobs/s 没有提升。证据要求下一版在 parent block table 释放前完成
+EngineCore 内 fork，不能通过延长 host 侧租约来 pin 整条长前缀。
+
 ## 7. 验收顺序
 
 1. 保留 whole-job routing、candidate streaming、per-job bounded 和 global
@@ -216,6 +271,23 @@ candidate/rollout 都重新进入普通请求生命周期：
   global frontier A/B，但真实 CIS 结果为负，不能直接照搬其结论。
 - [Regime-Aware Routing](https://arxiv.org/abs/2607.09248)：请求执行时逐步暴露行为，
   再动态路由到不同子调度器；与本实验中 P1/P3 静态路由结论相反的现象一致。
+- [ArborKV](https://arxiv.org/abs/2605.22106)：tree-aware allocation/eviction，
+  保护 active branch 与 ancestors，优先压缩 inactive subtrees，并支持回访时
+  lazy rehydration。
+- [vLLM Automatic Prefix Caching](https://github.com/vllm-project/vllm/blob/main/docs/design/prefix_caching.md)：
+  refcount、free queue、逆序 free 与 LRU eviction 的现有语义。
+- [TensorRT-LLM KV Cache](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/kvcache.md)：
+  token-range retention、decode retention priority/duration 与 KV events。
+- [KVFlow, NeurIPS 2025](https://arxiv.org/abs/2507.07400) 及其
+  [公开实现](https://github.com/PanZaifeng/KVFlow)：将 agent workflow
+  抽象为 step graph，按 next-use distance 传播 KV-node 优先级，并优先淘汰动态
+  suffix；与 CIS winner/loser 生命周期最接近的已发表系统工作。
+- [SGLang Session-Aware Radix Cache](https://github.com/sgl-project/sglang/blob/main/docs/docs/advanced_features/session_radix_cache.mdx)：
+  active session soft protection 与 unreferenced-first eviction。
+- [SGLang per-token-range retention RFC](https://github.com/sgl-project/sglang/issues/36208)：
+  page 对齐的区间优先级，只排序 free/unreferenced KV。
+- [vLLM queue-informed LRU RFC](https://github.com/vllm-project/vllm/issues/48485)：
+  根据近期等待请求的前缀需求，延后相关 free cached blocks 的淘汰。
 
 原始微基准结果保存在：
 

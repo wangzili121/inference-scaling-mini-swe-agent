@@ -33,6 +33,10 @@ _VLLM_SETTINGS = {
     "max_num_batched_tokens",
     "max_num_seqs",
     "mh_fused_logprobs",
+    "native_parallel_sampling",
+    "native_kv_fork",
+    "native_kv_fork_lease",
+    "native_kv_branch_eviction",
     "parameter_count",
     "pipeline_parallel_size",
     "quantization",
@@ -276,6 +280,34 @@ def load_backend_from_config(
         if not asynchronous:
             raise ValueError("request_priority_policy requires runtime.backend='vllm'")
         acceleration_kwargs["request_priority_policy"] = request_priority_policy
+    native_parallel_sampling = bool(
+        settings.pop("native_parallel_sampling", False)
+    )
+    if native_parallel_sampling:
+        if not asynchronous:
+            raise ValueError(
+                "native_parallel_sampling requires runtime.backend='vllm'"
+            )
+        acceleration_kwargs["native_parallel_sampling"] = True
+    native_kv_fork = bool(settings.pop("native_kv_fork", False))
+    if native_kv_fork:
+        if not asynchronous:
+            raise ValueError("native_kv_fork requires runtime.backend='vllm'")
+        acceleration_kwargs["native_kv_fork"] = True
+    native_kv_fork_lease = bool(settings.pop("native_kv_fork_lease", False))
+    if native_kv_fork_lease:
+        if not native_kv_fork:
+            raise ValueError("native_kv_fork_lease requires native_kv_fork=true")
+        acceleration_kwargs["native_kv_fork_lease"] = True
+    native_kv_branch_eviction = bool(
+        settings.pop("native_kv_branch_eviction", False)
+    )
+    if native_kv_branch_eviction:
+        if not asynchronous:
+            raise ValueError(
+                "native_kv_branch_eviction requires runtime.backend='vllm'"
+            )
+        acceleration_kwargs["native_kv_branch_eviction"] = True
     if speculation is not None:
         acceleration_kwargs.update(
             speculation=speculation,

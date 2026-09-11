@@ -1,0 +1,72 @@
+diff --git a/vllm/v1/engine/parallel_sampling.py b/vllm/v1/engine/parallel_sampling.py
+index 0703462..f420c76 100644
+--- a/vllm/v1/engine/parallel_sampling.py
++++ b/vllm/v1/engine/parallel_sampling.py
+@@ -18,6 +18,8 @@ class ParentRequest:
+     Facilitate generating child request sampling params.
+     """
+
++    cis_child_final_streaming_supported = True
++
+     request_id: str
+     external_req_id: str
+     sampling_params: SamplingParams
+@@ -35,6 +37,20 @@ class ParentRequest:
+         self.request_id = request.request_id
+         self.external_req_id = request.external_req_id
+         self.sampling_params = sampling_params
++        extra_args = sampling_params.extra_args or {}
++        raw_child_seeds = extra_args.get("cis_child_seeds")
++        self.cis_child_seeds = (
++            None
++            if raw_child_seeds is None
++            else tuple(int(value) for value in raw_child_seeds)
++        )
++        if self.cis_child_seeds is not None and len(self.cis_child_seeds) != sampling_params.n:
++            raise ValueError("cis_child_seeds must contain one seed per parallel child")
++        self.cis_emit_child_finals = bool(
++            extra_args.get("cis_emit_child_finals", False)
++        )
+
+         self.child_requests = set()
+         self.output_aggregator = (
+@@ -59,7 +75,10 @@ class ParentRequest:
+         Returns:
+           Child `sampling_params` instance.
+         """
+-        seed = self.sampling_params.seed
++        seed = (
++            self.sampling_params.seed
++            if self.cis_child_seeds is None
++            else self.cis_child_seeds[index]
++        )
+         if self.cached_child_sampling_params:
+             # Reuse child sampling_params data structure
+             return self.cached_child_sampling_params
+@@ -68,12 +87,19 @@ class ParentRequest:
+         child_sampling_params.n = 1
+         if seed is None:
+             # Cache child sampling_params for later reuse
+             self.cached_child_sampling_params = child_sampling_params
+-        else:
++        elif self.cis_child_seeds is None:
+             # Each child gets a clone with a unique seed
+             child_sampling_params.seed = seed + index
++        else:
++            child_sampling_params.seed = seed
++        if child_sampling_params.extra_args:
++            child_sampling_params.extra_args = {
++                key: value
++                for key, value in child_sampling_params.extra_args.items()
++                if key not in {"cis_child_seeds", "cis_emit_child_finals"}
++            } or None
+         return child_sampling_params
+@@ -112,6 +138,8 @@ class ParentRequest:
+             #
+             # DO NOT output finished and already returned child request to client again
+             outputs = [] if already_finished_and_returned else [completion_output]
++        elif self.cis_emit_child_finals:
++            outputs = [] if already_finished_and_returned else [completion_output]
+         else:
+             # If not streaming, aggregate the n final outputs.
+             self.output_aggregator[completion_output.index] = completion_output

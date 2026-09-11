@@ -298,6 +298,39 @@ def test_rollout_submission_batches_preserve_logical_candidate_order() -> None:
     assert [len(candidate.rollouts) for candidate in step.candidates] == [2, 2, 2]
 
 
+def test_conditional_is_exposes_candidate_rollout_fork_edges() -> None:
+    class RecordingBackend(TabularAutoregressiveBackend):
+        def __init__(self) -> None:
+            super().__init__({}, fallback=[0.5, 0.5])
+            self.batches = []
+
+        def sample_batch(self, requests):
+            self.batches.append(tuple(requests))
+            return super().sample_batch(requests)
+
+    backend = RecordingBackend()
+    conditional_is_step(
+        base_backend=backend,
+        rollout_backend=backend,
+        prompt=(),
+        generated_prefix=(),
+        config=ConditionalISConfig(
+            candidate_count=3, rollout_count=2, block_size=1, total_length=2
+        ),
+        base_sampling=SamplingConfig(),
+        rollout_sampling=SamplingConfig(),
+        reward=_reward,
+        seeds=SeedStream(20260911),
+        step_index=0,
+    )
+
+    candidates, rollouts = backend.batches
+    assert all(request.fork_expected_children == 2 for request in candidates)
+    candidate_ids = {request.request_id for request in candidates}
+    assert all(request.fork_parent_request_id in candidate_ids for request in rollouts)
+    assert all(request.fork_expected_children == 0 for request in rollouts)
+
+
 def test_rollout_submission_batch_size_must_be_positive() -> None:
     with pytest.raises(ValueError, match="rollout_submission_batch_size"):
         ConditionalISConfig(rollout_submission_batch_size=0)

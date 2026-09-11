@@ -98,6 +98,7 @@ def test_async_vllm_loader_merges_role_settings_and_exact_scorer(monkeypatch) ->
         "gpu_memory_utilization": 0.7,
         "max_num_seqs": 32,
         "async_scheduling": True,
+        "native_parallel_sampling": True,
         "pipeline_parallel_size": 2,
         "engine_kwargs": {"enable_chunked_prefill": True},
         "proposal": {
@@ -134,6 +135,7 @@ def test_async_vllm_loader_merges_role_settings_and_exact_scorer(monkeypatch) ->
     assert vllm_calls[0][1]["gpu_memory_utilization"] == 0.2
     assert vllm_calls[0][1]["max_num_seqs"] == 8
     assert vllm_calls[0][1]["async_scheduling"] is True
+    assert vllm_calls[0][1]["native_parallel_sampling"] is True
     assert vllm_calls[0][1]["pipeline_parallel_size"] == 2
     assert vllm_calls[0][1]["dtype"] == "bfloat16"
     assert vllm_calls[0][1]["seed"] == 17
@@ -167,6 +169,35 @@ def test_vllm_sync_override_and_unknown_setting(monkeypatch) -> None:
     config["vllm"] = {"engine_kwargs": {"dtype": "float16"}}
     with pytest.raises(ValueError, match="duplicate explicit settings: dtype"):
         loader.load_backend_from_config("base-model", config)
+
+    config["vllm"] = {"native_kv_fork": True}
+    with pytest.raises(ValueError, match="native_kv_fork requires"):
+        loader.load_backend_from_config("base-model", config)
+
+    config["runtime"]["backend"] = "vllm"
+    config["vllm"] = {"native_kv_fork_lease": True}
+    with pytest.raises(ValueError, match="native_kv_fork_lease requires"):
+        loader.load_backend_from_config("base-model", config)
+
+
+def test_async_vllm_loader_enables_kv_fork_lease(monkeypatch) -> None:
+    config = _config("vllm")
+    config["vllm"] = {
+        "native_kv_fork": True,
+        "native_kv_fork_lease": True,
+        "native_kv_branch_eviction": True,
+    }
+    calls = []
+    monkeypatch.setattr(
+        loader.AsyncVLLMBackend,
+        "from_pretrained",
+        lambda model, **kwargs: calls.append((model, kwargs)) or "async-vllm",
+    )
+
+    assert loader.load_backend_from_config("base-model", config) == "async-vllm"
+    assert calls[0][1]["native_kv_fork"] is True
+    assert calls[0][1]["native_kv_fork_lease"] is True
+    assert calls[0][1]["native_kv_branch_eviction"] is True
 
 
 def test_vllm_mh_fused_logprobs_require_sync_without_speculation(monkeypatch) -> None:

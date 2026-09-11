@@ -25,6 +25,8 @@ class GenerationRequest:
     uniforms: tuple[float, ...] | None = None
     arithmetic_uniform: float | None = None
     confidence_top_k: int | None = None
+    fork_parent_request_id: str | None = None
+    fork_expected_children: int = 0
 
     def __post_init__(self) -> None:
         if self.max_new_tokens <= 0:
@@ -52,6 +54,10 @@ class GenerationRequest:
                 )
         if self.confidence_top_k is not None and self.confidence_top_k <= 0:
             raise ValueError("confidence_top_k must be positive")
+        if self.fork_expected_children < 0:
+            raise ValueError("fork_expected_children must be non-negative")
+        if self.fork_parent_request_id is not None and self.fork_expected_children:
+            raise ValueError("a fork child cannot also declare expected children")
 
 
 @dataclass(frozen=True, slots=True)

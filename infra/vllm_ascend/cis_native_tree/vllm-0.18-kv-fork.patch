@@ -1,0 +1,313 @@
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 3a90b2a..8af4f7c 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -2,7 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+ import itertools
++from collections import OrderedDict
++from time import monotonic
+ from collections.abc import Sequence
+ from dataclasses import dataclass
+ from typing import Literal, overload
+@@ -11,7 +12,7 @@ from typing import Literal, overload
+ from vllm.logger import init_logger
+ from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
+ from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+-from vllm.v1.core.kv_cache_utils import KVCacheBlock
++from vllm.v1.core.kv_cache_utils import KVCacheBlock, get_block_hash
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.metrics.stats import PrefixCacheStats
+ from vllm.v1.request import Request
+@@ -103,7 +104,18 @@ class KVCacheBlocks:
+         return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
+
+
++@dataclass
++class _CISForkHint:
++    blocks: tuple[KVCacheBlock, ...]
++    block_hashes: tuple[object, ...]
++    num_tokens: int
++    remaining_children: int
++    leased_blocks: tuple[KVCacheBlock, ...]
++    expires_at: float | None
++
++
+ class KVCacheManager:
++    cis_fork_supported = True
++    cis_fork_lease_supported = True
++    cis_branch_eviction_supported = True
++
+     def __init__(
+         self,
+         kv_cache_config: KVCacheConfig,
+@@ -147,6 +159,9 @@ class KVCacheManager:
+         self.block_pool = self.coordinator.block_pool
+         self.kv_cache_config = kv_cache_config
++        self._cis_fork_hints: OrderedDict[str, _CISForkHint] = OrderedDict()
++        self._cis_pending_forks: dict[str, str] = {}
++        self._cis_failed_forks: set[str] = set()
++        self._cis_max_fork_hints = 4096
+
+         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
+         # via create_kv_cache_blocks instead of creating new ones to avoid GC
+@@ -173,6 +188,91 @@ class KVCacheManager:
+         self.prefix_cache_stats = PrefixCacheStats()
+         return stats
+
++    def _release_cis_fork_hint(self, parent_id: str) -> _CISForkHint | None:
++        hint = self._cis_fork_hints.pop(parent_id, None)
++        if hint is not None and hint.leased_blocks:
++            self.block_pool.free_blocks(reversed(hint.leased_blocks))
++            logger.info(
++                "CIS_KV_FORK lease_release parent=%s blocks=%d",
++                parent_id,
++                len(hint.leased_blocks),
++            )
++        return hint
++
++    def _expire_cis_fork_hints(self) -> None:
++        now = monotonic()
++        expired = [
++            parent_id
++            for parent_id, hint in self._cis_fork_hints.items()
++            if hint.expires_at is not None and hint.expires_at <= now
++        ]
++        for parent_id in expired:
++            self._release_cis_fork_hint(parent_id)
++            logger.info("CIS_KV_FORK lease_expire parent=%s", parent_id)
++
++    def capture_cis_fork(self, request: Request) -> None:
++        """Remember a candidate's blocks and optionally lease its unique suffix."""
++        self._expire_cis_fork_hints()
++        params = request.sampling_params
++        extra_args = None if params is None else params.extra_args
++        expected = int((extra_args or {}).get("cis_fork_expected_children", 0))
++        fork_handle = (extra_args or {}).get("cis_fork_handle")
++        if expected <= 0 or not self.enable_caching or self.num_kv_cache_groups != 1:
++            return
++        if not fork_handle:
++            return
++        computed_tokens = min(request.num_computed_tokens, request.num_tokens - 1)
++        num_blocks = computed_tokens // self.block_pool.hash_block_size
++        if num_blocks <= 0:
++            return
++        blocks = tuple(self.coordinator.get_blocks(request.request_id)[0][:num_blocks])
++        block_hashes = tuple(request.block_hashes[:num_blocks])
++        if (
++            len(blocks) != num_blocks
++            or len(block_hashes) != num_blocks
++            or any(block.is_null or block.block_hash is None for block in blocks)
++        ):
++            return
++        fork_handle = str(fork_handle)
++        lease_ms = int((extra_args or {}).get("cis_fork_lease_ms", 0))
++        shared_prefix_tokens = int(
++            (extra_args or {}).get("cis_fork_shared_prefix_tokens", 0)
++        )
++        first_lease_block = min(
++            num_blocks,
++            max(0, shared_prefix_tokens // self.block_pool.hash_block_size),
++        )
++        leased_blocks = blocks[first_lease_block:] if lease_ms > 0 else ()
++        if leased_blocks:
++            self.block_pool.touch(leased_blocks)
++        self._release_cis_fork_hint(fork_handle)
++        self._cis_fork_hints[fork_handle] = _CISForkHint(
++            blocks=blocks,
++            block_hashes=block_hashes,
++            num_tokens=num_blocks * self.block_pool.hash_block_size,
++            remaining_children=expected,
++            leased_blocks=leased_blocks,
++            expires_at=(monotonic() + lease_ms / 1_000.0 if lease_ms > 0 else None),
++        )
++        self._cis_fork_hints.move_to_end(fork_handle)
++        while len(self._cis_fork_hints) > self._cis_max_fork_hints:
++            oldest = next(iter(self._cis_fork_hints))
++            self._release_cis_fork_hint(oldest)
++        logger.info(
++            "CIS_KV_FORK capture parent=%s blocks=%d children=%d leased=%d",
++            fork_handle,
++            num_blocks,
++            expected,
++            len(leased_blocks),
++        )
++
++    def _get_cis_forked_blocks(
++        self, request: Request
++    ) -> tuple[KVCacheBlocks, int] | None:
++        self._expire_cis_fork_hints()
++        params = request.sampling_params
++        extra_args = None if params is None else params.extra_args
++        parent_id = (extra_args or {}).get("cis_fork_parent_request_id")
++        if not parent_id:
++            return None
++        if request.request_id in self._cis_failed_forks:
++            return None
++        hint = self._cis_fork_hints.get(str(parent_id))
++        if hint is None:
++            self._cis_failed_forks.add(request.request_id)
++            logger.info(
++                "CIS_KV_FORK miss child=%s parent=%s reason=no_hint",
++                request.request_id,
++                parent_id,
++            )
++            return None
++        valid = (
++            len(request.block_hashes) >= len(hint.block_hashes)
++            and tuple(request.block_hashes[: len(hint.block_hashes)])
++            == hint.block_hashes
++            and tuple(
++                None if block.block_hash is None else get_block_hash(block.block_hash)
++                for block in hint.blocks
++            )
++            == hint.block_hashes
++        )
++        if not valid:
++            self._release_cis_fork_hint(str(parent_id))
++            self._cis_failed_forks.add(request.request_id)
++            logger.info(
++                "CIS_KV_FORK miss child=%s parent=%s reason=stale_or_mismatch",
++                request.request_id,
++                parent_id,
++            )
++            return None
++        self._cis_pending_forks[request.request_id] = str(parent_id)
++        logger.info(
++            "CIS_KV_FORK hit child=%s parent=%s tokens=%d",
++            request.request_id,
++            parent_id,
++            hint.num_tokens,
++        )
++        return KVCacheBlocks((hint.blocks,)), hint.num_tokens
++
++    def _commit_cis_fork(self, request_id: str) -> None:
++        self._cis_failed_forks.discard(request_id)
++        parent_id = self._cis_pending_forks.pop(request_id, None)
++        if parent_id is None:
++            return
++        hint = self._cis_fork_hints.get(parent_id)
++        if hint is None:
++            return
++        hint.remaining_children -= 1
++        if hint.remaining_children <= 0:
++            self._release_cis_fork_hint(parent_id)
++
+     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
+         """Get the computed (cached) blocks for the request.
+         Note that the computed blocks must be full.
+@@ -193,6 +293,13 @@ class KVCacheManager:
+         if not self.enable_caching or request.skip_reading_prefix_cache:
+             return self.empty_kv_cache_blocks, 0
+
++        cis_fork = self._get_cis_forked_blocks(request)
++        if cis_fork is not None:
++            if self.log_stats:
++                assert self.prefix_cache_stats is not None
++                self.prefix_cache_stats.record(
++                    num_tokens=request.num_tokens,
++                    num_hits=cis_fork[1],
++                    preempted=False,
++                )
++            return cis_fork
++
+         # NOTE: When all tokens hit the cache, we must recompute the last token
+         # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
+@@ -339,6 +446,7 @@ class KVCacheManager:
+             num_tokens_main_model,
+             num_encoder_tokens,
+         )
++        self._commit_cis_fork(request.request_id)
+
+         # P/D: delay caching blocks if we have to recv from
+         # remote. Update state for locally cached blocks.
+@@ -397,6 +505,47 @@ class KVCacheManager:
+             request: The request to free the blocks.
+         """
++        self._cis_pending_forks.pop(request.request_id, None)
++        self._cis_failed_forks.discard(request.request_id)
++        params = request.sampling_params
++        extra_args = None if params is None else params.extra_args
++        disposable_from = (extra_args or {}).get("cis_disposable_from_token")
++        disposable_blocks: tuple[KVCacheBlock, ...] = ()
++        if (
++            disposable_from is not None
++            and request.is_finished()
++            and self.num_kv_cache_groups == 1
++        ):
++            blocks = tuple(self.coordinator.get_blocks(request.request_id)[0])
++            start = min(
++                len(blocks),
++                max(
++                    0,
++                    (
++                        int(disposable_from)
++                        + self.block_pool.hash_block_size
++                        - 1
++                    )
++                    // self.block_pool.hash_block_size,
++                ),
++            )
++            disposable_blocks = blocks[start:]
+         self.coordinator.free(request.request_id)
++        movable = [
++            block
++            for block in reversed(disposable_blocks)
++            if block.ref_cnt == 0
++            and not block.is_null
++            and block.prev_free_block is not None
++            and block.next_free_block is not None
++        ]
++        if movable:
++            for block in movable:
++                self.block_pool.free_block_queue.remove(block)
++            self.block_pool.free_block_queue.prepend_n(movable)
++            logger.info(
++                "CIS_KV_BRANCH demote request=%s blocks=%d",
++                request.request_id,
++                len(movable),
++            )
+
+     def remove_skipped_blocks(
+         self, request_id: str, total_computed_tokens: int
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 98e16b6..0446250 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1802,6 +1802,7 @@ class Scheduler(SchedulerInterface):
+
+         delay_free_blocks |= connector_delay_free_blocks
+         if not delay_free_blocks:
++            self.kv_cache_manager.capture_cis_fork(request)
+             self._free_blocks(request)
+
+         return kv_xfer_params
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 4ccdcda..8ccdcda 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -316,6 +316,31 @@ class FreeKVCacheBlockQueue:
+
+         self.num_free_blocks += len(blocks)
+
++    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
++        """Put free blocks at the front in their eviction order."""
++        if not blocks:
++            return
++        first_free = self.fake_free_list_head.next_free_block
++        if first_free is None:
++            raise RuntimeError(
++                "next_free_block of fake_free_list_head should always exist"
++            )
++        previous = self.fake_free_list_head
++        for block in blocks:
++            block.prev_free_block = previous
++            previous.next_free_block = block
++            previous = block
++        previous.next_free_block = first_free
++        first_free.prev_free_block = previous
++        self.num_free_blocks += len(blocks)
++
+     def get_all_free_blocks(self) -> list[KVCacheBlock]:
+         """Get all free blocks in the free list. Mainly used for testing.

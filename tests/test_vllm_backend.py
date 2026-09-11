@@ -29,6 +29,7 @@ class _Completion:
     logprobs: list[dict[int, _Logprob]]
     finish_reason: str = "length"
     power_logprobs: list[dict[int, _Logprob]] | None = None
+    index: int = 0
 
 
 @dataclass
@@ -514,6 +515,33 @@ class _AsyncEngine(_Engine):
         self.profile_events.append(("stop", None))
 
 
+class _ParallelAsyncEngine(_AsyncEngine):
+    def __init__(self):
+        super().__init__()
+        self.parent_calls = []
+
+    async def _stream(self, *, prompt, sampling_params, request_id, **kwargs):
+        self.parent_calls.append((request_id, sampling_params))
+        seeds = sampling_params.extra_args["cis_child_seeds"]
+        self.active += len(seeds)
+        self.maximum_active = max(self.maximum_active, self.active)
+        for index, seed in enumerate(seeds):
+            await asyncio.sleep(0.001)
+            token = int(seed % 5) + 3
+            self.active -= 1
+            yield _Output(
+                [
+                    _Completion(
+                        [token],
+                        [{token: _Logprob(-0.25)}],
+                        index=index,
+                    )
+                ],
+                num_cached_tokens=1,
+                request_id=request_id,
+            )
+
+
 def test_async_vllm_overlaps_requests_from_independent_callers() -> None:
     engine = _AsyncEngine()
     backend = AsyncVLLMBackend(
@@ -576,6 +604,157 @@ def test_async_vllm_streams_completion_callbacks_and_draft_observations() -> Non
         assert backend.draft_cache_snapshot() is None
     finally:
         backend.close()
+
+
+def test_async_vllm_native_parallel_sampling_preserves_child_seeds() -> None:
+    engine = _ParallelAsyncEngine()
+    backend = AsyncVLLMBackend(
+        engine,
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        native_parallel_sampling=True,
+    )
+    completed = []
+    requests = [
+        GenerationRequest(
+            (1, 2),
+            1,
+            SamplingConfig(),
+            seed,
+            f"job-a:step:0:candidate:{index}",
+        )
+        for index, seed in enumerate((103, 211, 307))
+    ]
+    try:
+        outputs = backend.sample_batch_with_callback(
+            requests,
+            lambda index, sample: completed.append((index, sample.request_id)),
+        )
+        snapshot = backend.snapshot()
+    finally:
+        backend.close()
+
+    assert [sample.token_ids for sample in outputs] == [(6,), (4,), (5,)]
+    assert sorted(completed) == [
+        (0, "job-a:step:0:candidate:0"),
+        (1, "job-a:step:0:candidate:1"),
+        (2, "job-a:step:0:candidate:2"),
+    ]
+    assert len(engine.parent_calls) == 1
+    parent_id, params = engine.parent_calls[0]
+    assert parent_id.endswith(":parent:3")
+    assert params.n == 3
+    assert params.extra_args["cis_child_seeds"] == [103, 211, 307]
+    assert snapshot.native_parallel_groups == 1
+    assert snapshot.native_parallel_children == 3
+    assert snapshot.engine_requests == 3
+    assert snapshot.maximum_in_flight_requests == 3
+
+
+def test_async_vllm_native_kv_fork_adds_parent_child_metadata() -> None:
+    backend = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        native_kv_fork=True,
+    )
+    try:
+        parent = GenerationRequest(
+            (1,),
+            1,
+            SamplingConfig(),
+            7,
+            "job-a:step:0:candidate:0",
+            fork_expected_children=3,
+        )
+        child = GenerationRequest(
+            (1, 4),
+            1,
+            SamplingConfig(),
+            8,
+            "job-a:step:0:candidate:0:rollout:0",
+            fork_parent_request_id=parent.request_id,
+        )
+        parent_params = backend._sampling_params(parent)
+        child_params = backend._sampling_params(child)
+    finally:
+        backend.close()
+
+    assert parent_params.extra_args == {
+        "cis_fork_handle": "job-a:step:0:candidate:0",
+        "cis_fork_expected_children": 3,
+    }
+    assert child_params.extra_args == {
+        "cis_fork_parent_request_id": "job-a:step:0:candidate:0"
+    }
+
+
+def test_async_vllm_native_kv_fork_lease_marks_candidate_suffix() -> None:
+    backend = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        native_kv_fork=True,
+        native_kv_fork_lease=True,
+    )
+    try:
+        request = GenerationRequest(
+            (1, 2, 3),
+            1,
+            SamplingConfig(),
+            7,
+            "job-a:step:0:candidate:0",
+            fork_expected_children=3,
+        )
+        params = backend._sampling_params(request)
+    finally:
+        backend.close()
+
+    assert params.extra_args == {
+        "cis_fork_handle": "job-a:step:0:candidate:0",
+        "cis_fork_expected_children": 3,
+        "cis_fork_shared_prefix_tokens": 3,
+        "cis_fork_lease_ms": 300_000,
+    }
+
+
+def test_async_vllm_branch_eviction_marks_rollout_tail() -> None:
+    backend = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        native_kv_branch_eviction=True,
+    )
+    try:
+        candidate = GenerationRequest(
+            (1, 2),
+            1,
+            SamplingConfig(),
+            7,
+            "job-a:step:0:candidate:0",
+        )
+        rollout = GenerationRequest(
+            (1, 2, 3, 4),
+            1,
+            SamplingConfig(),
+            8,
+            "job-a:step:0:candidate:0:rollout:0",
+        )
+        candidate_params = backend._sampling_params(candidate)
+        rollout_params = backend._sampling_params(rollout)
+    finally:
+        backend.close()
+
+    assert candidate_params.extra_args is None
+    assert rollout_params.extra_args == {"cis_disposable_from_token": 4}
 
 
 def test_async_vllm_emits_algorithm_request_lifecycle() -> None:

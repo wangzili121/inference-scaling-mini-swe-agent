@@ -84,6 +84,32 @@ _CIS_STEP_REQUEST = re.compile(
 )
 
 
+def _cis_parallel_group_key(request: GenerationRequest) -> tuple[Any, ...] | None:
+    """Return the native parent group for one Conditional IS child request."""
+
+    if request.uniforms is not None or request.arithmetic_uniform is not None:
+        return None
+    match = _CIS_STEP_REQUEST.match(request.request_id)
+    if match is None:
+        return None
+    if match.group("rollout") is None:
+        node = (match.group("job"), match.group("step"), "candidate")
+    else:
+        node = (
+            match.group("job"),
+            match.group("step"),
+            "rollout",
+            match.group("candidate"),
+        )
+    return (
+        *node,
+        request.prefix,
+        request.max_new_tokens,
+        request.sampling,
+        request.confidence_top_k,
+    )
+
+
 def _validate_mh_fused_vllm_version() -> None:
     """Fail before allocating a model when the worker adapter is incompatible."""
 
@@ -129,6 +155,15 @@ class _BeamSearchParamsShim:
 
 
 @dataclass(frozen=True, slots=True)
+class _SingleCompletionOutput:
+    """Minimal RequestOutput view used to parse one parent child completion."""
+
+    outputs: tuple[Any, ...]
+    num_cached_tokens: int
+    request_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class VLLMBackendSnapshot:
     sample_calls: int
     score_calls: int
@@ -157,6 +192,8 @@ class VLLMBackendSnapshot:
     native_accepted_draft_tokens: int = 0
     rejected_verification_token_slots: int = 0
     num_preemptions: int = 0
+    native_parallel_groups: int = 0
+    native_parallel_children: int = 0
 
 
 class _AsyncLoopRunner:
@@ -368,6 +405,8 @@ class VLLMBackend:
         self._observed_draft_sequences = 0
         self._fused_reference_sequences = 0
         self._fused_reference_tokens = 0
+        self._native_parallel_groups = 0
+        self._native_parallel_children = 0
 
     @classmethod
     def from_pretrained(
@@ -1209,6 +1248,8 @@ class VLLMBackend:
                 native_accepted_draft_tokens=accepted,
                 rejected_verification_token_slots=rejected,
                 num_preemptions=preemptions,
+                native_parallel_groups=self._native_parallel_groups,
+                native_parallel_children=self._native_parallel_children,
             )
 
     def encode(self, text: str, *, add_special_tokens: bool = True) -> TokenSequence:
@@ -1354,6 +1395,10 @@ class AsyncVLLMBackend(VLLMBackend):
         speculation: ActiveBatchSpeculationConfig | None = None,
         native_suffix_speculation: bool = False,
         request_priority_policy: str = "none",
+        native_parallel_sampling: bool = False,
+        native_kv_fork: bool = False,
+        native_kv_fork_lease: bool = False,
+        native_kv_branch_eviction: bool = False,
     ) -> None:
         if (engine is None) == (engine_factory is None):
             raise ValueError("provide exactly one of engine or engine_factory")
@@ -1380,6 +1425,16 @@ class AsyncVLLMBackend(VLLMBackend):
         if request_priority_policy not in {"none", "step_fifo", "rollout_first"}:
             raise ValueError("unknown CIS request priority policy")
         self._request_priority_policy = request_priority_policy
+        self._native_parallel_sampling = bool(native_parallel_sampling)
+        self._native_kv_fork = bool(native_kv_fork)
+        self._native_kv_fork_lease = bool(native_kv_fork_lease)
+        self._native_kv_branch_eviction = bool(native_kv_branch_eviction)
+        if self._native_kv_fork_lease and not self._native_kv_fork:
+            raise ValueError("native_kv_fork_lease requires native_kv_fork")
+        if self._native_parallel_sampling and self._native_kv_fork:
+            raise ValueError(
+                "native_parallel_sampling and native_kv_fork are separate experiments"
+            )
         self._step_priority_lock = threading.Lock()
         self._step_priorities: dict[str, int] = {}
         self._next_step_priority = itertools.count()
@@ -1446,17 +1501,45 @@ class AsyncVLLMBackend(VLLMBackend):
         dynamic_speculation: bool = False,
         engine_kwargs: dict[str, Any] | None = None,
         request_priority_policy: str = "none",
+        native_parallel_sampling: bool = False,
+        native_kv_fork: bool = False,
+        native_kv_fork_lease: bool = False,
+        native_kv_branch_eviction: bool = False,
     ) -> "AsyncVLLMBackend":
         try:
             from transformers import AutoTokenizer
             from vllm.engine.arg_utils import AsyncEngineArgs
             from vllm.v1.engine.async_llm import AsyncLLM
+            from vllm.v1.engine.parallel_sampling import ParentRequest
+            from vllm.v1.core.kv_cache_manager import KVCacheManager
 
             SamplingParams, TokensPrompt, BeamSearchParams = _load_vllm_sampling_api()
         except ImportError as error:  # pragma: no cover - optional GPU installation
             raise ModuleNotFoundError(
                 "AsyncVLLMBackend.from_pretrained requires the project's vllm extra"
             ) from error
+        if native_parallel_sampling and not bool(
+            getattr(ParentRequest, "cis_child_final_streaming_supported", False)
+        ):
+            raise RuntimeError(
+                "native_parallel_sampling requires the CIS ParentRequest runtime patch"
+            )
+        if native_kv_fork and not bool(
+            getattr(KVCacheManager, "cis_fork_supported", False)
+        ):
+            raise RuntimeError("native_kv_fork requires the CIS KV fork runtime patch")
+        if native_kv_fork_lease and not bool(
+            getattr(KVCacheManager, "cis_fork_lease_supported", False)
+        ):
+            raise RuntimeError(
+                "native_kv_fork_lease requires the CIS KV fork lease runtime patch"
+            )
+        if native_kv_branch_eviction and not bool(
+            getattr(KVCacheManager, "cis_branch_eviction_supported", False)
+        ):
+            raise RuntimeError(
+                "native_kv_branch_eviction requires the CIS branch eviction runtime patch"
+            )
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_name_or_path,
@@ -1552,12 +1635,204 @@ class AsyncVLLMBackend(VLLMBackend):
             speculation=speculation,
             native_suffix_speculation=speculation is not None,
             request_priority_policy=request_priority_policy,
+            native_parallel_sampling=native_parallel_sampling,
+            native_kv_fork=native_kv_fork,
+            native_kv_fork_lease=native_kv_fork_lease,
+            native_kv_branch_eviction=native_kv_branch_eviction,
         )
+
+    def _sampling_params(self, request: GenerationRequest) -> Any:
+        params = super()._sampling_params(request)
+        if not self._native_kv_fork and not self._native_kv_branch_eviction:
+            return params
+        extra_args = dict(getattr(params, "extra_args", None) or {})
+        if self._native_kv_fork and request.fork_expected_children:
+            extra_args["cis_fork_handle"] = request.request_id
+            extra_args["cis_fork_expected_children"] = int(
+                request.fork_expected_children
+            )
+            if self._native_kv_fork_lease:
+                extra_args["cis_fork_shared_prefix_tokens"] = len(request.prefix)
+                # A saturated CIS step can queue a child for well over a minute.
+                # The lease covers only the candidate-specific full suffix blocks
+                # and is released as soon as every rollout child is admitted.
+                extra_args["cis_fork_lease_ms"] = 300_000
+        if self._native_kv_fork and request.fork_parent_request_id is not None:
+            extra_args["cis_fork_parent_request_id"] = request.fork_parent_request_id
+        match = _CIS_STEP_REQUEST.match(request.request_id)
+        if (
+            self._native_kv_branch_eviction
+            and match is not None
+            and match.group("rollout") is not None
+        ):
+            extra_args["cis_disposable_from_token"] = len(request.prefix)
+        params.extra_args = extra_args or None
+        return params
 
     def _next_request_id(self) -> str:
         with self._request_counter_lock:
             value = next(self._request_counter)
         return f"inference-scaling:{self.model_id}:{value}"
+
+    @staticmethod
+    def _native_parallel_params(params: Any, requests: Sequence[GenerationRequest]) -> Any:
+        try:
+            from vllm.sampling_params import RequestOutputKind
+
+            params.output_kind = RequestOutputKind.FINAL_ONLY
+        except ImportError:  # pragma: no cover - exercised by lightweight fakes
+            params.output_kind = "final_only"
+        params.n = len(requests)
+        extra_args = dict(getattr(params, "extra_args", None) or {})
+        extra_args.update(
+            cis_child_seeds=[int(request.seed) for request in requests],
+            cis_emit_child_finals=True,
+        )
+        params.extra_args = extra_args
+        return params
+
+    @staticmethod
+    def _partition_native_parallel_requests(
+        requests: Sequence[GenerationRequest],
+    ) -> list[list[tuple[int, GenerationRequest]]]:
+        groups: list[list[tuple[int, GenerationRequest]]] = []
+        positions: dict[tuple[Any, ...], int] = {}
+        for index, request in enumerate(requests):
+            key = _cis_parallel_group_key(request)
+            if key is None:
+                groups.append([(index, request)])
+                continue
+            position = positions.get(key)
+            if position is None:
+                positions[key] = len(groups)
+                groups.append([(index, request)])
+            else:
+                groups[position].append((index, request))
+        return groups
+
+    async def _generate_parent_group(
+        self,
+        indexed_requests: Sequence[tuple[int, GenerationRequest]],
+        on_complete: SampleCompletionCallback | None,
+    ) -> list[tuple[int, tuple[SequenceSample, int, int, int]]]:
+        requests = tuple(request for _, request in indexed_requests)
+        first = requests[0]
+        prompt = self._prompt(first.prefix)
+        params = self._native_parallel_params(self._sampling_params(first), requests)
+        parent_request_id = f"{first.request_id}:parent:{len(requests)}"
+        priority = self._request_priority(first)
+        kwargs = {
+            "prompt": prompt,
+            "sampling_params": params,
+            "request_id": parent_request_id,
+            "priority": priority,
+        }
+        if self._lora_request is not None:
+            kwargs["lora_request"] = self._lora_request
+
+        submitted_at = time.time()
+        for child_index, request in enumerate(requests):
+            self._observe_request(
+                {
+                    "schema_version": 1,
+                    "event": "submitted",
+                    "event_unix_us": int(submitted_at * 1e6),
+                    "request_id": request.request_id,
+                    "engine_request_id": f"{child_index}_{parent_request_id}",
+                    "parent_request_id": parent_request_id,
+                    "native_parallel_group_size": len(requests),
+                    "native_parallel_child_index": child_index,
+                    "prefix_tokens": len(request.prefix),
+                    "max_new_tokens": request.max_new_tokens,
+                    "seed": request.seed,
+                    "priority": priority,
+                }
+            )
+
+        self._engine_requests_started(len(requests))
+        with self._statistics_lock:
+            self._native_parallel_groups += 1
+            self._native_parallel_children += len(requests)
+        completed: dict[int, tuple[SequenceSample, int, int, int]] = {}
+        try:
+            async for output in self._engine.generate(**kwargs):
+                cached_tokens = int(getattr(output, "num_cached_tokens", 0) or 0)
+                for completion in getattr(output, "outputs", ()):
+                    child_index = int(getattr(completion, "index", 0))
+                    if child_index in completed:
+                        continue
+                    if getattr(completion, "finish_reason", None) is None:
+                        continue
+                    if not 0 <= child_index < len(requests):
+                        raise RuntimeError("vLLM returned an invalid parent child index")
+                    request = requests[child_index]
+                    view = _SingleCompletionOutput(
+                        (completion,), cached_tokens, parent_request_id
+                    )
+                    item = self._sample_from_output(request, view)
+                    completed[child_index] = item
+                    self._observe_request(
+                        {
+                            "schema_version": 1,
+                            "event": "finished",
+                            "event_unix_us": int(time.time() * 1e6),
+                            "request_id": request.request_id,
+                            "engine_request_id": f"{child_index}_{parent_request_id}",
+                            "parent_request_id": parent_request_id,
+                            "native_parallel_group_size": len(requests),
+                            "native_parallel_child_index": child_index,
+                            "prefix_tokens": len(request.prefix),
+                            "max_new_tokens": request.max_new_tokens,
+                            "seed": request.seed,
+                            "priority": priority,
+                            "output_tokens": len(item[0].token_ids),
+                            "cached_tokens": cached_tokens,
+                            "finish_reason": item[0].finish_reason,
+                        }
+                    )
+                    if on_complete is not None:
+                        on_complete(indexed_requests[child_index][0], item[0])
+        finally:
+            self._engine_requests_finished(len(requests))
+        if len(completed) != len(requests):
+            raise RuntimeError("vLLM parent request omitted one or more child outputs")
+        return [
+            (indexed_requests[index][0], completed[index])
+            for index in range(len(requests))
+        ]
+
+    async def _generate_native_parallel(
+        self,
+        requests: Sequence[GenerationRequest],
+        on_complete: SampleCompletionCallback | None,
+    ) -> list[tuple[SequenceSample, int, int, int]]:
+        async def run_group(indexed: list[tuple[int, GenerationRequest]]):
+            if len(indexed) > 1:
+                return await self._generate_parent_group(indexed, on_complete)
+            index, request = indexed[0]
+            output = await self._generate_one(
+                self._prompt(request.prefix), self._sampling_params(request), request
+            )
+            item = self._sample_from_output(request, output)
+            if on_complete is not None:
+                on_complete(index, item[0])
+            return [(index, item)]
+
+        grouped = await asyncio.gather(
+            *(
+                run_group(group)
+                for group in self._partition_native_parallel_requests(requests)
+            )
+        )
+        ordered: list[tuple[SequenceSample, int, int, int] | None] = [None] * len(
+            requests
+        )
+        for group in grouped:
+            for index, item in group:
+                ordered[index] = item
+        if any(item is None for item in ordered):
+            raise RuntimeError("native parallel sampling omitted a request")
+        return [item for item in ordered if item is not None]
 
     def start_profile(self, profile_prefix: str | None = None) -> None:
         async def start() -> None:
@@ -1779,6 +2054,19 @@ class AsyncVLLMBackend(VLLMBackend):
             return super().sample_batch(requests)
         if self._closed:
             raise RuntimeError("vLLM backend is closed")
+        if self._native_parallel_sampling:
+            parsed = self._runner.run(
+                self._generate_native_parallel(tuple(requests), None)
+            )
+            samples = [item[0] for item in parsed]
+            self._record_sample_batch(
+                samples,
+                prefill_tokens=sum(item[1] for item in parsed),
+                cached_tokens=sum(item[2] for item in parsed),
+                forward_slots=sum(item[3] for item in parsed),
+            )
+            self.observe_draft_samples(samples)
+            return samples
         prompts = tuple(self._prompt(request.prefix) for request in requests)
         params = [self._sampling_params(request) for request in requests]
         parsed = self._runner.run(
@@ -1814,6 +2102,19 @@ class AsyncVLLMBackend(VLLMBackend):
             return []
         if self._closed:
             raise RuntimeError("vLLM backend is closed")
+        if self._native_parallel_sampling:
+            parsed = self._runner.run(
+                self._generate_native_parallel(tuple(requests), on_complete)
+            )
+            samples = [item[0] for item in parsed]
+            self._record_sample_batch(
+                samples,
+                prefill_tokens=sum(item[1] for item in parsed),
+                cached_tokens=sum(item[2] for item in parsed),
+                forward_slots=sum(item[3] for item in parsed),
+            )
+            self.observe_draft_samples(samples)
+            return samples
         prompts = tuple(self._prompt(request.prefix) for request in requests)
         params = [self._sampling_params(request) for request in requests]
         parsed = self._runner.run(

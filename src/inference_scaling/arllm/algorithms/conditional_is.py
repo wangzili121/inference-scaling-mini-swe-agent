@@ -297,6 +297,7 @@ def _sample_candidates(
     confidence_top_k: int | None = None,
     request_namespace: str = "conditional-is",
     stage_observer: StageObserver | None = None,
+    fork_expected_children: int = 0,
 ) -> list[SequenceSample]:
     requests = _candidate_requests(
         prefix=prefix,
@@ -307,6 +308,7 @@ def _sample_candidates(
         step_index=step_index,
         confidence_top_k=confidence_top_k,
         request_namespace=request_namespace,
+        fork_expected_children=fork_expected_children,
     )
     started = perf_counter()
     with _profile_range("candidate"):
@@ -334,6 +336,7 @@ def _candidate_requests(
     step_index: int,
     confidence_top_k: int | None,
     request_namespace: str,
+    fork_expected_children: int = 0,
 ) -> list[GenerationRequest]:
     return [
         GenerationRequest(
@@ -347,6 +350,7 @@ def _candidate_requests(
                 f"{request_namespace}:step:{step_index}:candidate:{candidate_index}"
             ),
             confidence_top_k=confidence_top_k,
+            fork_expected_children=fork_expected_children,
         )
         for candidate_index in range(count)
     ]
@@ -455,6 +459,7 @@ def _rollout_requests_for_candidate(
                 uniforms=token_uniforms[rollout_index],
                 arithmetic_uniform=arithmetic_uniforms[rollout_index],
                 confidence_top_k=confidence_top_k,
+                fork_parent_request_id=candidate.request_id,
             )
         )
     return requests, [rollout_prefix] * rollout_count, False
@@ -541,6 +546,7 @@ def _sample_candidates_with_streamed_rollouts(
         step_index=step_index,
         confidence_top_k=confidence_top_k,
         request_namespace=request_namespace,
+        fork_expected_children=rollout_count,
     )
     completed_candidates: list[SequenceSample | None] = [None] * candidate_count
     pending: list[tuple[int, SequenceSample]] = []
@@ -1161,6 +1167,7 @@ class AutoregressiveStepwiseAdapter:
                 ),
                 request_namespace=self.request_namespace,
                 stage_observer=self.stage_observer,
+                fork_expected_children=self.config.rollout_count,
             )
         except BaseException:
             self._release_step(step_index)
@@ -1307,6 +1314,7 @@ def _bounded_conditional_is_step(
         confidence_top_k=getattr(reward, "generation_confidence_top_k", None),
         request_namespace=request_namespace,
         stage_observer=stage_observer,
+        fork_expected_children=config.rollout_count,
     )
     rollout_length = max(0, remaining_length - len(proposals[0].token_ids))
     eos = rollout_sampling.eos_token_id

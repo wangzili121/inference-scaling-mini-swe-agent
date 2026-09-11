@@ -16,6 +16,26 @@ REQUEST_ID = re.compile(
     r"^(?P<job>.*):step:(?P<step>\d+):candidate:(?P<candidate>\d+)"
     r"(?::rollout:(?P<rollout>\d+))?"
 )
+FORK_CAPTURE = re.compile(
+    r"CIS_KV_FORK capture parent=(?P<parent>\S+) "
+    r"blocks=(?P<blocks>\d+) children=(?P<children>\d+)"
+    r"(?: leased=(?P<leased>\d+))?"
+)
+FORK_HIT = re.compile(
+    r"CIS_KV_FORK hit child=(?P<child>\S+) parent=(?P<parent>\S+) "
+    r"tokens=(?P<tokens>\d+)"
+)
+FORK_MISS = re.compile(
+    r"CIS_KV_FORK miss child=(?P<child>\S+) parent=(?P<parent>\S+) "
+    r"reason=(?P<reason>\S+)"
+)
+FORK_LEASE_RELEASE = re.compile(
+    r"CIS_KV_FORK lease_release parent=(?P<parent>\S+) blocks=(?P<blocks>\d+)"
+)
+FORK_LEASE_EXPIRE = re.compile(r"CIS_KV_FORK lease_expire parent=(?P<parent>\S+)")
+BRANCH_DEMOTE = re.compile(
+    r"CIS_KV_BRANCH demote request=(?P<request>\S+) blocks=(?P<blocks>\d+)"
+)
 
 
 def _percentile(values: Iterable[float], quantile: float) -> float | None:
@@ -160,6 +180,49 @@ def summarize(root: Path) -> dict[str, Any]:
         if len(values) > 1
     ]
     backend = benchmark.get("backend_delta", {})
+    runtime_log = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in sorted((root / "logs").glob("*.log"))
+    )
+    fork_capture_by_parent = {
+        match.group("parent"): match for match in FORK_CAPTURE.finditer(runtime_log)
+    }
+    fork_hit_by_child = {
+        match.group("child"): match for match in FORK_HIT.finditer(runtime_log)
+    }
+    fork_miss_by_child: dict[str, set[str]] = defaultdict(set)
+    for match in FORK_MISS.finditer(runtime_log):
+        fork_miss_by_child[match.group("child")].add(match.group("reason"))
+    for child in fork_hit_by_child:
+        fork_miss_by_child.pop(child, None)
+    fork_captures = len(fork_capture_by_parent)
+    fork_hits = len(fork_hit_by_child)
+    fork_misses = len(fork_miss_by_child)
+    fork_hit_tokens = [
+        int(match.group("tokens")) for match in fork_hit_by_child.values()
+    ]
+    fork_capture_blocks = [
+        int(match.group("blocks")) for match in fork_capture_by_parent.values()
+    ]
+    fork_leased_blocks = [
+        int(match.group("leased") or 0) for match in fork_capture_by_parent.values()
+    ]
+    fork_lease_release_records = list(FORK_LEASE_RELEASE.finditer(runtime_log))
+    fork_lease_expire_records = list(FORK_LEASE_EXPIRE.finditer(runtime_log))
+    fork_miss_reasons: dict[str, int] = defaultdict(int)
+    for reasons in fork_miss_by_child.values():
+        reason = (
+            "stale_or_mismatch"
+            if "stale_or_mismatch" in reasons
+            else sorted(reasons)[0]
+        )
+        fork_miss_reasons[reason] += 1
+    branch_demote_by_request = {
+        match.group("request"): match for match in BRANCH_DEMOTE.finditer(runtime_log)
+    }
+    branch_demoted_blocks = [
+        int(match.group("blocks")) for match in branch_demote_by_request.values()
+    ]
     wall_seconds = float(benchmark.get("wall_seconds", 0.0) or 0.0)
     prefill_tokens = float(backend.get("prefill_tokens", 0.0) or 0.0)
     cached_tokens = float(
@@ -193,6 +256,57 @@ def summarize(root: Path) -> dict[str, Any]:
             else None
         ),
         "maximum_in_flight_requests": backend.get("maximum_in_flight_requests"),
+        "native_parallel_groups": backend.get("native_parallel_groups"),
+        "native_parallel_children": backend.get("native_parallel_children"),
+        "kv_fork": {
+            "captures": fork_captures,
+            "hits": fork_hits,
+            "misses": fork_misses,
+            "hit_rate": (
+                fork_hits / (fork_hits + fork_misses)
+                if fork_hits + fork_misses
+                else None
+            ),
+            "hit_tokens": {
+                "total": sum(fork_hit_tokens),
+                "mean": (
+                    statistics.fmean(fork_hit_tokens) if fork_hit_tokens else None
+                ),
+                "p50": _percentile(fork_hit_tokens, 0.50),
+                "p95": _percentile(fork_hit_tokens, 0.95),
+            },
+            "captured_blocks": {
+                "total": sum(fork_capture_blocks),
+                "mean": (
+                    statistics.fmean(fork_capture_blocks)
+                    if fork_capture_blocks
+                    else None
+                ),
+                "p95": _percentile(fork_capture_blocks, 0.95),
+            },
+            "leased_blocks": {
+                "total": sum(fork_leased_blocks),
+                "mean": (
+                    statistics.fmean(fork_leased_blocks)
+                    if fork_leased_blocks
+                    else None
+                ),
+                "p95": _percentile(fork_leased_blocks, 0.95),
+                "release_events": len(fork_lease_release_records),
+                "expire_events": len(fork_lease_expire_records),
+            },
+            "miss_reasons": dict(sorted(fork_miss_reasons.items())),
+        },
+        "kv_branch_eviction": {
+            "demoted_requests": len(branch_demote_by_request),
+            "demoted_blocks": sum(branch_demoted_blocks),
+            "blocks_per_request_mean": (
+                statistics.fmean(branch_demoted_blocks)
+                if branch_demoted_blocks
+                else None
+            ),
+            "blocks_per_request_p95": _percentile(branch_demoted_blocks, 0.95),
+        },
         "steps": len(block_ms),
         "step_completion_ms": {
             "mean": statistics.fmean(block_ms) if block_ms else None,

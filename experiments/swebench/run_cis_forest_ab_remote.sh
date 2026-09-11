@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
   echo "usage: $0 VARIANT DEVICES OUTPUT PORT CONTAINER" >&2
-  echo "VARIANT: baseline | step-gang | step-gang-6 | step-elastic | step-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
+  echo "VARIANT: baseline | step-gang | step-gang-6 | step-elastic | step-window-rollout-first | step-fork | step-fork-lease | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
   exit 2
 fi
 
@@ -26,6 +26,7 @@ candidate_count=${CIS_CANDIDATE_COUNT:-15}
 rollout_count=${CIS_ROLLOUT_COUNT:-3}
 block_size=${CIS_BLOCK_SIZE:-128}
 active_step_limit=${CIS_ACTIVE_STEP_LIMIT:-6}
+native_runtime_setup=:
 
 for value in "$limit" "$workers" "$candidate_count" "$rollout_count" "$block_size" "$active_step_limit"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
@@ -54,6 +55,64 @@ case "$variant" in
       --set 'vllm.request_priority_policy=\"rollout_first\"'
     )
     ;;
+  step-window-rollout-first)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"rollout_first\"'
+    )
+    ;;
+  step-fork)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_kv_fork=true
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch'
+    ;;
+  step-fork-lease)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_kv_fork=true
+      --set vllm.native_kv_fork_lease=true
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch'
+    ;;
+  step-branch-evict)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_kv_branch_eviction=true
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch'
+    ;;
+  step-fork-branch-evict)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_kv_fork=true
+      --set vllm.native_kv_branch_eviction=true
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch'
+    ;;
+  step-fork-lease-branch-evict)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_kv_fork=true
+      --set vllm.native_kv_fork_lease=true
+      --set vllm.native_kv_branch_eviction=true
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch'
+    ;;
+  step-window-rollout-first-fork)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"rollout_first\"'
+      --set vllm.native_kv_fork=true
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch'
+    ;;
   step-streaming)
     variant_args=(
       --set conditional_is.active_step_limit="$active_step_limit"
@@ -62,6 +121,25 @@ case "$variant" in
       --set conditional_is.rollout_stream_candidate_batch_size=1
       --set conditional_is.rollout_stream_max_batches="$candidate_count"
     )
+    ;;
+  step-parent)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_parallel_sampling=true
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-parent-request.patch'
+    ;;
+  step-parent-streaming)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_parallel_sampling=true
+      --set conditional_is.stream_candidate_rollouts=true
+      --set conditional_is.rollout_stream_candidate_batch_size=1
+      --set conditional_is.rollout_stream_max_batches="$candidate_count"
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-parent-request.patch'
     ;;
   streaming)
     variant_args=(
@@ -149,6 +227,8 @@ docker run -d \
   -v "$cache":/root/.cache/vllm \
   -v "$output":/artifacts \
   "$image" -lc "
+    set -euo pipefail
+    $native_runtime_setup
     export PYTHONPATH=/workspace/src:\$PYTHONPATH
     exec /usr/local/python3.11.14/bin/python -m inference_scaling.swe_agent.profile \
       --config /workspace/configs/swebench/conditional_is_smoke.toml \
