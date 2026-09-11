@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
   echo "usage: $0 VARIANT DEVICES OUTPUT PORT CONTAINER" >&2
-  echo "VARIANT: baseline | step-gang | step-gang-6 | step-elastic | streaming | bounded | frontier-CAPACITY-BATCH" >&2
+  echo "VARIANT: baseline | step-gang | step-gang-6 | step-elastic | step-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
   exit 2
 fi
 
@@ -52,6 +52,15 @@ case "$variant" in
   step-elastic)
     variant_args=(
       --set 'vllm.request_priority_policy=\"rollout_first\"'
+    )
+    ;;
+  step-streaming)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set conditional_is.stream_candidate_rollouts=true
+      --set conditional_is.rollout_stream_candidate_batch_size=1
+      --set conditional_is.rollout_stream_max_batches=2
     )
     ;;
   streaming)
