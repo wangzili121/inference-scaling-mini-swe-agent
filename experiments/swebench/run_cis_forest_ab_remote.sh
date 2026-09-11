@@ -60,7 +60,7 @@ case "$variant" in
       --set 'vllm.request_priority_policy=\"step_fifo\"'
       --set conditional_is.stream_candidate_rollouts=true
       --set conditional_is.rollout_stream_candidate_batch_size=1
-      --set conditional_is.rollout_stream_max_batches=2
+      --set conditional_is.rollout_stream_max_batches="$candidate_count"
     )
     ;;
   streaming)
