@@ -957,4 +957,60 @@ FTS/s 同向、无质量回退；最终项目目标仍是至少 10%。
 6. Forest decode window 的饱和 P0 jobs/s/FTS/s 为 `-0.27%/-0.12%`，没有吞吐
    收益；小 smoke 的约 45% 假象未复现，停止扩展完整 tree scheduler。
 7. 下一核心工作应是 graph-capturable CANN Forest Attention，而不是继续堆 Host
-   调度规则；Step cap 还需外层 workers 消融，确认其独立贡献。
+   调度规则；Step cap 的外层 workers 消融已完成，结果见第 18 节。
+
+## 18. 2026-09-13 Step 外层限流与 Priority 消融已完成
+
+第 16 节 P0 所列 A-E 已在服务器 `159.138.5.111` 的空闲 NPU 1/4 上完成。没有停止、
+覆盖或共用其他人的卡。固定 P0、TP2、64-request workload、v0.18 和同一组 engine
+参数，测试：
+
+```text
+A flat W32
+B flat W6
+C cap6 W32
+D step_fifo priority W32
+E cap6 + step_fifo W32
+```
+
+并额外复跑 A/D/E。最关键结果：
+
+- B 相对 A：jobs/s `-2.3%`，证明纯外层 workers 限流不能复现收益。
+- C 相对 A：jobs/s `+2.7%`，0 preemption，barrier P95 `-64.3%`，但 burst P95
+  `+10.4%`。cap-only 是稳定性控制，不是主要吞吐来源。
+- D 两轮相对 A：jobs/s `+13.0%/+24.1%`，generated tokens/s
+  `+7.7%/+10.4%`。主要吞吐收益来自 CIS `job+step -> priority` 映射，而不是 cap；
+  代价是 preemption 16/4，engine queue P95 上升。
+- E 两轮相对 A：jobs/s `+5.5%/+11.1%`，Job P95 `-24.9%/-34.1%`，barrier
+  P95 `-75.3%/-71.0%`，两轮 0 preemption。它是尾延迟/稳定性方案，不是最高吞吐
+  方案。
+- A/D/E 两轮等权平均：D jobs/s `+18.5%`、generated tokens/s `+9.1%`；E
+  jobs/s `+8.3%`、generated tokens/s `+0.1%`、Job P95 `-29.7%`、barrier P95
+  `-73.2%`。
+
+统计注意：benchmark 原 `Job latency` 从客户端线程实际发 HTTP 时开始，W6 会隐藏
+尚未获得 worker 的请求。汇总器已增加以最早 worker start 为共同近似到达时刻的
+`burst_latency_seconds`，用于公平比较 W32/W6。以后 benchmark 应直接保存精确
+`released_at`。
+
+当前准确边界：vLLM 自带的是 per-request priority 原语；本仓库新增的是 CIS step
+元数据、step 生命周期 admission 和 `job_id + step_id` priority 映射。因此不是
+漏开的框架开关，但也还不是完整 tree scheduler。产品化应提供 throughput priority-only
+模式和 tail-safe cap+priority 模式，后续再用动态 policy 统一二者。
+
+详细报告：
+
+```text
+docs/experiments/CIS_STEP_ADMISSION_PRIORITY_ABLATION_20260913.zh-CN.md
+```
+
+原始数据：
+
+```text
+/data/disk/wangzili/cis-step-ablation-20260913/full
+/data/disk/wangzili/cis-step-ablation-20260913/confirm
+```
+
+下一步不应再重复固定 cap sweep。针对调度的最小后续是用统一 trace 解释 D 的吞吐
+提升与 preemption 上升，以及 E 的 barrier 收益和设备利用率损失；更高技术含量的
+主线仍是能进入 FULL graph 的 CANN Forest Attention。

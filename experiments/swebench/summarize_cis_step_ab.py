@@ -131,6 +131,25 @@ def _step_concurrency(intervals: list[tuple[float, float]]) -> dict[str, float]:
 
 def summarize(root: Path) -> dict[str, Any]:
     benchmark = json.loads((root / "benchmark.json").read_text(encoding="utf-8"))
+    measurements = [
+        item
+        for item in benchmark.get("measurements", ())
+        if item.get("started_at") is not None and item.get("finished_at") is not None
+    ]
+    # Older artifacts do not persist the common release timestamp. The earliest
+    # worker start is within milliseconds of release and is a much fairer origin
+    # than per-worker start time when comparing different client worker counts.
+    released_at = benchmark.get("released_at")
+    burst_origin = (
+        float(released_at)
+        if released_at is not None
+        else min((float(item["started_at"]) for item in measurements), default=None)
+    )
+    burst_latency_seconds = (
+        [float(item["finished_at"]) - burst_origin for item in measurements]
+        if burst_origin is not None
+        else []
+    )
     run_namespace = str(benchmark.get("run_namespace", ""))
     algorithms = [
         record
@@ -394,6 +413,22 @@ def summarize(root: Path) -> dict[str, Any]:
         "success_rate": benchmark.get("success_rate"),
         "jobs_per_second": benchmark.get("jobs_per_second"),
         "job_latency_seconds": benchmark.get("latency_seconds"),
+        "burst_latency_seconds": {
+            "origin": (
+                "benchmark_release"
+                if released_at is not None
+                else "earliest_worker_start"
+            ),
+            "mean": (
+                statistics.fmean(burst_latency_seconds)
+                if burst_latency_seconds
+                else None
+            ),
+            "p50": _percentile(burst_latency_seconds, 0.50),
+            "p95": _percentile(burst_latency_seconds, 0.95),
+            "p99": _percentile(burst_latency_seconds, 0.99),
+            "max": max(burst_latency_seconds, default=None),
+        },
         "forward_token_slots_per_second": (
             corrected_forward_slots / wall_seconds if wall_seconds else None
         ),

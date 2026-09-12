@@ -176,6 +176,9 @@ def test_burst_routes_whole_jobs_across_endpoints(monkeypatch) -> None:
     assert result["jobs_per_second"] > 0
     assert result["throughput"]["jobs_per_second"] == result["jobs_per_second"]
     assert result["throughput"]["generation_forward_token_slots_per_second"] > 0
+    assert result["released_at"] <= min(
+        measurement["started_at"] for measurement in result["measurements"]
+    )
     assert result["conditional_is"]["candidate_count"] == 8
     assert result["backend_delta"]["generation_forward_token_slots"] == 13
     assert all(call[1]["conditional_is"]["rollout_count"] == 2 for call in calls)

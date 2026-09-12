@@ -407,6 +407,7 @@ def run_burst(
             executor.submit(execute, index, record)
             for index, record in enumerate(records)
         ]
+        released_at = time.time()
         release.set()
         if after_release is not None:
             after_release()
@@ -457,6 +458,7 @@ def run_burst(
         "backend_delta": backend_delta,
         "endpoint_backend_delta": endpoint_backend_delta,
         "wall_seconds": wall_seconds,
+        "released_at": released_at,
         "jobs_per_second": throughput["jobs_per_second"],
         "throughput": throughput,
         "successes": successes,

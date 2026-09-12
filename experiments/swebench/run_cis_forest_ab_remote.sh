@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
   echo "usage: $0 VARIANT DEVICES OUTPUT PORT CONTAINER" >&2
-  echo "VARIANT: baseline | step-gang | step-gang-6 | step-gang-piecewise | step-gang-dual-graph | step-forest-attention | step-forest-attention-piecewise | step-forest-attention-dual-graph | step-forest-window-N | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
+  echo "VARIANT: baseline | step-cap-only | step-priority-only | step-gang | step-gang-6 | step-gang-piecewise | step-gang-dual-graph | step-forest-attention | step-forest-attention-piecewise | step-forest-attention-dual-graph | step-forest-window-N | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
   exit 2
 fi
 
@@ -61,6 +61,16 @@ fi
 case "$variant" in
   baseline)
     variant_args=()
+    ;;
+  step-cap-only)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+    )
+    ;;
+  step-priority-only)
+    variant_args=(
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+    )
     ;;
   step-gang|step-gang-6)
     variant_args=(
