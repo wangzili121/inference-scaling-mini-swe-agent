@@ -8,6 +8,7 @@ import json
 import os
 import signal
 import threading
+import traceback
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -116,6 +117,7 @@ def _handler(runner: ConditionalISRunner) -> type[BaseHTTPRequestHandler]:
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
                 return
             except Exception as error:
+                traceback.print_exc()
                 self._json(
                     HTTPStatus.INTERNAL_SERVER_ERROR,
                     {"error": f"{type(error).__name__}: {error}"},

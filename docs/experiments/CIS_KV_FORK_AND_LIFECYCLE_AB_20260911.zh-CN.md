@@ -71,6 +71,12 @@
 
 ## 正式结果
 
+> 2026-09-11 校正：下表 P0 的 `+8.7%` 是相对本轮同机但偏慢的
+> `0.1562 jobs/s` control。与此前最佳 Step cap6（`0.1688 jobs/s`、约
+> `2931 FTS/s`、Job mean/P95 `134.7/246.1s`）相比，direct fork 只有
+> jobs/s `+0.5%`、FTS/s 约 `+0.8%`，Job mean/P95 反而约 `+7.0%/+2.6%`。
+> 所以表中百分比不得作为 direct fork 的最终增益结论。
+
 百分比均相对同配置 Step baseline；延迟下降和吞吐上升是正向。不同运行的随机
 生成 token 数仍有小幅差异，因此同时报告 jobs/s 与 forward-token-slots/s。
 
@@ -98,34 +104,38 @@ dead-tail demotion 实际处理 108 条 rollout、175 个独有完整 block，�
 
 ## 结论
 
-1. Phase-1 direct fork 在高扇出 P0 上是目前最明确的正结果：jobs/s `+8.7%`、
-   FTS/s `+6.1%`、Job P95 `-19.5%`，且 906 个 child 全部直接命中。
+1. Phase-1 direct fork 的 906 个 child 全部直接命中，证明物理 KV handoff
+   功能成立；但相对最佳 Step cap6 的性能增量只有约 1%，且尾延迟没有改善，
+   不能把相对弱 control 的 `+8.7%` 当作最终收益。
 2. P1 收益只有约 2%，P2 没有端到端收益。P2 即使把 suffix lease 延长到 300 秒，
    仍有 30 个 unique child miss；没有过期事件，说明被覆盖的是未受保护的共享
    parent path，而不是最后一个 candidate suffix block。
 3. 若为 phase-1 hint 硬 pin 整条 6--60K parent path，会把并发树的 KV footprint
-   放大到不可接受，方向不成立。正确下一步是 scheduler 内 branch-on-token：在
+   放大到不可接受，方向不成立。后续已经实现 scheduler 内 branch-on-token waiter：
    candidate block table 仍有引用时原地给 R 个 child 增加引用，然后再释放 parent。
 4. “知道 loser 后删除 KV”可以实现，但单独提前驱逐 rollout tail 已被证伪。
    下一版应在 reduce transition 上同时表达 winner retain 和 loser demotion，并
    继续保持 soft priority；只有 pressure 需要空间时才真正覆盖 loser。
-5. direct fork 暂时仅作为 P0/低 stale-risk 的实验开关，不默认启用；ParentRequest
+5. direct fork 暂时仅作为低 stale-risk 的实验开关，不默认启用；ParentRequest
    前端 grouping 仅带来约 `+0.7%` generated-token throughput，也不继续扩矩阵。
 
-## 下一步实现顺序
+## 2026-09-12 后续验证与收敛
 
-1. 在 EngineCore 内增加 `branch_on_token(parent, R)`，candidate 结束时直接 fork
-   block table/refcount，消除 host readmission 与 free-queue race；先在 P0/P1/P2
-   保持同 seed、同算法语义做 A/B。
-2. 增加 reduce transition 元数据：`job/step/candidate/segment` page ownership，
-   winner 路径获得短期 soft retain，loser candidate suffix 与 rollout tail 标记
-   dead；共享节点的保留级别取所有活跃使用者中最保守值。
-3. 只有上述两项仍显示 attention 为主瓶颈后，进入两层 Forest Attention CANN
-   kernel；KV lifecycle 本身不再扩大参数网格。
+1. EngineCore fork-on-token waiter 已完成 P0/P1/P2 正式 A/B：物理 KV 命中率 100%，
+   但 immediate/barrier/tail-2 均未超过各自最佳 Step control 的 FTS/s。
+2. compact waiter 又在 P0 省掉 4300 万个 prompt token 的 IPC/占位 payload，
+   相对同机 Step control 的 jobs/s/FTS/s 仍下降 3.6%/5.9%。因此不继续实现动态
+   tree-root，也不扩大 release-policy 网格。
+3. reduce 后的 loser-tail demotion 已在压力测试中回退；没有 preemption 的正式
+   baseline 不继续开发 page ownership。只有未来长上下文出现 winner miss 或真实
+   KV pressure 时，才恢复 soft retain/demotion。
+4. 当前主线转入两层 Forest Attention CANN kernel；已有 trace 和 FIA 微基准分别
+   给出了端到端占比、共享几何和 exact LSE merge 的依据。
 
 ## 原始数据
 
 - `docs/experiments/data/cis_tree_fork_ab_host111.json`
 - `docs/experiments/data/cis_tree_lease_host167.json`
+- `docs/experiments/data/cis_engine_fork_compact_p0_full_20260912.json`
 - Host A：`/data/disk/wangzili/cis-tree-ab-20260911`
 - Host B：`/data/disk/wangzili/cis-tree-ab-20260911`

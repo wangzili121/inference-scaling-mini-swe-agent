@@ -1,0 +1,12 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1468,7 +1468,8 @@ class Scheduler(SchedulerInterface):
+         if stopped_preempted_reqs:
+             # This is a rare case and unlikely to impact performance.
+             self.waiting.remove_requests(stopped_preempted_reqs)
++        self._release_cis_fork_waiters_for_capacity()
+
+         if failed_kv_load_req_ids and not self.recompute_kv_load_failures:
+             requests = [self.requests[req_id] for req_id in failed_kv_load_req_ids]
+             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)

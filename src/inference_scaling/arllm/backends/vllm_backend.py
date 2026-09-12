@@ -764,6 +764,12 @@ class VLLMBackend:
             if self._active_engine_requests < 0:
                 raise RuntimeError("vLLM in-flight request accounting became negative")
 
+    def active_engine_request_count(self) -> int:
+        """Return local admission occupancy without querying engine metrics."""
+
+        with self._statistics_lock:
+            return self._active_engine_requests
+
     @staticmethod
     def _sum_metric_values(
         metrics: Any, *, model_name: str | None = None
@@ -909,6 +915,13 @@ class VLLMBackend:
             token_topk_confidences=token_topk_confidences,
             confidence_top_k=effective_top_k,
         )
+        if (
+            getattr(completion, "stop_reason", None) == "cis_parent_terminal"
+            and not tokens
+        ):
+            # Parked rollout placeholders cancelled by a terminal parent never
+            # enter the model. Do not charge their logical prompt as prefill.
+            return sample, 0, 0, 0
         prompt_length = len(self._model_prefix(request.prefix))
         cached = min(prompt_length, int(getattr(output, "num_cached_tokens", 0) or 0))
         return (
@@ -1396,7 +1409,10 @@ class AsyncVLLMBackend(VLLMBackend):
         native_suffix_speculation: bool = False,
         request_priority_policy: str = "none",
         native_parallel_sampling: bool = False,
+        native_segmented_rng: bool = False,
         native_kv_fork: bool = False,
+        native_kv_fork_waiters: bool = False,
+        native_kv_fork_compact_waiters: bool = False,
         native_kv_fork_lease: bool = False,
         native_kv_fork_lease_scope: str = "candidate_suffix",
         native_kv_fork_lease_max_fraction: float | None = None,
@@ -1429,7 +1445,12 @@ class AsyncVLLMBackend(VLLMBackend):
             raise ValueError("unknown CIS request priority policy")
         self._request_priority_policy = request_priority_policy
         self._native_parallel_sampling = bool(native_parallel_sampling)
+        self._native_segmented_rng = bool(native_segmented_rng)
         self._native_kv_fork = bool(native_kv_fork)
+        self._native_kv_fork_waiters = bool(native_kv_fork_waiters)
+        self._native_kv_fork_compact_waiters = bool(
+            native_kv_fork_compact_waiters
+        )
         self._native_kv_fork_lease = bool(native_kv_fork_lease)
         if native_kv_fork_lease_scope not in {"candidate_suffix", "full_parent"}:
             raise ValueError("unknown native KV fork lease scope")
@@ -1445,6 +1466,15 @@ class AsyncVLLMBackend(VLLMBackend):
         self._native_kv_resample_gc = bool(native_kv_resample_gc)
         if self._native_kv_fork_lease and not self._native_kv_fork:
             raise ValueError("native_kv_fork_lease requires native_kv_fork")
+        if self._native_kv_fork_waiters and not self._native_kv_fork_lease:
+            raise ValueError("native_kv_fork_waiters requires a native KV fork lease")
+        if (
+            self._native_kv_fork_compact_waiters
+            and not self._native_kv_fork_waiters
+        ):
+            raise ValueError(
+                "native_kv_fork_compact_waiters requires native_kv_fork_waiters"
+            )
         if (
             self._native_kv_fork_lease_scope != "candidate_suffix"
             and not self._native_kv_fork_lease
@@ -1530,7 +1560,10 @@ class AsyncVLLMBackend(VLLMBackend):
         engine_kwargs: dict[str, Any] | None = None,
         request_priority_policy: str = "none",
         native_parallel_sampling: bool = False,
+        native_segmented_rng: bool = False,
         native_kv_fork: bool = False,
+        native_kv_fork_waiters: bool = False,
+        native_kv_fork_compact_waiters: bool = False,
         native_kv_fork_lease: bool = False,
         native_kv_fork_lease_scope: str = "candidate_suffix",
         native_kv_fork_lease_max_fraction: float | None = None,
@@ -1543,6 +1576,8 @@ class AsyncVLLMBackend(VLLMBackend):
             from vllm.v1.engine.async_llm import AsyncLLM
             from vllm.v1.engine.parallel_sampling import ParentRequest
             from vllm.v1.core.kv_cache_manager import KVCacheManager
+            from vllm.v1.core.sched.scheduler import Scheduler
+            from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
             SamplingParams, TokensPrompt, BeamSearchParams = _load_vllm_sampling_api()
         except ImportError as error:  # pragma: no cover - optional GPU installation
@@ -1555,10 +1590,28 @@ class AsyncVLLMBackend(VLLMBackend):
             raise RuntimeError(
                 "native_parallel_sampling requires the CIS ParentRequest runtime patch"
             )
+        if native_segmented_rng and not bool(
+            getattr(GPUModelRunner, "cis_segmented_rng_supported", False)
+        ):
+            raise RuntimeError(
+                "native_segmented_rng requires the CIS segmented RNG runtime patch"
+            )
         if native_kv_fork and not bool(
             getattr(KVCacheManager, "cis_fork_supported", False)
         ):
             raise RuntimeError("native_kv_fork requires the CIS KV fork runtime patch")
+        if native_kv_fork_waiters and not bool(
+            getattr(Scheduler, "cis_fork_waiter_supported", False)
+        ):
+            raise RuntimeError(
+                "native_kv_fork_waiters requires the CIS fork waiter runtime patch"
+            )
+        if native_kv_fork_compact_waiters and not bool(
+            getattr(Scheduler, "cis_fork_compact_waiter_supported", False)
+        ):
+            raise RuntimeError(
+                "native_kv_fork_compact_waiters requires the compact waiter patch"
+            )
         if native_kv_fork_lease and not bool(
             getattr(KVCacheManager, "cis_fork_lease_supported", False)
         ):
@@ -1689,7 +1742,10 @@ class AsyncVLLMBackend(VLLMBackend):
             native_suffix_speculation=speculation is not None,
             request_priority_policy=request_priority_policy,
             native_parallel_sampling=native_parallel_sampling,
+            native_segmented_rng=native_segmented_rng,
             native_kv_fork=native_kv_fork,
+            native_kv_fork_waiters=native_kv_fork_waiters,
+            native_kv_fork_compact_waiters=native_kv_fork_compact_waiters,
             native_kv_fork_lease=native_kv_fork_lease,
             native_kv_fork_lease_scope=native_kv_fork_lease_scope,
             native_kv_fork_lease_max_fraction=native_kv_fork_lease_max_fraction,
@@ -1699,6 +1755,24 @@ class AsyncVLLMBackend(VLLMBackend):
 
     def _sampling_params(self, request: GenerationRequest) -> Any:
         params = super()._sampling_params(request)
+        if request.rng_switch_after_tokens is not None:
+            assert request.rng_switch_seed is not None
+            if not self._native_segmented_rng:
+                raise RuntimeError(
+                    "segmented RNG requests require native_segmented_rng=true"
+                )
+            extra_args = dict(getattr(params, "extra_args", None) or {})
+            extra_args["cis_rng_switch_after_tokens"] = int(
+                request.rng_switch_after_tokens
+            )
+            extra_args["cis_rng_switch_seed"] = int(request.rng_switch_seed)
+            if request.rng_prefix_group is not None:
+                assert request.rng_prefix_group_size is not None
+                extra_args["cis_rng_prefix_group"] = request.rng_prefix_group
+                extra_args["cis_rng_prefix_group_size"] = int(
+                    request.rng_prefix_group_size
+                )
+            params.extra_args = extra_args
         if (
             not self._native_kv_fork
             and not self._native_kv_branch_eviction
@@ -1711,6 +1785,18 @@ class AsyncVLLMBackend(VLLMBackend):
             extra_args["cis_fork_expected_children"] = int(
                 request.fork_expected_children
             )
+            if request.fork_group_id is not None:
+                extra_args["cis_fork_group_id"] = request.fork_group_id
+                extra_args["cis_fork_group_size"] = int(request.fork_group_size or 0)
+                extra_args["cis_fork_release_remaining"] = int(
+                    request.fork_release_remaining or 0
+                )
+                if request.fork_adaptive_release:
+                    extra_args["cis_fork_adaptive_release"] = True
+                if request.fork_adaptive_runnable_fraction is not None:
+                    extra_args["cis_fork_adaptive_runnable_fraction"] = float(
+                        request.fork_adaptive_runnable_fraction
+                    )
             if self._native_kv_fork_lease:
                 extra_args["cis_fork_shared_prefix_tokens"] = (
                     0
@@ -1728,6 +1814,18 @@ class AsyncVLLMBackend(VLLMBackend):
                 extra_args["cis_fork_lease_ms"] = 300_000
         if self._native_kv_fork and request.fork_parent_request_id is not None:
             extra_args["cis_fork_parent_request_id"] = request.fork_parent_request_id
+            if request.fork_wait_for_parent:
+                if not self._native_kv_fork_waiters:
+                    raise RuntimeError(
+                        "fork waiter requests require native_kv_fork_waiters=true"
+                    )
+                extra_args["cis_fork_wait_for_parent"] = True
+                if self._native_kv_fork_compact_waiters:
+                    extra_args["cis_fork_compact_waiter"] = True
+                # The EngineCore expands this prompt with the parent's candidate
+                # tokens. The frontend never sees that mutation, so keep its
+                # cache metrics bounded by the prompt length it registered.
+                extra_args["cis_fork_frontend_prompt_tokens"] = len(request.prefix)
         match = _CIS_STEP_REQUEST.match(request.request_id)
         if self._native_kv_resample_gc and match is not None:
             extra_args["cis_branch_handle"] = request.request_id

@@ -100,12 +100,20 @@ class ConditionalISConfig:
     rollout_log_weight_bounds: tuple[float, float] | None = None
     rollout_evaluation_batch_size: int = 1
     rollout_submission_batch_size: int | None = None
+    rollout_subtree_max_active_batches: int | None = None
+    fused_candidate_rollout_paths: bool = False
+    engine_fork_candidate_rollouts: bool = False
+    engine_fork_release_remaining_candidates: int | None = None
+    engine_fork_adaptive_release: bool = False
+    engine_fork_adaptive_runnable_fraction: float = 0.5
     stream_candidate_rollouts: bool = False
     rollout_stream_candidate_batch_size: int = 5
     rollout_stream_max_batches: int = 2
     rollout_frontier_capacity: int | None = None
     rollout_frontier_batch_size: int = 15
     active_step_limit: int | None = None
+    active_step_borrow_limit: int | None = None
+    active_step_borrow_below_requests: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("candidate_count", "rollout_count", "block_size", "total_length"):
@@ -140,6 +148,11 @@ class ConditionalISConfig:
                 "rollout_submission_batch_size",
                 self.rollout_submission_batch_size,
             )
+        if self.rollout_subtree_max_active_batches is not None:
+            require_positive(
+                "rollout_subtree_max_active_batches",
+                self.rollout_subtree_max_active_batches,
+            )
         require_positive(
             "rollout_stream_candidate_batch_size",
             self.rollout_stream_candidate_batch_size,
@@ -159,6 +172,24 @@ class ConditionalISConfig:
         )
         if self.active_step_limit is not None:
             require_positive("active_step_limit", self.active_step_limit)
+        if self.active_step_borrow_limit is not None:
+            require_positive("active_step_borrow_limit", self.active_step_borrow_limit)
+            if self.active_step_limit is None:
+                raise ValueError("active_step_borrow_limit requires active_step_limit")
+            if self.active_step_borrow_limit <= self.active_step_limit:
+                raise ValueError(
+                    "active_step_borrow_limit must exceed active_step_limit"
+                )
+        if self.active_step_borrow_below_requests is not None:
+            require_positive(
+                "active_step_borrow_below_requests",
+                self.active_step_borrow_below_requests,
+            )
+            if self.active_step_borrow_limit is None:
+                raise ValueError(
+                    "active_step_borrow_below_requests requires "
+                    "active_step_borrow_limit"
+                )
         if (
             self.rollout_frontier_capacity is not None
             and self.rollout_frontier_batch_size > self.rollout_frontier_capacity
@@ -171,6 +202,62 @@ class ConditionalISConfig:
             raise ValueError(
                 "stream_candidate_rollouts and rollout_submission_batch_size "
                 "are mutually exclusive"
+            )
+        if self.rollout_subtree_max_active_batches is not None and (
+            self.stream_candidate_rollouts
+            or self.rollout_submission_batch_size is not None
+            or self.rollout_frontier_capacity is not None
+        ):
+            raise ValueError(
+                "rollout_subtree_max_active_batches is mutually exclusive with "
+                "other rollout admission controls"
+            )
+        if self.fused_candidate_rollout_paths and (
+            self.stream_candidate_rollouts
+            or self.rollout_submission_batch_size is not None
+            or self.rollout_subtree_max_active_batches is not None
+            or self.rollout_frontier_capacity is not None
+            or self.exact_rollout_early_stop
+        ):
+            raise ValueError(
+                "fused_candidate_rollout_paths is mutually exclusive with staged "
+                "rollout admission and early stopping"
+            )
+        if self.fused_candidate_rollout_paths and self.rollout_design != "iid":
+            raise ValueError("fused_candidate_rollout_paths currently requires iid rollouts")
+        if self.engine_fork_candidate_rollouts and (
+            self.fused_candidate_rollout_paths
+            or self.stream_candidate_rollouts
+            or self.rollout_submission_batch_size is not None
+            or self.rollout_subtree_max_active_batches is not None
+            or self.rollout_frontier_capacity is not None
+            or self.exact_rollout_early_stop
+        ):
+            raise ValueError(
+                "engine_fork_candidate_rollouts is mutually exclusive with other "
+                "rollout execution modes"
+            )
+        if self.engine_fork_candidate_rollouts and self.rollout_design != "iid":
+            raise ValueError("engine_fork_candidate_rollouts currently requires iid rollouts")
+        if self.engine_fork_release_remaining_candidates is not None:
+            if not self.engine_fork_candidate_rollouts:
+                raise ValueError(
+                    "engine_fork_release_remaining_candidates requires "
+                    "engine_fork_candidate_rollouts"
+                )
+            if not 0 <= self.engine_fork_release_remaining_candidates < self.candidate_count:
+                raise ValueError(
+                    "engine_fork_release_remaining_candidates must be in "
+                    "[0, candidate_count)"
+                )
+        if self.engine_fork_adaptive_release and not self.engine_fork_candidate_rollouts:
+            raise ValueError(
+                "engine_fork_adaptive_release requires "
+                "engine_fork_candidate_rollouts"
+            )
+        if not 0.0 < self.engine_fork_adaptive_runnable_fraction <= 1.0:
+            raise ValueError(
+                "engine_fork_adaptive_runnable_fraction must be in (0, 1]"
             )
         if self.rollout_frontier_capacity is not None and (
             self.stream_candidate_rollouts

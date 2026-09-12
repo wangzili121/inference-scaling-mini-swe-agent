@@ -27,6 +27,16 @@ class GenerationRequest:
     confidence_top_k: int | None = None
     fork_parent_request_id: str | None = None
     fork_expected_children: int = 0
+    fork_wait_for_parent: bool = False
+    fork_group_id: str | None = None
+    fork_group_size: int | None = None
+    fork_release_remaining: int | None = None
+    fork_adaptive_release: bool = False
+    fork_adaptive_runnable_fraction: float | None = None
+    rng_switch_after_tokens: int | None = None
+    rng_switch_seed: int | None = None
+    rng_prefix_group: str | None = None
+    rng_prefix_group_size: int | None = None
 
     def __post_init__(self) -> None:
         if self.max_new_tokens <= 0:
@@ -58,6 +68,58 @@ class GenerationRequest:
             raise ValueError("fork_expected_children must be non-negative")
         if self.fork_parent_request_id is not None and self.fork_expected_children:
             raise ValueError("a fork child cannot also declare expected children")
+        if self.fork_wait_for_parent and self.fork_parent_request_id is None:
+            raise ValueError("a fork waiter requires a parent request")
+        fork_group_fields = (
+            self.fork_group_id,
+            self.fork_group_size,
+            self.fork_release_remaining,
+        )
+        if any(value is not None for value in fork_group_fields):
+            if any(value is None for value in fork_group_fields):
+                raise ValueError("fork group metadata must be provided together")
+            if self.fork_expected_children <= 0:
+                raise ValueError("fork group metadata requires a fork parent")
+            if not self.fork_group_id:
+                raise ValueError("fork_group_id cannot be empty")
+            if self.fork_group_size is None or self.fork_group_size <= 0:
+                raise ValueError("fork_group_size must be positive")
+            if (
+                self.fork_release_remaining is None
+                or not 0 <= self.fork_release_remaining < self.fork_group_size
+            ):
+                raise ValueError(
+                    "fork_release_remaining must be in [0, fork_group_size)"
+                )
+        if self.fork_adaptive_release and self.fork_group_id is None:
+            raise ValueError("adaptive fork release requires fork group metadata")
+        if self.fork_adaptive_runnable_fraction is not None:
+            if not self.fork_adaptive_release:
+                raise ValueError(
+                    "fork_adaptive_runnable_fraction requires adaptive release"
+                )
+            if not 0.0 < self.fork_adaptive_runnable_fraction <= 1.0:
+                raise ValueError(
+                    "fork_adaptive_runnable_fraction must be in (0, 1]"
+                )
+        if (self.rng_switch_after_tokens is None) != (self.rng_switch_seed is None):
+            raise ValueError("segmented RNG requires both a boundary and continuation seed")
+        if self.rng_switch_after_tokens is not None:
+            if not 0 < self.rng_switch_after_tokens < self.max_new_tokens:
+                raise ValueError(
+                    "segmented RNG boundary must lie inside the generated sequence"
+                )
+            if self.rng_switch_seed is None or self.rng_switch_seed < 0:
+                raise ValueError("segmented RNG continuation seed must be non-negative")
+        if (self.rng_prefix_group is None) != (self.rng_prefix_group_size is None):
+            raise ValueError("an RNG prefix group requires its expected group size")
+        if self.rng_prefix_group is not None:
+            if self.rng_switch_after_tokens is None:
+                raise ValueError("an RNG prefix group requires segmented RNG")
+            if not self.rng_prefix_group:
+                raise ValueError("rng_prefix_group cannot be empty")
+            if self.rng_prefix_group_size is None or self.rng_prefix_group_size < 2:
+                raise ValueError("rng_prefix_group_size must be at least two")
 
 
 @dataclass(frozen=True, slots=True)

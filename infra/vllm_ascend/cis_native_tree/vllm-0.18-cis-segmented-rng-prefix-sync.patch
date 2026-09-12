@@ -1,0 +1,231 @@
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 98e1dab..eb12899 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -386,6 +386,9 @@ class ExecuteModelState(NamedTuple):
+ class GPUModelRunner(
+     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
+ ):
++    cis_segmented_rng_supported = True
++    cis_segmented_rng_prefix_sync_supported = True
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -575,6 +578,14 @@ class GPUModelRunner(
+
+         # Request states.
+         self.requests: dict[str, CachedRequestState] = {}
++        self._cis_segmented_rng_pending: set[str] = set()
++        self._cis_segmented_rng_logged = False
++        self._cis_rng_prefix_group_by_request: dict[str, str] = {}
++        self._cis_rng_prefix_group_members: dict[str, set[str]] = defaultdict(set)
++        self._cis_rng_prefix_group_seen: dict[str, set[str]] = defaultdict(set)
++        self._cis_rng_prefix_group_expected: dict[str, int] = {}
++        self._cis_rng_prefix_cache: dict[str, dict[str, Any]] = {}
++        self._cis_rng_prefix_sync_logged = False
+         # NOTE(rob): num_prompt_logprobs only includes reqs
+         # that are currently in the prefill phase.
+         self.num_prompt_logprobs: dict[str, int] = {}
+@@ -1028,8 +1039,10 @@ class GPUModelRunner(
+         """
+         # Remove finished requests from the cached states.
+         for req_id in scheduler_output.finished_req_ids:
++            self._retire_cis_rng_prefix_request(req_id)
+             self.requests.pop(req_id, None)
+             self.num_prompt_logprobs.pop(req_id, None)
++            self._cis_segmented_rng_pending.discard(req_id)
+         self.late_interaction_runner.on_requests_finished(
+             scheduler_output.finished_req_ids
+         )
+@@ -1125,6 +1138,30 @@ class GPUModelRunner(
+                 lora_request=new_req_data.lora_request,
+             )
+             self.requests[req_id] = req_state
++            if (
++                sampling_params is not None
++                and sampling_params.extra_args
++                and sampling_params.extra_args.get("cis_rng_switch_after_tokens")
++                is not None
++            ):
++                self._cis_segmented_rng_pending.add(req_id)
++                prefix_group = sampling_params.extra_args.get("cis_rng_prefix_group")
++                if prefix_group is not None:
++                    prefix_group = str(prefix_group)
++                    expected = int(
++                        sampling_params.extra_args["cis_rng_prefix_group_size"]
++                    )
++                    previous_expected = self._cis_rng_prefix_group_expected.setdefault(
++                        prefix_group, expected
++                    )
++                    if previous_expected != expected:
++                        raise RuntimeError(
++                            "inconsistent CIS RNG prefix group size for "
++                            f"{prefix_group}: {previous_expected} != {expected}"
++                        )
++                    self._cis_rng_prefix_group_by_request[req_id] = prefix_group
++                    self._cis_rng_prefix_group_members[prefix_group].add(req_id)
++                    self._cis_rng_prefix_group_seen[prefix_group].add(req_id)
+             self.late_interaction_runner.register_request(req_id, pooling_params)
+
+             if sampling_params and sampling_params.prompt_logprobs is not None:
+@@ -3083,6 +3120,144 @@ class GPUModelRunner(
+             ec_connector_output,
+         )
+
++    def _retire_cis_rng_prefix_request(self, req_id: str) -> None:
++        prefix_group = self._cis_rng_prefix_group_by_request.pop(req_id, None)
++        if prefix_group is None:
++            return
++
++        members = self._cis_rng_prefix_group_members[prefix_group]
++        members.discard(req_id)
++        expected = self._cis_rng_prefix_group_expected[prefix_group]
++        if (
++            not members
++            and len(self._cis_rng_prefix_group_seen[prefix_group]) >= expected
++        ):
++            self._cis_rng_prefix_group_members.pop(prefix_group, None)
++            self._cis_rng_prefix_group_seen.pop(prefix_group, None)
++            self._cis_rng_prefix_group_expected.pop(prefix_group, None)
++            self._cis_rng_prefix_cache.pop(prefix_group, None)
++
++    def _switch_cis_segmented_rng(self) -> None:
++        if not self._cis_segmented_rng_pending:
++            return
++
++        switched: list[str] = []
++        for req_id in self._cis_segmented_rng_pending:
++            req_state = self.requests.get(req_id)
++            if req_state is None or req_state.sampling_params is None:
++                switched.append(req_id)
++                continue
++            extra_args = req_state.sampling_params.extra_args or {}
++            boundary = int(extra_args["cis_rng_switch_after_tokens"])
++            if len(req_state.output_token_ids) < boundary:
++                continue
++            if req_state.generator is None:
++                raise RuntimeError("CIS segmented RNG requires a request-local seed")
++            req_state.generator.manual_seed(int(extra_args["cis_rng_switch_seed"]))
++            switched.append(req_id)
++
++        self._cis_segmented_rng_pending.difference_update(switched)
++        for req_id in switched:
++            self._retire_cis_rng_prefix_request(req_id)
++        if switched and not self._cis_segmented_rng_logged:
++            logger.info(
++                "CIS segmented RNG switched %d request generator(s) at the "
++                "candidate boundary",
++                len(switched),
++            )
++            self._cis_segmented_rng_logged = True
++
++    def _synchronize_cis_rng_prefix(
++        self, sampler_output: SamplerOutput
++    ) -> SamplerOutput:
++        if not self._cis_rng_prefix_group_by_request:
++            return sampler_output
++        if sampler_output.sampled_token_ids.shape[1] != 1:
++            raise RuntimeError("CIS RNG prefix synchronization does not support spec decode")
++
++        synchronized = 0
++        num_sampled = sampler_output.sampled_token_ids.shape[0]
++        logprobs = sampler_output.logprobs_tensors
++        for req_index, req_id in enumerate(self.input_batch.req_ids[:num_sampled]):
++            prefix_group = self._cis_rng_prefix_group_by_request.get(req_id)
++            if prefix_group is None or self.discard_request_mask.np[req_index]:
++                continue
++            req_state = self.requests[req_id]
++            extra_args = req_state.sampling_params.extra_args or {}
++            boundary = int(extra_args["cis_rng_switch_after_tokens"])
++            position = len(req_state.output_token_ids)
++            if position >= boundary:
++                continue
++
++            cache = self._cis_rng_prefix_cache.get(prefix_group)
++            if cache is None:
++                sampled = sampler_output.sampled_token_ids
++                cache = {
++                    "seen": set(),
++                    "sampled_token_ids": torch.empty(
++                        (boundary, sampled.shape[1]),
++                        dtype=sampled.dtype,
++                        device=sampled.device,
++                    ),
++                }
++                if logprobs is not None:
++                    cache.update(
++                        {
++                            "logprob_token_ids": torch.empty(
++                                (boundary, logprobs.logprob_token_ids.shape[1]),
++                                dtype=logprobs.logprob_token_ids.dtype,
++                                device=logprobs.logprob_token_ids.device,
++                            ),
++                            "logprobs": torch.empty(
++                                (boundary, logprobs.logprobs.shape[1]),
++                                dtype=logprobs.logprobs.dtype,
++                                device=logprobs.logprobs.device,
++                            ),
++                            "selected_token_ranks": torch.empty(
++                                boundary,
++                                dtype=logprobs.selected_token_ranks.dtype,
++                                device=logprobs.selected_token_ranks.device,
++                            ),
++                        }
++                    )
++                self._cis_rng_prefix_cache[prefix_group] = cache
++
++            seen = cache["seen"]
++            if position not in seen:
++                cache["sampled_token_ids"][position].copy_(
++                    sampler_output.sampled_token_ids[req_index]
++                )
++                if logprobs is not None:
++                    cache["logprob_token_ids"][position].copy_(
++                        logprobs.logprob_token_ids[req_index]
++                    )
++                    cache["logprobs"][position].copy_(logprobs.logprobs[req_index])
++                    cache["selected_token_ranks"][position].copy_(
++                        logprobs.selected_token_ranks[req_index]
++                    )
++                seen.add(position)
++            else:
++                sampler_output.sampled_token_ids[req_index].copy_(
++                    cache["sampled_token_ids"][position]
++                )
++                if logprobs is not None:
++                    logprobs.logprob_token_ids[req_index].copy_(
++                        cache["logprob_token_ids"][position]
++                    )
++                    logprobs.logprobs[req_index].copy_(cache["logprobs"][position])
++                    logprobs.selected_token_ranks[req_index].copy_(
++                        cache["selected_token_ranks"][position]
++                    )
++                synchronized += 1
++
++        if synchronized and not self._cis_rng_prefix_sync_logged:
++            logger.info(
++                "CIS RNG prefix synchronization reused %d sampled token(s)",
++                synchronized,
++            )
++            self._cis_rng_prefix_sync_logged = True
++        return sampler_output
++
+     def _sample(
+         self,
+         logits: torch.Tensor | None,
+@@ -3093,11 +3268,13 @@ class GPUModelRunner(
+         # Update output token ids with tokens sampled in last step
+         # if async scheduling and required by current sampling params.
+         self.input_batch.update_async_output_token_ids()
++        self._switch_cis_segmented_rng()
+         if spec_decode_metadata is None:
+-            return self.sampler(
++            sampler_output = self.sampler(
+                 logits=logits,
+                 sampling_metadata=sampling_metadata,
+             )
++            return self._synchronize_cis_rng_prefix(sampler_output)
+
+         # Update spec_token_ids with real draft tokens from pre step only when
+         # output_token_ids is needed (penalties or bad_words are in use).

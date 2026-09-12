@@ -28,6 +28,7 @@ class _Completion:
     token_ids: list[int]
     logprobs: list[dict[int, _Logprob]]
     finish_reason: str = "length"
+    stop_reason: str | None = None
     power_logprobs: list[dict[int, _Logprob]] | None = None
     index: int = 0
 
@@ -290,6 +291,27 @@ def test_vllm_generation_captures_requested_topk_confidence() -> None:
     assert engine.calls[0][1][0].logprobs == 3
     assert sample.token_topk_confidences == pytest.approx((0.3,))
     assert sample.confidence_top_k == 3
+
+
+def test_terminal_parent_fork_waiter_does_not_charge_prefill() -> None:
+    backend, _ = _backend()
+    request = GenerationRequest((1, 2, 3), 4, SamplingConfig(), 7, "rollout")
+    output = _Output(
+        outputs=[
+            _Completion(
+                token_ids=[],
+                logprobs=[],
+                finish_reason="abort",
+                stop_reason="cis_parent_terminal",
+            )
+        ]
+    )
+
+    _, prefill_tokens, cached_tokens, forward_slots = backend._sample_from_output(
+        request, output
+    )
+
+    assert (prefill_tokens, cached_tokens, forward_slots) == (0, 0, 0)
 
 
 def test_vllm_sampling_preserves_per_request_seed_policy_and_order() -> None:
@@ -662,6 +684,52 @@ def test_async_vllm_native_parallel_sampling_preserves_child_seeds() -> None:
     assert snapshot.maximum_in_flight_requests == 3
 
 
+def test_async_vllm_segmented_rng_adds_boundary_metadata() -> None:
+    request = GenerationRequest(
+        (1, 2),
+        4,
+        SamplingConfig(),
+        7,
+        "job-a:step:0:candidate:0:rollout:0",
+        rng_switch_after_tokens=2,
+        rng_switch_seed=11,
+        rng_prefix_group="job-a:step:0:candidate:0",
+        rng_prefix_group_size=3,
+    )
+    disabled = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="native_segmented_rng"):
+            disabled._sampling_params(request)
+    finally:
+        disabled.close()
+
+    enabled = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        native_segmented_rng=True,
+    )
+    try:
+        params = enabled._sampling_params(request)
+    finally:
+        enabled.close()
+
+    assert params.extra_args == {
+        "cis_rng_switch_after_tokens": 2,
+        "cis_rng_switch_seed": 11,
+        "cis_rng_prefix_group": "job-a:step:0:candidate:0",
+        "cis_rng_prefix_group_size": 3,
+    }
+
+
 def test_async_vllm_native_kv_fork_adds_parent_child_metadata() -> None:
     backend = AsyncVLLMBackend(
         _AsyncEngine(),
@@ -679,6 +747,11 @@ def test_async_vllm_native_kv_fork_adds_parent_child_metadata() -> None:
             7,
             "job-a:step:0:candidate:0",
             fork_expected_children=3,
+            fork_group_id="job-a:step:0",
+            fork_group_size=8,
+            fork_release_remaining=2,
+            fork_adaptive_release=True,
+            fork_adaptive_runnable_fraction=0.5,
         )
         child = GenerationRequest(
             (1, 4),
@@ -696,10 +769,97 @@ def test_async_vllm_native_kv_fork_adds_parent_child_metadata() -> None:
     assert parent_params.extra_args == {
         "cis_fork_handle": "job-a:step:0:candidate:0",
         "cis_fork_expected_children": 3,
+        "cis_fork_group_id": "job-a:step:0",
+        "cis_fork_group_size": 8,
+        "cis_fork_release_remaining": 2,
+        "cis_fork_adaptive_release": True,
+        "cis_fork_adaptive_runnable_fraction": 0.5,
     }
     assert child_params.extra_args == {
         "cis_fork_parent_request_id": "job-a:step:0:candidate:0"
     }
+
+
+def test_async_vllm_native_kv_fork_waiter_adds_park_metadata() -> None:
+    backend = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        native_kv_fork=True,
+        native_kv_fork_waiters=True,
+        native_kv_fork_lease=True,
+        native_kv_fork_lease_scope="full_parent",
+    )
+    try:
+        request = GenerationRequest(
+            (1,),
+            4,
+            SamplingConfig(),
+            8,
+            "job-a:step:0:candidate:0:rollout:0",
+            fork_parent_request_id="job-a:step:0:candidate:0",
+            fork_wait_for_parent=True,
+        )
+        params = backend._sampling_params(request)
+    finally:
+        backend.close()
+
+    assert params.extra_args == {
+        "cis_fork_parent_request_id": "job-a:step:0:candidate:0",
+        "cis_fork_wait_for_parent": True,
+        "cis_fork_frontend_prompt_tokens": 1,
+    }
+
+
+def test_async_vllm_compact_fork_waiter_adds_engine_hint() -> None:
+    backend = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        native_kv_fork=True,
+        native_kv_fork_waiters=True,
+        native_kv_fork_compact_waiters=True,
+        native_kv_fork_lease=True,
+        native_kv_fork_lease_scope="full_parent",
+    )
+    try:
+        request = GenerationRequest(
+            (1, 2, 3),
+            4,
+            SamplingConfig(),
+            8,
+            "job-a:step:0:candidate:0:rollout:0",
+            fork_parent_request_id="job-a:step:0:candidate:0",
+            fork_wait_for_parent=True,
+        )
+        params = backend._sampling_params(request)
+    finally:
+        backend.close()
+
+    assert params.extra_args == {
+        "cis_fork_parent_request_id": "job-a:step:0:candidate:0",
+        "cis_fork_wait_for_parent": True,
+        "cis_fork_compact_waiter": True,
+        "cis_fork_frontend_prompt_tokens": 3,
+    }
+
+
+def test_async_vllm_compact_fork_waiter_requires_waiters() -> None:
+    with pytest.raises(ValueError, match="requires native_kv_fork_waiters"):
+        AsyncVLLMBackend(
+            _AsyncEngine(),
+            _Tokenizer(),
+            model_id="fake",
+            parameter_count=100,
+            sampling_params_factory=_SamplingParams,
+            native_kv_fork=True,
+            native_kv_fork_compact_waiters=True,
+            native_kv_fork_lease=True,
+        )
 
 
 def test_async_vllm_native_kv_fork_lease_marks_candidate_suffix() -> None:

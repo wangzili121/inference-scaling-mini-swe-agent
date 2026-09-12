@@ -1,0 +1,19 @@
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -1613,11 +1613,13 @@ class NPUModelRunner(GPUModelRunner):
+         # Sample the next token and get logprobs if needed.
+         sampling_metadata = self.input_batch.sampling_metadata
++        self._switch_cis_segmented_rng()
+         if spec_decode_metadata is None:
+             if lmhead_tp_enable() and logits is not None:
+                 logits = logits[: self.input_batch.num_reqs]
+-            return self.sampler(
++            sampler_output = self.sampler(
+                 logits=logits,
+                 sampling_metadata=sampling_metadata,
+             )
++            return self._synchronize_cis_rng_prefix(sampler_output)
+
+         if lmhead_tp_enable() and logits is not None:
+             logits = logits[: len(spec_decode_metadata.logits_indices)]

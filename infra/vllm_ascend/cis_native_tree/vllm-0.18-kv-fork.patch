@@ -4,14 +4,14 @@ index 2c712a1..945bf94 100644
 +++ b/vllm/v1/core/kv_cache_manager.py
 @@ -2,15 +2,17 @@
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
- 
+
  import itertools
 +from collections import OrderedDict
  from collections.abc import Sequence
  from dataclasses import dataclass
 +from time import monotonic
  from typing import Literal, overload
- 
+
  from vllm.distributed.kv_events import KVCacheEvent
  from vllm.logger import init_logger
  from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
@@ -23,8 +23,8 @@ index 2c712a1..945bf94 100644
  from vllm.v1.request import Request
 @@ -103,7 +105,32 @@ class KVCacheBlocks:
          return KVCacheBlocks(tuple(() for _ in range(len(self.blocks))))
- 
- 
+
+
 +@dataclass
 +class _CISForkHint:
 +    blocks: tuple[KVCacheBlock, ...]
@@ -66,13 +66,13 @@ index 2c712a1..945bf94 100644
 +        self._cis_max_fork_hints = 4096
 +        self._cis_branch_records: OrderedDict[str, _CISBranchRecord] = OrderedDict()
 +        self._cis_max_branch_records = 16384
- 
+
          # Pre-constructed KVCacheBlocks with no blocks, callers should use this
          # via create_kv_cache_blocks instead of creating new ones to avoid GC
 @@ -173,6 +208,341 @@ class KVCacheManager:
          self.prefix_cache_stats = PrefixCacheStats()
          return stats
- 
+
 +    def _release_cis_fork_hint(self, parent_id: str) -> _CISForkHint | None:
 +        hint = self._cis_fork_hints.pop(parent_id, None)
 +        if hint is not None and hint.leased_blocks:
@@ -414,7 +414,7 @@ index 2c712a1..945bf94 100644
 @@ -192,6 +562,17 @@ class KVCacheManager:
          if not self.enable_caching or request.skip_reading_prefix_cache:
              return self.empty_kv_cache_blocks, 0
- 
+
 +        cis_fork = self._get_cis_forked_blocks(request)
 +        if cis_fork is not None:
 +            if self.log_stats:
@@ -434,7 +434,7 @@ index 2c712a1..945bf94 100644
              num_encoder_tokens,
          )
 +        self._commit_cis_fork(request.request_id)
- 
+
          # P/D: delay caching blocks if we have to recv from
          # remote. Update state for locally cached blocks.
 @@ -395,7 +777,70 @@ class KVCacheManager:
@@ -505,7 +505,7 @@ index 2c712a1..945bf94 100644
 +                request.request_id,
 +                len(movable),
 +            )
- 
+
      def remove_skipped_blocks(
          self, request_id: str, total_computed_tokens: int
 diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
@@ -513,9 +513,9 @@ index 3da3d7e..83a358b 100644
 --- a/vllm/v1/core/kv_cache_utils.py
 +++ b/vllm/v1/core/kv_cache_utils.py
 @@ -345,6 +345,24 @@ class FreeKVCacheBlockQueue:
- 
+
          self.num_free_blocks += len(blocks)
- 
+
 +    def prepend_n(self, blocks: list[KVCacheBlock]) -> None:
 +        """Put free blocks at the front in their eviction order."""
 +        if not blocks:
@@ -536,23 +536,23 @@ index 3da3d7e..83a358b 100644
 +
      def get_all_free_blocks(self) -> list[KVCacheBlock]:
          """Get all free blocks in the free list. Mainly used for testing.
- 
+
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
 index ea2c2a6..fb8e3a2 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -1801,6 +1801,7 @@ class Scheduler(SchedulerInterface):
- 
+
          delay_free_blocks |= connector_delay_free_blocks
          if not delay_free_blocks:
 +            self.kv_cache_manager.capture_cis_fork(request)
              self._free_blocks(request)
- 
+
          return kv_xfer_params
 @@ -1878,6 +1879,18 @@ class Scheduler(SchedulerInterface):
- 
+
          return reset_successful
- 
+
 +    def cis_resample_gc(
 +        self,
 +        selected_candidate_id: str | None,
@@ -575,7 +575,7 @@ index 2f2acdd..d72cd6c 100644
 @@ -576,6 +576,18 @@ class EngineCore:
              reset_running_requests, reset_connector
          )
- 
+
 +    def cis_resample_gc(
 +        self,
 +        selected_candidate_id: str | None,
@@ -590,4 +590,4 @@ index 2f2acdd..d72cd6c 100644
 +
      def reset_encoder_cache(self) -> None:
          """Reset the encoder cache to invalidate all cached encoder outputs.
- 
+

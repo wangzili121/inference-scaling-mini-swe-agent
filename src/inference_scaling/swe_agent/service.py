@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from inference_scaling.arllm.algorithms import (
+    OccupancyAwareStepAdmissionController,
     RolloutAdmissionController,
     StepAdmissionController,
     run_conditional_is,
@@ -142,7 +143,7 @@ class CISExecution:
     total_seconds: float
     backend_delta: dict[str, Any]
     stage_events: tuple[dict[str, Any], ...]
-    conditional: dict[str, int]
+    conditional: dict[str, int | float | bool | None]
     started_at: float
     finished_at: float
 
@@ -249,6 +250,9 @@ class ConditionalISRunner:
         conditional = dict(config["conditional_is"])
         sampling = dict(config["sampling"])
         reward = dict(config["reward"])
+        engine_fork_release_remaining = int(
+            conditional.get("engine_fork_release_remaining_candidates", -1)
+        )
         self.maximum = int(generation["max_new_tokens"])
         self.sampling = SamplingConfig(
             temperature=float(sampling.get("temperature", 1.0)),
@@ -266,6 +270,28 @@ class ConditionalISRunner:
                 None
                 if conditional.get("rollout_submission_batch_size") in (None, 0)
                 else int(conditional["rollout_submission_batch_size"])
+            ),
+            rollout_subtree_max_active_batches=(
+                None
+                if conditional.get("rollout_subtree_max_active_batches") in (None, 0)
+                else int(conditional["rollout_subtree_max_active_batches"])
+            ),
+            fused_candidate_rollout_paths=bool(
+                conditional.get("fused_candidate_rollout_paths", False)
+            ),
+            engine_fork_candidate_rollouts=bool(
+                conditional.get("engine_fork_candidate_rollouts", False)
+            ),
+            engine_fork_release_remaining_candidates=(
+                None
+                if engine_fork_release_remaining < 0
+                else engine_fork_release_remaining
+            ),
+            engine_fork_adaptive_release=bool(
+                conditional.get("engine_fork_adaptive_release", False)
+            ),
+            engine_fork_adaptive_runnable_fraction=float(
+                conditional.get("engine_fork_adaptive_runnable_fraction", 0.5)
             ),
             stream_candidate_rollouts=bool(
                 conditional.get("stream_candidate_rollouts", False)
@@ -289,6 +315,16 @@ class ConditionalISRunner:
                 if conditional.get("active_step_limit") in (None, 0)
                 else int(conditional["active_step_limit"])
             ),
+            active_step_borrow_limit=(
+                None
+                if conditional.get("active_step_borrow_limit") in (None, 0)
+                else int(conditional["active_step_borrow_limit"])
+            ),
+            active_step_borrow_below_requests=(
+                None
+                if conditional.get("active_step_borrow_below_requests") in (None, 0)
+                else int(conditional["active_step_borrow_below_requests"])
+            ),
         )
         self.rollout_admission_controller = (
             None
@@ -298,11 +334,26 @@ class ConditionalISRunner:
                 batch_size=self.conditional.rollout_frontier_batch_size,
             )
         )
-        self.step_admission_controller = (
-            None
-            if self.conditional.active_step_limit is None
-            else StepAdmissionController(self.conditional.active_step_limit)
-        )
+        if self.conditional.active_step_limit is None:
+            self.step_admission_controller = None
+        elif self.conditional.active_step_borrow_limit is None:
+            self.step_admission_controller = StepAdmissionController(
+                self.conditional.active_step_limit
+            )
+        else:
+            active_requests = getattr(backend, "active_engine_request_count", None)
+            if not callable(active_requests):
+                raise ValueError(
+                    "occupancy-aware step admission requires backend occupancy"
+                )
+            self.step_admission_controller = OccupancyAwareStepAdmissionController(
+                self.conditional.active_step_limit,
+                borrow_limit=self.conditional.active_step_borrow_limit,
+                borrow_below_requests=(
+                    self.conditional.active_step_borrow_below_requests or 64
+                ),
+                active_requests=active_requests,
+            )
         reward_kind = str(reward.get("kind", "sequence_log_probability"))
         if reward_kind == "sequence_log_probability":
             self.reward = SequenceLogProbabilityReward(
@@ -636,6 +687,18 @@ class ConditionalISRunner:
                 "candidate_count": conditional.candidate_count,
                 "rollout_count": conditional.rollout_count,
                 "block_size": conditional.block_size,
+                "engine_fork_candidate_rollouts": (
+                    conditional.engine_fork_candidate_rollouts
+                ),
+                "engine_fork_release_remaining_candidates": (
+                    conditional.engine_fork_release_remaining_candidates
+                ),
+                "engine_fork_adaptive_release": (
+                    conditional.engine_fork_adaptive_release
+                ),
+                "engine_fork_adaptive_runnable_fraction": (
+                    conditional.engine_fork_adaptive_runnable_fraction
+                ),
             },
             started_at=started_at,
             finished_at=finished_at,

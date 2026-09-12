@@ -1,0 +1,85 @@
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index bff9fc12b..000000000 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -386,5 +386,7 @@ class GPUModelRunner(
+     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
+ ):
++    cis_segmented_rng_supported = True
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -575,6 +577,8 @@ class GPUModelRunner(
+
+         # Request states.
+         self.requests: dict[str, CachedRequestState] = {}
++        self._cis_segmented_rng_pending: set[str] = set()
++        self._cis_segmented_rng_logged = False
+         # NOTE(rob): num_prompt_logprobs only includes reqs
+         # that are currently in the prefill phase.
+         self.num_prompt_logprobs: dict[str, int] = {}
+@@ -1029,6 +1033,7 @@ class GPUModelRunner(
+         for req_id in scheduler_output.finished_req_ids:
+             self.requests.pop(req_id, None)
+             self.num_prompt_logprobs.pop(req_id, None)
++            self._cis_segmented_rng_pending.discard(req_id)
+         self.late_interaction_runner.on_requests_finished(
+             scheduler_output.finished_req_ids
+         )
+@@ -1126,6 +1131,13 @@ class GPUModelRunner(
+                 lora_request=new_req_data.lora_request,
+             )
+             self.requests[req_id] = req_state
++            if (
++                sampling_params is not None
++                and sampling_params.extra_args
++                and sampling_params.extra_args.get("cis_rng_switch_after_tokens")
++                is not None
++            ):
++                self._cis_segmented_rng_pending.add(req_id)
+             self.late_interaction_runner.register_request(req_id, pooling_params)
+
+             if sampling_params and sampling_params.prompt_logprobs is not None:
+@@ -3082,6 +3095,34 @@ class GPUModelRunner(
+             ec_connector_output,
+         )
+
++    def _switch_cis_segmented_rng(self) -> None:
++        if not self._cis_segmented_rng_pending:
++            return
++
++        switched: list[str] = []
++        for req_id in self._cis_segmented_rng_pending:
++            req_state = self.requests.get(req_id)
++            if req_state is None or req_state.sampling_params is None:
++                switched.append(req_id)
++                continue
++            extra_args = req_state.sampling_params.extra_args or {}
++            boundary = int(extra_args["cis_rng_switch_after_tokens"])
++            if len(req_state.output_token_ids) < boundary:
++                continue
++            if req_state.generator is None:
++                raise RuntimeError("CIS segmented RNG requires a request-local seed")
++            req_state.generator.manual_seed(int(extra_args["cis_rng_switch_seed"]))
++            switched.append(req_id)
++
++        self._cis_segmented_rng_pending.difference_update(switched)
++        if switched and not self._cis_segmented_rng_logged:
++            logger.info(
++                "CIS segmented RNG switched %d request generator(s) at the "
++                "candidate boundary",
++                len(switched),
++            )
++            self._cis_segmented_rng_logged = True
++
+     def _sample(
+         self,
+         logits: torch.Tensor | None,
+@@ -3092,5 +3133,6 @@ class GPUModelRunner(
+         # if async scheduling and required by current sampling params.
+         self.input_batch.update_async_output_token_ids()
++        self._switch_cis_segmented_rng()
+         if spec_decode_metadata is None:
+             return self.sampler(
+                 logits=logits,

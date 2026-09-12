@@ -45,6 +45,13 @@ rollout；EngineCore handoff 保证这段短间隔内 parent block 不回到可�
 
 ## Handoff 结果
 
+> 2026-09-11 校正：下表的 P0 `baseline=0.1562 jobs/s` 是后续同机重跑的较弱
+> control，只适合这组运行内 A/B；它不是此前已经得到的最佳 Step cap6 结果。
+> 与最佳 Step cap6（`0.1688 jobs/s`、约 `2931 FTS/s`、Job mean/P95
+> `134.7/246.1s`）比较，direct fork 的增量仅为 jobs/s `+0.5%`、FTS/s
+> 约 `+0.8%`，且 Job mean/P95 分别恶化约 `7.0%/2.6%`。因此 direct fork
+> 只能判定为“功能成立、增量未被稳定证明”，不能表述为独立的 `+8.7%` 优化。
+
 百分比相对同算法配置的 Step baseline；延迟下降为正向。
 
 | 配置 | 方案 | jobs/s | Job mean / P95 | Step mean / P95 | Barrier mean / P95 | FTS/s | Preempt | Fork hit |
@@ -115,9 +122,10 @@ P2 的 jobs/s 变化来自本轮生成工作量和结束时刻差异；工作归
 
 ## 当前结论
 
-1. P0 的 direct fork 是目前唯一稳定的正向 tree-KV 结果：jobs/s `+8.7%`、
-   FTS/s `+6.1%`、Job P95 `-19.5%`。P0 child 很快全部 adopt，额外 full-parent
-   retention 只增加压力，反而抹去大部分收益。
+1. P0 direct fork 相对本轮较弱 control 为正，但相对历史最佳 Step cap6 只有
+   jobs/s `+0.5%`、FTS/s 约 `+0.8%`，尾延迟还略差，尚不能作为独立性能优化。
+   它的可靠收获是证明 906/906 个 child 可以安全 adopt 物理 block table。
+   额外 full-parent retention 只增加压力，反而抹去大部分收益。
 2. P2 的 streaming + handoff 明显修复了单独 streaming 的灾难性回退，并把 Job、
    Step、Barrier 尾延迟全部降低，但 FTS/s 与 jobs/s 仍下降。说明“接着 fork”能
    消除 free-queue race，却不能抵消更碎的 prefill/decode batch shape。
@@ -156,9 +164,15 @@ P2 的 jobs/s 变化来自本轮生成工作量和结束时刻差异；工作归
    不继续扩大 streaming 参数矩阵。
 2. 停止逐 step 同步 GC 和普通 free-queue 微调。若后续长上下文 profile 出现真实
    KV 压力，只在 pressure event 批量降低 dead branch 保留级，避免每 step RPC。
-3. 保留 P0 direct fork，将主要研发转向
+3. direct fork 仅保留为实验机制，不进入默认配置。主要研发转向
    sibling-prefix-aware Forest Attention，因为 APC 只省 prefill，并不减少 45 条
    rollout 在 decode 中重复读取同一长 trunk。
+
+> 2026-09-12 进展：后续 EngineCore fork-on-token waiter 已做到 candidate 只计算
+> 一次、child 物理 KV 命中 100%；compact waiter 又删除了 4300 万个 prompt token
+> 的 placeholder payload。P0 相对同机 Step control 的 jobs/s/FTS/s 仍下降
+> 3.6%/5.9%，所以动态 tree-root 和更多 release-policy 调参均停止，Forest
+> Attention 成为下一条主线。详见 `CIS_ENGINECORE_FORK_AB_20260912.zh-CN.md`。
 
 ## 原始数据
 

@@ -726,6 +726,9 @@ def main() -> None:
                 conditional_overrides=_conditional_overrides(args),
                 routing=args.routing,
             )
+            (output / "warmup.json").write_text(
+                json.dumps(warmup_result, indent=2) + "\n", encoding="utf-8"
+            )
             if warmup_result["success_rate"] != 1.0:
                 raise RuntimeError("profiling warmup failed")
         lifecycle = (

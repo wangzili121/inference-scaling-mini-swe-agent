@@ -137,6 +137,7 @@ def test_runtime_config_declares_every_feature_ablation_key() -> None:
     assert "async_scheduling = false" in text
     assert "enforce_eager = false" in text
     assert "enable_cpu_binding = true" in text
+    assert "engine_fork_release_remaining_candidates = -1" in text
 
 
 def test_burst_routes_whole_jobs_across_endpoints(monkeypatch) -> None:

@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
   echo "usage: $0 VARIANT DEVICES OUTPUT PORT CONTAINER" >&2
-  echo "VARIANT: baseline | step-gang | step-gang-6 | step-elastic | step-window-rollout-first | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
+  echo "VARIANT: baseline | step-gang | step-gang-6 | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
   exit 2
 fi
 
@@ -27,7 +27,11 @@ rollout_count=${CIS_ROLLOUT_COUNT:-3}
 block_size=${CIS_BLOCK_SIZE:-128}
 active_step_limit=${CIS_ACTIVE_STEP_LIMIT:-6}
 fork_lease_max_fraction=${CIS_FORK_LEASE_MAX_FRACTION:-0.20}
+active_step_borrow_limit=${CIS_ACTIVE_STEP_BORROW_LIMIT:-12}
+active_step_borrow_below=${CIS_ACTIVE_STEP_BORROW_BELOW:-64}
+engine_fork_runnable_fraction=${CIS_ENGINE_FORK_RUNNABLE_FRACTION:-0.5}
 native_runtime_setup=:
+variant_docker_env=()
 
 for value in "$limit" "$workers" "$candidate_count" "$rollout_count" "$block_size" "$active_step_limit"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
@@ -35,11 +39,19 @@ for value in "$limit" "$workers" "$candidate_count" "$rollout_count" "$block_siz
     exit 2
   }
 done
+(( workers <= limit )) || {
+  echo "workers must not exceed workload limit" >&2
+  exit 2
+}
 
 for path in "$workspace" "$model" "$public_workload" "$self_workload" "$categorical"; do
   [[ -e "$path" ]] || { echo "missing dependency: $path" >&2; exit 1; }
 done
 [[ -x /usr/local/bin/npu-smi ]] || { echo "npu-smi is unavailable" >&2; exit 1; }
+if ss -H -ltn "sport = :$port" | grep -q .; then
+  echo "port is already in use: $port" >&2
+  exit 1
+fi
 
 case "$variant" in
   baseline)
@@ -51,6 +63,66 @@ case "$variant" in
       --set 'vllm.request_priority_policy=\"step_fifo\"'
     )
     ;;
+  step-fused-paths)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set conditional_is.fused_candidate_rollout_paths=true
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_segmented_rng=true
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --check /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-segmented-rng-prefix-sync.patch && git apply /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-segmented-rng-prefix-sync.patch && cd /vllm-workspace/vllm-ascend && git apply --check /workspace/infra/vllm_ascend/cis_native_tree/vllm-ascend-0.18-cis-segmented-rng-prefix-sync.patch && git apply /workspace/infra/vllm_ascend/cis_native_tree/vllm-ascend-0.18-cis-segmented-rng-prefix-sync.patch'
+    ;;
+  step-engine-fork|step-engine-fork-barrier|step-engine-fork-tail-*|step-engine-fork-adaptive|step-engine-fork-compact|step-engine-fork-compact-barrier|step-engine-fork-compact-tail-*)
+    engine_fork_variant=$variant
+    engine_fork_compact=false
+    if [[ "$variant" == step-engine-fork-compact* ]]; then
+      engine_fork_compact=true
+      engine_fork_variant="step-engine-fork${variant#step-engine-fork-compact}"
+    fi
+    engine_fork_release_args=()
+    if [[ "$engine_fork_variant" == step-engine-fork-barrier ]]; then
+      engine_fork_release_args+=(
+        --set conditional_is.engine_fork_release_remaining_candidates=0
+      )
+    elif [[ "$engine_fork_variant" == step-engine-fork-tail-* ]]; then
+      engine_fork_tail=${engine_fork_variant##*-}
+      [[ "$engine_fork_tail" =~ ^[0-9]+$ ]] || {
+        echo "invalid engine fork tail: $engine_fork_tail" >&2
+        exit 2
+      }
+      (( engine_fork_tail < candidate_count )) || {
+        echo "engine fork tail must be smaller than candidate count" >&2
+        exit 2
+      }
+      engine_fork_release_args+=(
+        --set conditional_is.engine_fork_release_remaining_candidates="$engine_fork_tail"
+      )
+    elif [[ "$engine_fork_variant" == step-engine-fork-adaptive ]]; then
+      engine_fork_release_args+=(
+        --set conditional_is.engine_fork_release_remaining_candidates=0
+        --set conditional_is.engine_fork_adaptive_release=true
+        --set conditional_is.engine_fork_adaptive_runnable_fraction="$engine_fork_runnable_fraction"
+      )
+    fi
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set conditional_is.engine_fork_candidate_rollouts=true
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_kv_fork=true
+      --set vllm.native_kv_fork_waiters=true
+      --set vllm.native_kv_fork_lease=true
+      --set 'vllm.native_kv_fork_lease_scope=\"full_parent\"'
+      "${engine_fork_release_args[@]}"
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch && git apply --recount --check /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-fork-waiters.patch && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-fork-waiters.patch'
+    if [[ "$engine_fork_compact" == true ]]; then
+      variant_args+=(--set vllm.native_kv_fork_compact_waiters=true)
+      native_runtime_setup+=' && git apply --recount --check /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-fork-compact-waiters.patch && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-fork-compact-waiters.patch'
+    fi
+    if [[ "$engine_fork_variant" == step-engine-fork-adaptive ]]; then
+      native_runtime_setup+=' && git apply --recount --check /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-fork-adaptive-release.patch && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-fork-adaptive-release.patch'
+    fi
+    ;;
   step-elastic)
     variant_args=(
       --set 'vllm.request_priority_policy=\"rollout_first\"'
@@ -60,6 +132,46 @@ case "$variant" in
     variant_args=(
       --set conditional_is.active_step_limit="$active_step_limit"
       --set 'vllm.request_priority_policy=\"rollout_first\"'
+    )
+    ;;
+  step-subtree-*|step-subtree-fork-*)
+    subtree_max=${variant##*-}
+    [[ "$subtree_max" =~ ^[1-9][0-9]*$ ]] || {
+      echo "invalid subtree max active batches: $subtree_max" >&2
+      exit 2
+    }
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set conditional_is.rollout_subtree_max_active_batches="$subtree_max"
+    )
+    if [[ "$variant" == step-subtree-fork-* ]]; then
+      variant_args+=(--set vllm.native_kv_fork=true)
+      native_runtime_setup='cd /vllm-workspace/vllm && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch'
+    fi
+    ;;
+  step-decode-guard-*)
+    guard_prefills=${variant##*-}
+    [[ "$guard_prefills" =~ ^[1-9][0-9]*$ ]] || {
+      echo "invalid decode guard prefill limit: $guard_prefills" >&2
+      exit 2
+    }
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+    )
+    variant_docker_env=(
+      -e VLLM_CIS_DECODE_GUARD_MAX_PREFILLS="$guard_prefills"
+      -e VLLM_CIS_DECODE_GUARD_MIN_DECODES=32
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --check /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-decode-guard.patch && git apply /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-decode-guard.patch'
+    ;;
+  step-occupancy-aware)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set conditional_is.active_step_borrow_limit="$active_step_borrow_limit"
+      --set conditional_is.active_step_borrow_below_requests="$active_step_borrow_below"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
     )
     ;;
   step-fork)
@@ -265,6 +377,9 @@ CIS_CANDIDATE_COUNT=$candidate_count
 CIS_ROLLOUT_COUNT=$rollout_count
 CIS_BLOCK_SIZE=$block_size
 CIS_ACTIVE_STEP_LIMIT=$active_step_limit
+CIS_ACTIVE_STEP_BORROW_LIMIT=$active_step_borrow_limit
+CIS_ACTIVE_STEP_BORROW_BELOW=$active_step_borrow_below
+CIS_ENGINE_FORK_RUNNABLE_FRACTION=$engine_fork_runnable_fraction
 CIS_FORK_LEASE_MAX_FRACTION=$fork_lease_max_fraction
 EOF
 
@@ -274,6 +389,7 @@ docker run -d \
   --entrypoint /bin/bash \
   -e CIS_MODEL_PATH=/models/conditional-is \
   -e ASCEND_RT_VISIBLE_DEVICES="$logical_devices" \
+  "${variant_docker_env[@]}" \
   "${device_args[@]}" \
   --device /dev/davinci_manager \
   --device /dev/devmm_svm \

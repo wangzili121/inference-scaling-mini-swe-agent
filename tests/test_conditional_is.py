@@ -7,6 +7,7 @@ from time import sleep
 import pytest
 
 from inference_scaling.arllm.algorithms.conditional_is import (
+    OccupancyAwareStepAdmissionController,
     RolloutAdmissionController,
     StepAdmissionController,
     conditional_is_step,
@@ -21,7 +22,7 @@ from inference_scaling.experimental.shared.rqmc import (
     randomized_lattice_uniforms,
     scrambled_sobol_uniforms,
 )
-from inference_scaling.arllm.types import ScoreRequest
+from inference_scaling.arllm.types import GenerationRequest, ScoreRequest, SequenceSample
 
 
 def _backend() -> TabularAutoregressiveBackend:
@@ -61,6 +62,34 @@ def test_step_admission_controller_bounds_complete_steps() -> None:
         assert second.result(timeout=1) > 0
         controller.release()
 
+
+def test_occupancy_aware_step_admission_borrows_only_while_underfilled() -> None:
+    occupancy = 3
+    controller = OccupancyAwareStepAdmissionController(
+        1,
+        borrow_limit=2,
+        borrow_below_requests=4,
+        active_requests=lambda: occupancy,
+    )
+    controller.acquire()
+    controller.acquire()
+    assert controller.borrowed_admissions == 1
+
+    entered = Event()
+
+    def acquire_third() -> None:
+        controller.acquire()
+        entered.set()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(acquire_third)
+        sleep(0.02)
+        assert not entered.is_set()
+        controller.release()
+        assert entered.wait(timeout=1)
+        future.result(timeout=1)
+    controller.release()
+    controller.release()
 
 def _exact_first_token_target() -> dict[int, float]:
     base_first = (0.7, 0.3)
@@ -302,7 +331,14 @@ def test_rollout_budget_subtracts_candidate_block() -> None:
 def test_rollout_submission_batches_preserve_logical_candidate_order() -> None:
     class RecordingBackend(TabularAutoregressiveBackend):
         def __init__(self) -> None:
-            super().__init__({}, fallback=[0.5, 0.5])
+            super().__init__(
+                {
+                    (): [0.7, 0.3],
+                    (0,): [0.9, 0.1],
+                    (1,): [0.2, 0.8],
+                },
+                fallback=[0.5, 0.5],
+            )
             self.batch_sizes: list[int] = []
 
         def sample_batch(self, requests):
@@ -369,6 +405,271 @@ def test_conditional_is_exposes_candidate_rollout_fork_edges() -> None:
 def test_rollout_submission_batch_size_must_be_positive() -> None:
     with pytest.raises(ValueError, match="rollout_submission_batch_size"):
         ConditionalISConfig(rollout_submission_batch_size=0)
+
+
+def test_rollout_subtree_frontier_preserves_result_and_bounds_active_bundles() -> None:
+    class RecordingBackend(TabularAutoregressiveBackend):
+        def __init__(self) -> None:
+            super().__init__({}, fallback=[0.5, 0.5])
+            self.lock = Lock()
+            self.active_bundles = 0
+            self.peak_active_bundles = 0
+            self.rollout_batch_sizes: list[int] = []
+
+        def sample_batch(self, requests):
+            is_rollout = all(":rollout:" in request.request_id for request in requests)
+            if is_rollout:
+                with self.lock:
+                    self.active_bundles += 1
+                    self.peak_active_bundles = max(
+                        self.peak_active_bundles, self.active_bundles
+                    )
+                    self.rollout_batch_sizes.append(len(requests))
+                sleep(0.01)
+            try:
+                return super().sample_batch(requests)
+            finally:
+                if is_rollout:
+                    with self.lock:
+                        self.active_bundles -= 1
+
+    common = dict(candidate_count=4, rollout_count=2, block_size=1, total_length=2)
+    baseline_backend = RecordingBackend()
+    baseline = conditional_is_step(
+        base_backend=baseline_backend,
+        rollout_backend=baseline_backend,
+        prompt=(),
+        generated_prefix=(),
+        config=ConditionalISConfig(**common),
+        base_sampling=SamplingConfig(),
+        rollout_sampling=SamplingConfig(),
+        reward=_reward,
+        seeds=SeedStream(20260911),
+        step_index=0,
+    )
+    backend = RecordingBackend()
+    subtree = conditional_is_step(
+        base_backend=backend,
+        rollout_backend=backend,
+        prompt=(),
+        generated_prefix=(),
+        config=ConditionalISConfig(
+            **common,
+            rollout_subtree_max_active_batches=2,
+        ),
+        base_sampling=SamplingConfig(),
+        rollout_sampling=SamplingConfig(),
+        reward=_reward,
+        seeds=SeedStream(20260911),
+        step_index=0,
+    )
+
+    assert subtree == baseline
+    assert sorted(backend.rollout_batch_sizes) == [2, 2, 2, 2]
+    assert backend.peak_active_bundles == 2
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rollout_subtree_max_active_batches": 0},
+        {
+            "rollout_subtree_max_active_batches": 2,
+            "rollout_submission_batch_size": 2,
+        },
+        {
+            "rollout_subtree_max_active_batches": 2,
+            "rollout_frontier_capacity": 16,
+        },
+        {
+            "rollout_subtree_max_active_batches": 2,
+            "stream_candidate_rollouts": True,
+        },
+    ],
+)
+def test_rollout_subtree_frontier_rejects_invalid_configuration(overrides) -> None:
+    with pytest.raises(ValueError, match="rollout_subtree_max_active_batches"):
+        ConditionalISConfig(**overrides)
+
+
+def test_fused_candidate_rollout_paths_preserve_logical_tree_shape() -> None:
+    class SegmentedBackend:
+        model_id = "segmented"
+
+        def __init__(self) -> None:
+            self.batches: list[tuple[GenerationRequest, ...]] = []
+
+        def sample_batch(self, requests):
+            self.batches.append(tuple(requests))
+            samples = []
+            for request in requests:
+                assert request.rng_switch_after_tokens == 2
+                candidate_index = int(request.request_id.split(":candidate:")[1].split(":")[0])
+                rollout_index = int(request.request_id.rsplit(":rollout:", 1)[1])
+                candidate_token = candidate_index + 1
+                rollout_token = rollout_index + 10
+                token_ids = (candidate_token, candidate_token, rollout_token, rollout_token)
+                samples.append(
+                    SequenceSample(
+                        prefix=request.prefix,
+                        token_ids=token_ids,
+                        token_logprobs=(-0.1,) * len(token_ids),
+                        policy_id=request.sampling.policy_id,
+                        model_id=self.model_id,
+                        request_id=request.request_id,
+                    )
+                )
+            return samples
+
+        def score_batch(self, _requests):
+            raise AssertionError("on-policy fused paths must not be rescored")
+
+    backend = SegmentedBackend()
+    step = conditional_is_step(
+        base_backend=backend,
+        rollout_backend=backend,
+        prompt=(),
+        generated_prefix=(),
+        config=ConditionalISConfig(
+            candidate_count=2,
+            rollout_count=2,
+            block_size=2,
+            total_length=4,
+            fused_candidate_rollout_paths=True,
+        ),
+        base_sampling=SamplingConfig(),
+        rollout_sampling=SamplingConfig(),
+        reward=lambda _prompt, generated: float(sum(generated)),
+        seeds=SeedStream(20260912),
+        step_index=0,
+    )
+
+    assert len(backend.batches) == 1
+    assert len(backend.batches[0]) == 4
+    assert len(step.candidates) == 2
+    assert [candidate.token_ids for candidate in step.candidates] == [(1, 1), (2, 2)]
+    assert [len(candidate.rollouts) for candidate in step.candidates] == [2, 2]
+    assert {
+        rollout.token_ids
+        for candidate in step.candidates
+        for rollout in candidate.rollouts
+    } == {(10, 10), (11, 11)}
+    assert all(
+        request.rng_switch_seed is not None for request in backend.batches[0]
+    )
+    assert len({request.rng_prefix_group for request in backend.batches[0]}) == 2
+    assert all(request.rng_prefix_group_size == 2 for request in backend.batches[0])
+
+
+def test_engine_fork_waiters_preserve_logical_tree_shape() -> None:
+    class ForkWaiterBackend:
+        model_id = "fork-waiter"
+
+        def __init__(self) -> None:
+            self.batches: list[tuple[GenerationRequest, ...]] = []
+
+        def sample_batch(self, requests):
+            self.batches.append(tuple(requests))
+            samples = []
+            for request in requests:
+                if request.fork_wait_for_parent:
+                    rollout_index = int(request.request_id.rsplit(":rollout:", 1)[1])
+                    token_ids = (rollout_index + 10, rollout_index + 10)
+                else:
+                    candidate_index = int(
+                        request.request_id.split(":candidate:")[1].split(":")[0]
+                    )
+                    token_ids = (candidate_index + 1, candidate_index + 1)
+                samples.append(
+                    SequenceSample(
+                        prefix=request.prefix,
+                        token_ids=token_ids,
+                        token_logprobs=(-0.1,) * len(token_ids),
+                        policy_id=request.sampling.policy_id,
+                        model_id=self.model_id,
+                        request_id=request.request_id,
+                    )
+                )
+            return samples
+
+        def score_batch(self, _requests):
+            raise AssertionError("on-policy engine fork paths must not be rescored")
+
+    backend = ForkWaiterBackend()
+    step = conditional_is_step(
+        base_backend=backend,
+        rollout_backend=backend,
+        prompt=(),
+        generated_prefix=(),
+        config=ConditionalISConfig(
+            candidate_count=2,
+            rollout_count=2,
+            block_size=2,
+            total_length=4,
+            engine_fork_candidate_rollouts=True,
+            engine_fork_release_remaining_candidates=0,
+            engine_fork_adaptive_release=True,
+            engine_fork_adaptive_runnable_fraction=0.5,
+        ),
+        base_sampling=SamplingConfig(),
+        rollout_sampling=SamplingConfig(),
+        reward=lambda _prompt, generated: float(sum(generated)),
+        seeds=SeedStream(20260912),
+        step_index=0,
+    )
+
+    assert len(backend.batches) == 1
+    assert len(backend.batches[0]) == 6
+    assert [candidate.token_ids for candidate in step.candidates] == [(1, 1), (2, 2)]
+    assert [len(candidate.rollouts) for candidate in step.candidates] == [2, 2]
+    assert all(request.fork_expected_children == 2 for request in backend.batches[0][:2])
+    assert all(request.fork_group_size == 2 for request in backend.batches[0][:2])
+    assert all(request.fork_release_remaining == 0 for request in backend.batches[0][:2])
+    assert all(request.fork_adaptive_release for request in backend.batches[0][:2])
+    assert all(
+        request.fork_adaptive_runnable_fraction == 0.5
+        for request in backend.batches[0][:2]
+    )
+    assert len({request.fork_group_id for request in backend.batches[0][:2]}) == 1
+    assert all(request.fork_wait_for_parent for request in backend.batches[0][2:])
+    assert {
+        rollout.token_ids
+        for candidate in step.candidates
+        for rollout in candidate.rollouts
+    } == {(10, 10), (11, 11)}
+
+
+def test_engine_fork_release_threshold_requires_valid_engine_fork_mode() -> None:
+    with pytest.raises(ValueError, match="requires engine_fork_candidate_rollouts"):
+        ConditionalISConfig(engine_fork_release_remaining_candidates=0)
+    with pytest.raises(ValueError, match="must be in"):
+        ConditionalISConfig(
+            candidate_count=4,
+            engine_fork_candidate_rollouts=True,
+            engine_fork_release_remaining_candidates=4,
+        )
+    with pytest.raises(ValueError, match="engine_fork_adaptive_release requires"):
+        ConditionalISConfig(engine_fork_adaptive_release=True)
+    with pytest.raises(ValueError, match="must be in"):
+        ConditionalISConfig(engine_fork_adaptive_runnable_fraction=0.0)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"rollout_submission_batch_size": 2}, "fused_candidate_rollout_paths"),
+        ({"rollout_subtree_max_active_batches": 2}, "fused_candidate_rollout_paths"),
+        ({"stream_candidate_rollouts": True}, "fused_candidate_rollout_paths"),
+        ({"exact_rollout_early_stop": True}, "fused_candidate_rollout_paths"),
+        ({"rollout_design": "scrambled_sobol"}, "requires iid"),
+        ({"engine_fork_candidate_rollouts": True}, "mutually exclusive"),
+    ],
+)
+def test_fused_candidate_rollout_paths_reject_incompatible_modes(
+    overrides, message
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        ConditionalISConfig(fused_candidate_rollout_paths=True, **overrides)
 
 
 def test_shared_rollout_frontier_bounds_concurrent_engine_admission() -> None:

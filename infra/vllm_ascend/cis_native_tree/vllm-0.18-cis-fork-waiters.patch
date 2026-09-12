@@ -1,0 +1,371 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index fb8e3a2..dfb5f17 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -65,6 +65,8 @@ logger = init_logger(__name__)
+
+
+ class Scheduler(SchedulerInterface):
++    cis_fork_waiter_supported = True
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -155,6 +157,9 @@ class Scheduler(SchedulerInterface):
+
+         # req_id -> Request
+         self.requests: dict[str, Request] = {}
++        self._cis_fork_waiters: dict[str, list[Request]] = defaultdict(list)
++        self._cis_fork_parent_by_child: dict[str, str] = {}
++        self._cis_fork_cancelled_outputs: list[tuple[int, EngineCoreOutput]] = []
++        self._cis_fork_completed_parents: dict[str, Request] = {}
++        self._cis_fork_released_parents: set[str] = set()
++        self._cis_fork_parent_remaining_children: dict[str, int] = {}
++        self._cis_fork_group_size: dict[str, int] = {}
++        self._cis_fork_group_remaining: dict[str, int] = {}
++        self._cis_fork_group_release_remaining: dict[str, int] = {}
++        self._cis_fork_group_adaptive: dict[str, bool] = {}
++        self._cis_fork_group_runnable_fraction: dict[str, float] = {}
++        self._cis_fork_group_pending: dict[
++            str, list[tuple[Request, str]]
++        ] = defaultdict(list)
++        self._cis_fork_groups_released: set[str] = set()
+         # Scheduling policy
+         try:
+             self.policy = SchedulingPolicy(self.scheduler_config.policy)
+@@ -1434,7 +1439,7 @@ class Scheduler(SchedulerInterface):
+                         events=request.take_events(),
+                         kv_transfer_params=kv_transfer_params,
+                         trace_headers=request.trace_headers,
+-                        num_cached_tokens=request.num_cached_tokens,
++                        num_cached_tokens=self._cis_frontend_cached_tokens(request),
+                         num_external_computed_tokens=request.num_external_computed_tokens,
+                         routed_experts=routed_experts,
+                         num_nans_in_logits=request.num_nans_in_logits,
+@@ -1462,7 +1467,7 @@ class Scheduler(SchedulerInterface):
+                         finish_reason=request.get_finished_reason(),
+                         events=request.take_events(),
+                         trace_headers=request.trace_headers,
+-                        num_cached_tokens=request.num_cached_tokens,
++                        num_cached_tokens=self._cis_frontend_cached_tokens(request),
+                     )
+                 )
+
+@@ -1475,6 +1480,10 @@ class Scheduler(SchedulerInterface):
+         if kv_connector_output:
+             self._update_from_kv_xfer_finished(kv_connector_output)
+
++        for client_index, output in self._cis_fork_cancelled_outputs:
++            outputs[client_index].append(output)
++        self._cis_fork_cancelled_outputs.clear()
++
+         # collect KV cache events from KV cache manager
+         events = self.kv_cache_manager.take_events()
+
+@@ -1700,7 +1709,8 @@ class Scheduler(SchedulerInterface):
+
+     def get_request_counts(self) -> tuple[int, int]:
+         """Returns (num_running_reqs, num_waiting_reqs)."""
+-        return len(self.running), len(self.waiting) + len(self.skipped_waiting)
++        parked = sum(len(children) for children in self._cis_fork_waiters.values())
++        return len(self.running), len(self.waiting) + len(self.skipped_waiting) + parked
+
+     def add_request(self, request: Request) -> None:
+         existing = self.requests.get(request.request_id)
+@@ -1719,8 +1729,23 @@ class Scheduler(SchedulerInterface):
+         else:
+             if request.resumable:
+                 request.streaming_queue = deque()
+-            self._enqueue_waiting_request(request)
+             self.requests[request.request_id] = request
++            params = request.sampling_params
++            extra_args = None if params is None else params.extra_args
++            wait_for_parent = bool(
++                (extra_args or {}).get("cis_fork_wait_for_parent", False)
++            )
++            group_id = (extra_args or {}).get("cis_fork_group_id")
++            if not wait_for_parent and group_id is not None:
++                group_id = str(group_id)
++                group_size = int(extra_args["cis_fork_group_size"])
++                release_remaining = int(
++                    extra_args["cis_fork_release_remaining"]
++                )
++                adaptive_release = bool(
++                    extra_args.get("cis_fork_adaptive_release", False)
++                )
++                runnable_fraction = float(
++                    extra_args.get("cis_fork_adaptive_runnable_fraction", 0.5)
++                )
++                known_size = self._cis_fork_group_size.setdefault(
++                    group_id, group_size
++                )
++                self._cis_fork_group_remaining.setdefault(group_id, group_size)
++                known_release = self._cis_fork_group_release_remaining.setdefault(
++                    group_id, release_remaining
++                )
++                known_adaptive = self._cis_fork_group_adaptive.setdefault(
++                    group_id, adaptive_release
++                )
++                known_fraction = self._cis_fork_group_runnable_fraction.setdefault(
++                    group_id, runnable_fraction
++                )
++                if (
++                    known_size != group_size
++                    or known_release != release_remaining
++                    or known_adaptive != adaptive_release
++                    or known_fraction != runnable_fraction
++                ):
++                    raise RuntimeError("inconsistent CIS fork group metadata")
++            if wait_for_parent:
++                parent_id = str(extra_args["cis_fork_parent_request_id"])
++                self._cis_fork_waiters[parent_id].append(request)
++                self._cis_fork_parent_by_child[request.request_id] = parent_id
++                logger.info(
++                    "CIS_ENGINE_FORK parked child=%s parent=%s",
++                    request.request_id,
++                    parent_id,
++                )
++                if parent_id in self._cis_fork_released_parents:
++                    parent = self._cis_fork_completed_parents.get(parent_id)
++                    if parent is None:
++                        raise RuntimeError("released CIS fork parent state is missing")
++                    self._activate_cis_fork_waiters(parent, parent_id)
++            else:
++                self._enqueue_waiting_request(request)
+             if self.log_stats:
+                 request.record_event(EngineCoreEventType.QUEUED)
+
+@@ -1792,6 +1817,19 @@ class Scheduler(SchedulerInterface):
+     ) -> dict[str, Any] | None:
+         assert request.is_finished()
+
++        parked_parent = self._cis_fork_parent_by_child.pop(
++            request.request_id, None
++        )
++        if parked_parent is not None:
++            waiters = self._cis_fork_waiters.get(parked_parent, [])
++            self._cis_fork_waiters[parked_parent] = [
++                child for child in waiters if child is not request
++            ]
++            if not self._cis_fork_waiters[parked_parent]:
++                self._cis_fork_waiters.pop(parked_parent, None)
++            self._finish_parked_cis_fork_waiter(request)
++            return None
++
+         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
+         self.encoder_cache_manager.free(request)
+         request_id = request.request_id
+@@ -1801,11 +1839,72 @@ class Scheduler(SchedulerInterface):
+
+         delay_free_blocks |= connector_delay_free_blocks
+         if not delay_free_blocks:
+-            self.kv_cache_manager.capture_cis_fork(request)
++            params = request.sampling_params
++            extra_args = None if params is None else params.extra_args
++            fork_handle = str(
++                (extra_args or {}).get("cis_fork_handle", request.request_id)
++            )
++            expected_children = int(
++                (extra_args or {}).get("cis_fork_expected_children", 0)
++            )
++            self.kv_cache_manager.capture_cis_fork(request)
++            if expected_children > 0:
++                self._complete_cis_fork_parent(request, fork_handle)
+             self._free_blocks(request)
+
+         return kv_xfer_params
+
++    def _finish_parked_cis_fork_waiter(self, request: Request) -> None:
++        self.finished_req_ids.add(request.request_id)
++        if self.finished_req_ids_dict is not None:
++            self.finished_req_ids_dict[request.client_index].add(request.request_id)
++        self.requests.pop(request.request_id, None)
++
++    @staticmethod
++    def _cis_frontend_cached_tokens(request: Request) -> int:
++        params = request.sampling_params
++        extra_args = None if params is None else params.extra_args
++        frontend_prompt_tokens = (extra_args or {}).get(
++            "cis_fork_frontend_prompt_tokens"
++        )
++        if frontend_prompt_tokens is None:
++            return request.num_cached_tokens
++        return min(request.num_cached_tokens, int(frontend_prompt_tokens))
++
++    def _complete_cis_fork_parent(
++        self, parent: Request, fork_handle: str
++    ) -> None:
++        params = parent.sampling_params
++        extra_args = None if params is None else params.extra_args
++        expected_children = int(
++            (extra_args or {}).get("cis_fork_expected_children", 0)
++        )
++        if expected_children <= 0:
++            raise RuntimeError("CIS fork parent is missing its child count")
++        if fork_handle in self._cis_fork_completed_parents:
++            raise RuntimeError("CIS fork parent completed more than once")
++        self._cis_fork_completed_parents[fork_handle] = parent
++        self._cis_fork_parent_remaining_children[fork_handle] = expected_children
++        group_id_value = (extra_args or {}).get("cis_fork_group_id")
++        if group_id_value is None:
++            self._release_cis_fork_parent(parent, fork_handle)
++            return
++        group_id = str(group_id_value)
++        remaining = self._cis_fork_group_remaining[group_id] - 1
++        self._cis_fork_group_remaining[group_id] = remaining
++        if parent.status == RequestStatus.FINISHED_LENGTH_CAPPED:
++            self._cis_fork_group_pending[group_id].append((parent, fork_handle))
++        else:
++            self._release_cis_fork_parent(parent, fork_handle)
++
++        release_remaining = self._cis_fork_group_release_remaining[group_id]
++        if group_id in self._cis_fork_groups_released or remaining <= release_remaining:
++            self._cis_fork_groups_released.add(group_id)
++            pending = self._cis_fork_group_pending.pop(group_id, [])
++            for ready_parent, ready_handle in pending:
++                self._release_cis_fork_parent(ready_parent, ready_handle)
++            if pending:
++                logger.info(
++                    "CIS_ENGINE_FORK group_release group=%s parents=%d "
++                    "remaining=%d threshold=%d",
++                    group_id,
++                    len(pending),
++                    remaining,
++                    release_remaining,
++                )
++        if remaining == 0:
++            if self._cis_fork_group_pending.get(group_id):
++                raise RuntimeError("CIS fork group completed with parked ready parents")
++            self._cis_fork_group_remaining.pop(group_id, None)
++            self._cis_fork_group_size.pop(group_id, None)
++            self._cis_fork_group_release_remaining.pop(group_id, None)
++            self._cis_fork_group_adaptive.pop(group_id, None)
++            self._cis_fork_group_runnable_fraction.pop(group_id, None)
++            self._cis_fork_group_pending.pop(group_id, None)
++            self._cis_fork_groups_released.discard(group_id)
++
++    def _release_cis_fork_waiters_for_capacity(self) -> None:
++        runnable = len(self.running) + len(self.waiting) + len(self.skipped_waiting)
++        for group_id in tuple(self._cis_fork_group_pending):
++            if not self._cis_fork_group_adaptive.get(group_id, False):
++                continue
++            target = max(
++                1,
++                int(
++                    self.max_num_running_reqs
++                    * self._cis_fork_group_runnable_fraction[group_id]
++                ),
++            )
++            available = target - runnable
++            if available <= 0:
++                continue
++            pending = self._cis_fork_group_pending[group_id]
++            released = 0
++            released_children = 0
++            while pending and available > 0:
++                parent, fork_handle = pending.pop(0)
++                children = len(self._cis_fork_waiters.get(fork_handle, ()))
++                self._release_cis_fork_parent(parent, fork_handle)
++                released += 1
++                released_children += children
++                available -= max(1, children)
++                runnable += children
++            if not pending:
++                self._cis_fork_group_pending.pop(group_id, None)
++            if released:
++                logger.info(
++                    "CIS_ENGINE_FORK adaptive_release group=%s parents=%d "
++                    "children=%d runnable=%d target=%d",
++                    group_id,
++                    released,
++                    released_children,
++                    runnable,
++                    target,
++                )
++
++    def _release_cis_fork_parent(
++        self, parent: Request, fork_handle: str
++    ) -> None:
++        self._cis_fork_released_parents.add(fork_handle)
++        self._activate_cis_fork_waiters(parent, fork_handle)
++
++    def _account_cis_fork_children(
++        self, fork_handle: str, count: int
++    ) -> None:
++        remaining = self._cis_fork_parent_remaining_children[fork_handle] - count
++        if remaining < 0:
++            raise RuntimeError("CIS fork parent received too many children")
++        if remaining:
++            self._cis_fork_parent_remaining_children[fork_handle] = remaining
++            return
++        self._cis_fork_parent_remaining_children.pop(fork_handle, None)
++        self._cis_fork_completed_parents.pop(fork_handle, None)
++        self._cis_fork_released_parents.discard(fork_handle)
++
++    def _activate_cis_fork_waiters(
++        self, parent: Request, fork_handle: str
++    ) -> None:
++        children = self._cis_fork_waiters.pop(fork_handle, [])
++        if not children:
++            return
++        if parent.status != RequestStatus.FINISHED_LENGTH_CAPPED:
++            for child in children:
++                self._cis_fork_parent_by_child.pop(child.request_id, None)
++                child.status = RequestStatus.FINISHED_ABORTED
++                child.stop_reason = "cis_parent_terminal"
++                self._finish_parked_cis_fork_waiter(child)
++                self._cis_fork_cancelled_outputs.append(
++                    (
++                        child.client_index,
++                        EngineCoreOutput(
++                            request_id=child.request_id,
++                            new_token_ids=[],
++                            finish_reason=child.get_finished_reason(),
++                            stop_reason=child.stop_reason,
++                            events=child.take_events(),
++                            trace_headers=child.trace_headers,
++                            num_cached_tokens=0,
++                        ),
++                    )
++                )
++            logger.info(
++                "CIS_ENGINE_FORK cancelled children=%d parent=%s status=%s",
++                len(children),
++                parent.request_id,
++                parent.status,
++            )
++            self._account_cis_fork_children(fork_handle, len(children))
++            return
++
++        candidate_tokens = list(parent.output_token_ids)
++        if not candidate_tokens:
++            raise RuntimeError("CIS engine fork parent produced no candidate tokens")
++        for child in children:
++            self._cis_fork_parent_by_child.pop(child.request_id, None)
++            if child.prompt_token_ids is None or child.prompt_embeds is not None:
++                raise RuntimeError("CIS engine fork currently requires token prompts")
++            child.prompt_token_ids.extend(candidate_tokens)
++            child._all_token_ids.extend(candidate_tokens)
++            child.num_prompt_tokens += len(candidate_tokens)
++            child.update_block_hashes()
++            self._enqueue_waiting_request(child)
++        logger.info(
++            "CIS_ENGINE_FORK activated children=%d parent=%s candidate_tokens=%d",
++            len(children),
++            parent.request_id,
++            len(candidate_tokens),
++        )
++        self._account_cis_fork_children(fork_handle, len(children))
++
+     def _free_blocks(self, request: Request):
+         assert request.is_finished()
+         self.kv_cache_manager.free(request)
+         del self.requests[request.request_id]
+@@ -1826,6 +1925,7 @@ class Scheduler(SchedulerInterface):
+         num_waiting = (
+             len(self.waiting)
+             + len(self.skipped_waiting)
++            + sum(len(children) for children in self._cis_fork_waiters.values())
+             - self.num_waiting_for_streaming_input
+         )
+         return num_waiting + len(self.running)

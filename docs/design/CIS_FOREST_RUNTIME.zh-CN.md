@@ -111,6 +111,23 @@ trunk + C * candidate_suffix + C * R * unique_tail
 `C15/R3/32K` 仅为 0.886x，且一个形状出现不可接受的数值偏差。该路径被记录为
 负结果，不进入产品实现。
 
+为降低 launch 数，2026-09-12 又补测了一个 bridge 方案：每个 candidate 将
+`trunk + candidate suffix` 视为一段共享前缀，R 个 sibling query 合批计算，再与
+各自 unique tail 做一次 LSE merge。它把三次 FIA 降为两次 FIA，但会把 trunk
+读取 C 次。P0 `C15/R3` 的结果为：
+
+| trunk | 原生 FIA P50 | 三段 FIA | 两段 candidate-group FIA | 两段相对基线 |
+|---:|---:|---:|---:|---:|
+| 4K | 0.346 ms | 0.914 ms | 0.644 ms | 0.537x |
+| 8K | 0.457 ms | 0.914 ms | 0.647 ms | 0.706x |
+| 16K | 0.708 ms | 0.914 ms | 0.644 ms | 1.099x |
+| 32K | 1.228 ms | 0.907 ms | 0.681 ms | 1.801x |
+
+两段方案的最大 output/LSE 误差为 `4.88e-4/2e-6`，数学等价性成立；它还在
+`32K/C8/R3` 达到 1.176x。结论是 16K/32K 可以先用动态门控 bridge 验证端到端
+收益，但 6-8K 仍必须把 shared/unique 计算和 LSE merge 融为一个 CANN op，才能
+跨过固定 launch 成本。
+
 ### 3.3 正式算子要求
 
 正式实现需要单个 prefix-aware Ascend kernel，或由一个 op 内部管理 multi-tile：
@@ -160,6 +177,15 @@ prefill/decode batch 比例、最后一个 rollout 的 barrier tail、jobs/s、P
 forward-token-slots/s。优化若仅减少 queue wait 却降低单位 forward-work 效率，
 不予保留。
 
+2026-09-12 已把第 2 项推进到可执行原型：rollout waiter 预注册并停在 EngineCore，
+parent 到达 B 后才在 scheduler 内激活，物理 KV fork 命中率 100%。进一步的
+compact waiter 让 3150 个 child 只发送单 token sentinel，省掉 4300 万个 prompt
+token 的 IPC/占位 payload。P0 饱和 A/B 中，它相对同机 Step control 的 jobs/s 和
+FTS/s 仍分别下降 3.6% 和 5.9%，Job/Step P95 分别恶化 37.0% 和 24.9%。这说明
+继续把 placeholder identity 也改成动态 tree-root 的预期空间不足；in-engine fork
+作为完整负结果保留，不再继续微调 release policy。调度侧已经完成问题收敛，下一
+主线直接进入 Forest Attention。
+
 ## 5. 跨 Instance Branch Parallel
 
 whole-job routing 只能改善多 job 负载均衡，不能缩短单个重型 CIS job。后续四卡
@@ -186,8 +212,9 @@ candidate/rollout 都重新进入普通请求生命周期：
 - request id、seed、reward statistics 和 branch metadata 保持设备/host 一致；
 - 下一 block 直接从 winner branch continuation，不重新 hash 和 readmit 完整前缀。
 
-是否开发该层取决于后续 trace 中 request lifecycle、block-table 操作与 Host bubble
-的占比。当前数据已经排除了 CPU reward，却还不足以声称 lifecycle 是主瓶颈。
+compact waiter 已经单独删除了最大的 request payload，却没有改善工作归一化吞吐，
+因此当前数据不支持开发完整 persistent tree-root。除非新的 trace 证明剩余 request
+identity/future 管理单独占据至少 5% 端到端时间，本层保持设计储备，不进入近期实现。
 
 ### 6.1 Branch-aware KV 生命周期
 
@@ -248,8 +275,8 @@ EngineCore 内 fork，不能通过延长 host 侧租约来 pin 整条长前缀�
 
 1. 保留 whole-job routing、candidate streaming、per-job bounded 和 global
    frontier 的真实负结果；停止继续微调 host admission。
-2. 实现 in-engine branch-on-token 原型，直接量化 host readmission、prefix hash 和
-   block-table fork 的开销；有至少 5% 端到端收益后再做干净复验。
+2. 保留已完成的 in-engine branch-on-token、compact waiter 和 release-policy A/B；
+   其 FTS/s 未过门槛，不继续开发动态 tree-root。
 3. 实现 Forest Attention CANN microkernel；先过逐 token reference，再用真实
    branch shape 验证 attention latency，最后接 vLLM-Ascend attention backend。
 4. 只有 kernel 和 scheduler 均通过后，开发四卡单 job 的 candidate-subtree
@@ -293,3 +320,4 @@ EngineCore 内 fork，不能通过延长 host 侧租约来 pin 整条长前缀�
 
 - `docs/experiments/data/cis_forest_two_level_sequential_20260910.json`
 - `docs/experiments/data/cis_forest_two_level_parallel_20260910.json`
+- `docs/experiments/data/cis_candidate_group_two_fia_20260912.json`

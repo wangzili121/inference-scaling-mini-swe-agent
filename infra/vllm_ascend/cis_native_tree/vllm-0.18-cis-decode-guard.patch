@@ -1,0 +1,75 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index ea2c2a6..bc136ad 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -108,6 +109,13 @@ class Scheduler(SchedulerInterface):
+             if self.scheduler_config.max_num_scheduled_tokens
+             else self.scheduler_config.max_num_batched_tokens
+         )
++        self.cis_decode_guard_max_prefills = max(
++            0, int(os.getenv("VLLM_CIS_DECODE_GUARD_MAX_PREFILLS", "0"))
++        )
++        self.cis_decode_guard_min_decodes = max(
++            0, int(os.getenv("VLLM_CIS_DECODE_GUARD_MIN_DECODES", "32"))
++        )
++        self.cis_decode_guard_activations = 0
+         self.max_model_len = vllm_config.model_config.max_model_len
+         self.enable_kv_cache_events = (
+             self.kv_events_config is not None
+@@ -541,6 +549,11 @@ class Scheduler(SchedulerInterface):
+                         self.ec_connector.update_state_after_alloc(request, i)
+
+         # Record the LoRAs in scheduled_running_reqs
++        cis_running_decodes = sum(
++            num_tokens == 1 and ":step:" in request_id
++            for request_id, num_tokens in num_scheduled_tokens.items()
++        )
++        cis_new_prefills = 0
+         scheduled_loras: set[int] = set()
+         if self.lora_config:
+             scheduled_loras = set(
+@@ -670,6 +683,27 @@ class Scheduler(SchedulerInterface):
+                     num_new_tokens = min(num_new_tokens, token_budget)
+                     assert num_new_tokens > 0
+
++                    if (
++                        self.cis_decode_guard_max_prefills > 0
++                        and cis_running_decodes >= self.cis_decode_guard_min_decodes
++                        and ":step:" in request_id
++                        and num_new_tokens > 1
++                        and cis_new_prefills >= self.cis_decode_guard_max_prefills
++                    ):
++                        self.cis_decode_guard_activations += 1
++                        if self.cis_decode_guard_activations == 1 or (
++                            self.cis_decode_guard_activations % 1000 == 0
++                        ):
++                            logger.info(
++                                "CIS_DECODE_GUARD activation=%d decodes=%d "
++                                "admitted_prefills=%d limit=%d",
++                                self.cis_decode_guard_activations,
++                                cis_running_decodes,
++                                cis_new_prefills,
++                                self.cis_decode_guard_max_prefills,
++                            )
++                        break
++
+                     # Schedule encoder inputs.
+                     if request.has_encoder_inputs:
+                         (
+@@ -800,6 +834,8 @@ class Scheduler(SchedulerInterface):
+                 )
+                 num_scheduled_tokens[request_id] = num_new_tokens
+                 token_budget -= num_new_tokens
++                if ":step:" in request_id and num_new_tokens > 1:
++                    cis_new_prefills += 1
+                 request.status = RequestStatus.RUNNING
+                 request.num_computed_tokens = num_computed_tokens
+                 # Count the number of prefix cached tokens.

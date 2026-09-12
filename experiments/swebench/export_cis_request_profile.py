@@ -7,7 +7,6 @@ import ast
 import csv
 import json
 import re
-import statistics
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable

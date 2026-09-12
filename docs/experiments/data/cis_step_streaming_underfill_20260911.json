@@ -1,0 +1,70 @@
+{
+  "p0-step-streaming-r1": {
+    "root": "/data/disk/wangzili/cis-step-streaming/tree-streaming-20260911/p0-step-streaming-r1",
+    "wall_seconds": 546.1906497639138,
+    "success_rate": 1.0,
+    "jobs_per_second": 0.11717520251887037,
+    "job_latency_seconds": {
+      "mean": 205.49342771081865,
+      "p50": 193.7315794180613,
+      "p95": 425.2356547028641,
+      "p99": 477.330873829394
+    },
+    "forward_token_slots_per_second": 2043.3634308503997,
+    "preemptions": 0.0,
+    "engine_requests": 1938.0,
+    "engine_requests_per_second": 3.5482116012745433,
+    "generated_tokens": 215994.0,
+    "generated_tokens_per_second": 395.4553233259514,
+    "prefill_tokens": 902010.0,
+    "shared_prefill_tokens_saved": 32075136.0,
+    "apc_token_hit_ratio": 0.9726474207319215,
+    "maximum_in_flight_requests": 30.0,
+    "steps": 70,
+    "step_completion_ms": {
+      "mean": 45484.944385642855,
+      "p50": 21407.365525499998,
+      "p95": 174895.4938761499
+    },
+    "step_end_to_end_ms": {
+      "mean": 187635.8545633,
+      "p50": 191344.9746265,
+      "p95": 424455.68136419996
+    },
+    "step_admission_wait_ms": {
+      "mean": 142150.91017765715,
+      "p95": 392340.10298564995
+    },
+    "rollout_barrier_tail_ms": {
+      "mean": 48126.240563434105,
+      "p95": 183586.15460205078
+    },
+    "engine_queue_ms": {
+      "mean": 13.991259029927761,
+      "p95": 0.157
+    },
+    "active_steps": {
+      "mean": 5.8329119672141685,
+      "peak": 6.0
+    },
+    "priority_range": [
+      4,
+      73
+    ],
+    "output_hash": "d506326617c6ed5bcbdf4fb933fdc892ebdb7d1f91b9b25dd9933f9673c7a4ec",
+    "overrides": [
+      "generation.max_new_tokens=512",
+      "vllm.max_model_len=65536",
+      "vllm.max_num_seqs=256",
+      "vllm.max_num_batched_tokens=32768",
+      "vllm.gpu_memory_utilization=0.90",
+      "vllm.engine_kwargs.max_num_partial_prefills=1",
+      "vllm.engine_kwargs.max_long_partial_prefills=1",
+      "conditional_is.active_step_limit=6",
+      "vllm.request_priority_policy=\"step_fifo\"",
+      "conditional_is.stream_candidate_rollouts=true",
+      "conditional_is.rollout_stream_candidate_batch_size=1",
+      "conditional_is.rollout_stream_max_batches=2"
+    ]
+  }
+}

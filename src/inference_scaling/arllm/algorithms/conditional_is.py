@@ -14,7 +14,7 @@ each candidate's future reward weighting under the rollout proposal itself.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
@@ -145,6 +145,44 @@ class StepAdmissionController:
                 raise RuntimeError("step admission released without acquisition")
             self._active -= 1
             self._condition.notify()
+
+
+class OccupancyAwareStepAdmissionController(StepAdmissionController):
+    """Borrow extra CIS step slots only while the engine is underfilled."""
+
+    def __init__(
+        self,
+        limit: int,
+        *,
+        borrow_limit: int,
+        borrow_below_requests: int,
+        active_requests: Callable[[], int],
+    ) -> None:
+        super().__init__(limit)
+        if borrow_limit <= limit:
+            raise ValueError("borrow limit must exceed the regular step limit")
+        if borrow_below_requests <= 0:
+            raise ValueError("borrow request threshold must be positive")
+        self.borrow_limit = int(borrow_limit)
+        self.borrow_below_requests = int(borrow_below_requests)
+        self.active_requests = active_requests
+        self.borrowed_admissions = 0
+
+    def acquire(self) -> float:
+        started = perf_counter()
+        with self._condition:
+            while True:
+                if self._active < self.limit:
+                    break
+                if (
+                    self._active < self.borrow_limit
+                    and self.active_requests() < self.borrow_below_requests
+                ):
+                    self.borrowed_admissions += 1
+                    break
+                self._condition.wait(timeout=0.05)
+            self._active += 1
+        return perf_counter() - started
 
 
 @lru_cache(maxsize=1)
@@ -340,6 +378,11 @@ def _candidate_requests(
     confidence_top_k: int | None,
     request_namespace: str,
     fork_expected_children: int = 0,
+    fork_group_id: str | None = None,
+    fork_group_size: int | None = None,
+    fork_release_remaining: int | None = None,
+    fork_adaptive_release: bool = False,
+    fork_adaptive_runnable_fraction: float | None = None,
 ) -> list[GenerationRequest]:
     return [
         GenerationRequest(
@@ -354,6 +397,11 @@ def _candidate_requests(
             ),
             confidence_top_k=confidence_top_k,
             fork_expected_children=fork_expected_children,
+            fork_group_id=fork_group_id,
+            fork_group_size=fork_group_size,
+            fork_release_remaining=fork_release_remaining,
+            fork_adaptive_release=fork_adaptive_release,
+            fork_adaptive_runnable_fraction=fork_adaptive_runnable_fraction,
         )
         for candidate_index in range(count)
     ]
@@ -677,6 +725,323 @@ def _sample_candidates_with_streamed_rollouts(
     )
 
 
+def _slice_fused_path(
+    sample: SequenceSample,
+    *,
+    prefix: TokenSequence,
+    start: int,
+    request_id: str,
+    finish_reason: str,
+) -> SequenceSample:
+    return SequenceSample(
+        prefix=prefix,
+        token_ids=sample.token_ids[start:],
+        token_logprobs=sample.token_logprobs[start:],
+        policy_id=sample.policy_id,
+        model_id=sample.model_id,
+        request_id=request_id,
+        finish_reason=finish_reason,
+        reference_token_logprobs=(
+            None
+            if sample.reference_token_logprobs is None
+            else sample.reference_token_logprobs[start:]
+        ),
+        reference_policy_id=sample.reference_policy_id,
+        token_topk_confidences=(
+            None
+            if sample.token_topk_confidences is None
+            else sample.token_topk_confidences[start:]
+        ),
+        confidence_top_k=sample.confidence_top_k,
+    )
+
+
+def _sample_engine_fork_candidate_rollouts(
+    *,
+    backend: AutoregressiveBackend,
+    prefix: TokenSequence,
+    candidate_count: int,
+    candidate_length: int,
+    total_path_length: int,
+    rollout_count: int,
+    candidate_sampling: SamplingConfig,
+    rollout_sampling: SamplingConfig,
+    seeds: SeedStream,
+    step_index: int,
+    confidence_top_k: int | None,
+    request_namespace: str,
+    stage_observer: StageObserver | None,
+    release_remaining_candidates: int | None,
+    adaptive_release: bool,
+    adaptive_runnable_fraction: float,
+) -> tuple[list[SequenceSample], _StreamedRollouts]:
+    """Pre-register rollout waiters and let EngineCore fork them at B."""
+
+    if not 0 < candidate_length < total_path_length:
+        raise ValueError("engine fork requires a non-empty candidate and rollout segment")
+    rollout_length = total_path_length - candidate_length
+    release_remaining = (
+        candidate_count - 1
+        if release_remaining_candidates is None
+        else release_remaining_candidates
+    )
+    fork_group_id = f"{request_namespace}:step:{step_index}"
+    candidate_requests = _candidate_requests(
+        prefix=prefix,
+        count=candidate_count,
+        block_length=candidate_length,
+        sampling=candidate_sampling,
+        seeds=seeds,
+        step_index=step_index,
+        confidence_top_k=confidence_top_k,
+        request_namespace=request_namespace,
+        fork_expected_children=rollout_count,
+        fork_group_id=fork_group_id,
+        fork_group_size=candidate_count,
+        fork_release_remaining=release_remaining,
+        fork_adaptive_release=adaptive_release,
+        fork_adaptive_runnable_fraction=(
+            adaptive_runnable_fraction if adaptive_release else None
+        ),
+    )
+    rollout_requests: list[GenerationRequest] = []
+    for candidate_index, parent in enumerate(candidate_requests):
+        for rollout_index in range(rollout_count):
+            rollout_requests.append(
+                GenerationRequest(
+                    prefix=prefix,
+                    max_new_tokens=rollout_length,
+                    sampling=rollout_sampling,
+                    seed=seeds.derive(
+                        "conditional_is",
+                        step_index,
+                        "candidate",
+                        candidate_index,
+                        "rollout",
+                        rollout_index,
+                    ),
+                    request_id=(
+                        f"{request_namespace}:step:{step_index}:"
+                        f"candidate:{candidate_index}:rollout:{rollout_index}"
+                    ),
+                    confidence_top_k=confidence_top_k,
+                    fork_parent_request_id=parent.request_id,
+                    fork_wait_for_parent=True,
+                )
+            )
+
+    started = perf_counter()
+    with _profile_range("candidate_rollout_engine_fork"):
+        samples = backend.sample_batch((*candidate_requests, *rollout_requests))
+    if len(samples) != len(candidate_requests) + len(rollout_requests):
+        raise RuntimeError("engine fork returned an invalid number of paths")
+    candidates = list(samples[:candidate_count])
+    _validate_candidates(candidates, candidate_count, backend, candidate_sampling)
+
+    samples_by_request_id: dict[str, SequenceSample] = {}
+    rollout_samples = samples[candidate_count:]
+    eos = rollout_sampling.eos_token_id
+    for candidate_index, candidate in enumerate(candidates):
+        terminal = eos is not None and candidate.token_ids[-1] == eos
+        start = candidate_index * rollout_count
+        for request, sample in zip(
+            rollout_requests[start : start + rollout_count],
+            rollout_samples[start : start + rollout_count],
+            strict=True,
+        ):
+            if terminal:
+                if sample.token_ids:
+                    raise RuntimeError("a terminal candidate executed a parked rollout")
+                continue
+            samples_by_request_id[request.request_id] = _slice_fused_path(
+                sample,
+                prefix=prefix + candidate.token_ids,
+                start=0,
+                request_id=request.request_id,
+                finish_reason=sample.finish_reason,
+            )
+
+    _observe_stage(
+        stage_observer,
+        "candidate_rollout_engine_fork",
+        step_index,
+        started,
+        candidate_count=candidate_count,
+        rollout_count=rollout_count,
+        candidate_length=candidate_length,
+        rollout_length=rollout_length,
+        prefix_tokens=len(prefix),
+        parked_rollout_requests=len(rollout_requests),
+        release_remaining_candidates=release_remaining,
+        adaptive_release=adaptive_release,
+        adaptive_runnable_fraction=adaptive_runnable_fraction,
+    )
+    return candidates, _StreamedRollouts(
+        samples_by_request_id,
+        1,
+        candidate_count,
+        1,
+    )
+
+
+def _sample_fused_candidate_rollout_paths(
+    *,
+    backend: AutoregressiveBackend,
+    prefix: TokenSequence,
+    candidate_count: int,
+    candidate_length: int,
+    total_path_length: int,
+    rollout_count: int,
+    sampling: SamplingConfig,
+    seeds: SeedStream,
+    step_index: int,
+    confidence_top_k: int | None,
+    request_namespace: str,
+    stage_observer: StageObserver | None,
+) -> tuple[list[SequenceSample], _StreamedRollouts]:
+    """Generate lockstep candidate/rollout paths without a host stage barrier."""
+
+    if not 0 < candidate_length < total_path_length:
+        raise ValueError("fused paths require a non-empty candidate and rollout segment")
+    requests: list[GenerationRequest] = []
+    for candidate_index in range(candidate_count):
+        logical_candidate_id = (
+            f"{request_namespace}:step:{step_index}:candidate:{candidate_index}"
+        )
+        candidate_seed = seeds.derive(
+            "conditional_is", step_index, "candidate", candidate_index
+        )
+        for rollout_index in range(rollout_count):
+            requests.append(
+                GenerationRequest(
+                    prefix=prefix,
+                    max_new_tokens=total_path_length,
+                    sampling=sampling,
+                    seed=candidate_seed,
+                    request_id=(
+                        f"{request_namespace}:step:{step_index}:"
+                        f"candidate:{candidate_index}:rollout:{rollout_index}"
+                    ),
+                    confidence_top_k=confidence_top_k,
+                    rng_switch_after_tokens=candidate_length,
+                    rng_switch_seed=seeds.derive(
+                        "conditional_is",
+                        step_index,
+                        "candidate",
+                        candidate_index,
+                        "rollout",
+                        rollout_index,
+                    ),
+                    rng_prefix_group=logical_candidate_id,
+                    rng_prefix_group_size=rollout_count,
+                )
+            )
+
+    started = perf_counter()
+    with _profile_range("candidate_rollout_fused"):
+        paths = backend.sample_batch(requests)
+    if len(paths) != len(requests):
+        raise RuntimeError("fused candidate/rollout batch returned an invalid size")
+
+    candidates: list[SequenceSample] = []
+    rollouts: dict[str, SequenceSample] = {}
+    eos = sampling.eos_token_id
+    for candidate_index in range(candidate_count):
+        offset = candidate_index * rollout_count
+        siblings = paths[offset : offset + rollout_count]
+        candidate_tokens = siblings[0].token_ids[:candidate_length]
+        if not candidate_tokens:
+            raise RuntimeError("a fused path produced an empty candidate")
+        for rollout_index, sibling in enumerate(siblings[1:], start=1):
+            sibling_candidate = sibling.token_ids[:candidate_length]
+            if sibling_candidate != candidate_tokens:
+                mismatch = next(
+                    (
+                        index
+                        for index, (left, right) in enumerate(
+                            zip(
+                                candidate_tokens,
+                                sibling_candidate,
+                                strict=False,
+                            )
+                        )
+                        if left != right
+                    ),
+                    min(len(candidate_tokens), len(sibling_candidate)),
+                )
+                raise RuntimeError(
+                    "fused sibling paths diverged before the RNG boundary: "
+                    f"candidate={candidate_index}, rollout={rollout_index}, "
+                    f"token_offset={mismatch}, "
+                    f"lengths={len(candidate_tokens)}/{len(sibling_candidate)}"
+                )
+
+        first = siblings[0]
+        terminal = len(candidate_tokens) < candidate_length or (
+            eos is not None and candidate_tokens[-1] == eos
+        )
+        candidates.append(
+            SequenceSample(
+                prefix=prefix,
+                token_ids=candidate_tokens,
+                token_logprobs=first.token_logprobs[: len(candidate_tokens)],
+                policy_id=first.policy_id,
+                model_id=first.model_id,
+                request_id=logical_candidate_id,
+                finish_reason=first.finish_reason if terminal else "length",
+                reference_token_logprobs=(
+                    None
+                    if first.reference_token_logprobs is None
+                    else first.reference_token_logprobs[: len(candidate_tokens)]
+                ),
+                reference_policy_id=first.reference_policy_id,
+                token_topk_confidences=(
+                    None
+                    if first.token_topk_confidences is None
+                    else first.token_topk_confidences[: len(candidate_tokens)]
+                ),
+                confidence_top_k=first.confidence_top_k,
+            )
+        )
+        if terminal:
+            continue
+        rollout_prefix = prefix + candidate_tokens
+        for rollout_index, sibling in enumerate(siblings):
+            request_id = (
+                f"{request_namespace}:step:{step_index}:candidate:{candidate_index}:"
+                f"rollout:{rollout_index}"
+            )
+            rollouts[request_id] = _slice_fused_path(
+                sibling,
+                prefix=rollout_prefix,
+                start=candidate_length,
+                request_id=request_id,
+                finish_reason=sibling.finish_reason,
+            )
+
+    _observe_stage(
+        stage_observer,
+        "candidate_rollout_fused",
+        step_index,
+        started,
+        sequence_count=len(requests),
+        candidate_count=candidate_count,
+        rollout_count=rollout_count,
+        candidate_length=candidate_length,
+        total_path_length=total_path_length,
+        repeated_candidate_tokens=(rollout_count - 1)
+        * candidate_count
+        * candidate_length,
+    )
+    _validate_candidates(candidates, candidate_count, backend, sampling)
+    return candidates, _StreamedRollouts(
+        rollouts,
+        1,
+        candidate_count,
+        1,
+    )
+
+
 def estimate_conditional_weights(
     *,
     base_backend: AutoregressiveBackend,
@@ -699,6 +1064,7 @@ def estimate_conditional_weights(
     rollout_index_offset: int = 0,
     generated_prefix_statistics: GeneratedSequenceStatistics | None = None,
     rollout_submission_batch_size: int | None = None,
+    rollout_subtree_max_active_batches: int | None = None,
     rollout_admission_controller: RolloutAdmissionController | None = None,
     precomputed_rollouts: _StreamedRollouts | None = None,
     request_namespace: str = "conditional-is",
@@ -726,6 +1092,11 @@ def estimate_conditional_weights(
         and rollout_submission_batch_size <= 0
     ):
         raise ValueError("rollout_submission_batch_size must be positive")
+    if (
+        rollout_subtree_max_active_batches is not None
+        and rollout_subtree_max_active_batches <= 0
+    ):
+        raise ValueError("rollout_subtree_max_active_batches must be positive")
     if rollout_index_offset and rollout_design != "iid":
         raise ValueError("staged rollout offsets currently require iid rollouts")
     if rollout_design != "iid" and reward_batch is not None:
@@ -763,37 +1134,96 @@ def estimate_conditional_weights(
         samples: list[SequenceSample] = []
         submission_batches = 0
         admission_wait_seconds = 0.0
-        with _profile_range("rollout"):
-            for start in range(0, len(requests), submission_batch_size):
-                request_batch = requests[start : start + submission_batch_size]
-                if rollout_admission_controller is None:
-                    samples.extend(rollout_backend.sample_batch(request_batch))
-                else:
-                    admission_wait_seconds += rollout_admission_controller.acquire(
-                        len(request_batch)
+        subtree_peak_active_batches = 0
+        if rollout_subtree_max_active_batches is not None and requests:
+            bundles: list[tuple[GenerationRequest, ...]] = []
+            current_candidate: int | None = None
+            current_bundle: list[GenerationRequest] = []
+            for request, candidate_index in zip(
+                requests, request_candidates, strict=True
+            ):
+                if current_candidate is not None and candidate_index != current_candidate:
+                    bundles.append(tuple(current_bundle))
+                    current_bundle = []
+                current_candidate = candidate_index
+                current_bundle.append(request)
+            if current_bundle:
+                bundles.append(tuple(current_bundle))
+
+            sample_by_id: dict[str, SequenceSample] = {}
+            next_bundle = 0
+            active: dict[Future[list[SequenceSample]], tuple[GenerationRequest, ...]] = {}
+            max_active = min(rollout_subtree_max_active_batches, len(bundles))
+
+            def submit_ready(executor: ThreadPoolExecutor) -> None:
+                nonlocal next_bundle, subtree_peak_active_batches, submission_batches
+                while next_bundle < len(bundles) and len(active) < max_active:
+                    bundle = bundles[next_bundle]
+                    next_bundle += 1
+                    active[executor.submit(rollout_backend.sample_batch, bundle)] = bundle
+                    submission_batches += 1
+                    subtree_peak_active_batches = max(
+                        subtree_peak_active_batches, len(active)
                     )
-                    completed = 0
 
-                    def release_completed(
-                        _index: int, _sample: SequenceSample
-                    ) -> None:
-                        nonlocal completed
-                        completed += 1
-                        rollout_admission_controller.release(1)
-
-                    try:
-                        samples.extend(
-                            sample_batch_with_callback(
-                                rollout_backend,
-                                request_batch,
-                                release_completed,
+            with _profile_range("rollout"), ThreadPoolExecutor(
+                max_workers=max_active,
+                thread_name_prefix="conditional-is-subtree",
+            ) as executor:
+                submit_ready(executor)
+                while active:
+                    completed_futures, _ = wait(
+                        tuple(active), return_when=FIRST_COMPLETED
+                    )
+                    for future in completed_futures:
+                        bundle = active.pop(future)
+                        bundle_samples = future.result()
+                        if len(bundle_samples) != len(bundle):
+                            raise RuntimeError(
+                                "rollout subtree batch returned an invalid size"
                             )
+                        for request, sample in zip(
+                            bundle, bundle_samples, strict=True
+                        ):
+                            if sample.request_id != request.request_id:
+                                raise RuntimeError(
+                                    "rollout subtree batch returned the wrong request"
+                                )
+                            sample_by_id[request.request_id] = sample
+                    submit_ready(executor)
+            samples = [sample_by_id[request.request_id] for request in requests]
+        else:
+            with _profile_range("rollout"):
+                for start in range(0, len(requests), submission_batch_size):
+                    request_batch = requests[start : start + submission_batch_size]
+                    if rollout_admission_controller is None:
+                        samples.extend(rollout_backend.sample_batch(request_batch))
+                    else:
+                        admission_wait_seconds += rollout_admission_controller.acquire(
+                            len(request_batch)
                         )
-                    finally:
-                        remaining = len(request_batch) - completed
-                        if remaining:
-                            rollout_admission_controller.release(remaining)
-                submission_batches += 1
+                        completed = 0
+
+                        def release_completed(
+                            _index: int, _sample: SequenceSample
+                        ) -> None:
+                            nonlocal completed
+                            completed += 1
+                            rollout_admission_controller.release(1)
+
+                        try:
+                            samples.extend(
+                                sample_batch_with_callback(
+                                    rollout_backend,
+                                    request_batch,
+                                    release_completed,
+                                )
+                            )
+                        finally:
+                            remaining = len(request_batch) - completed
+                            if remaining:
+                                rollout_admission_controller.release(remaining)
+                    submission_batches += 1
         frontier = (
             rollout_admission_controller.snapshot()
             if rollout_admission_controller is not None
@@ -820,6 +1250,13 @@ def estimate_conditional_weights(
                 None if frontier is None else frontier.peak_admitted
             ),
             frontier_waiters=(None if frontier is None else frontier.waiters),
+            subtree_bundle_size=(
+                rollout_count
+                if rollout_subtree_max_active_batches is not None
+                else None
+            ),
+            subtree_max_active_batches=rollout_subtree_max_active_batches,
+            subtree_peak_active_batches=subtree_peak_active_batches,
         )
     else:
         expected = {request.request_id for request in requests}
@@ -1136,6 +1573,12 @@ class AutoregressiveStepwiseAdapter:
                 admission_started,
                 wait_seconds=wait_seconds,
                 active_step_limit=self.step_admission_controller.limit,
+                active_step_borrow_limit=getattr(
+                    self.step_admission_controller, "borrow_limit", None
+                ),
+                borrowed_admissions=getattr(
+                    self.step_admission_controller, "borrowed_admissions", 0
+                ),
             )
         self._step_started[step_index] = perf_counter()
         try:
@@ -1143,6 +1586,66 @@ class AutoregressiveStepwiseAdapter:
             remaining = self.config.total_length - len(state)
             if remaining <= 0:
                 raise ValueError("generated prefix has already reached total_length")
+            if (
+                self.config.engine_fork_candidate_rollouts
+                and remaining > self.config.block_size
+            ):
+                if self.base_backend is not self.rollout_backend:
+                    raise ValueError("engine fork requires one shared model backend")
+                proposals, forked = _sample_engine_fork_candidate_rollouts(
+                    backend=self.base_backend,
+                    prefix=self.prompt + state,
+                    candidate_count=self.config.candidate_count,
+                    candidate_length=min(self.config.block_size, remaining),
+                    total_path_length=remaining,
+                    rollout_count=self.config.rollout_count,
+                    candidate_sampling=self.base_sampling,
+                    rollout_sampling=self.rollout_sampling,
+                    seeds=seeds,
+                    step_index=step_index,
+                    confidence_top_k=getattr(
+                        self.reward, "generation_confidence_top_k", None
+                    ),
+                    request_namespace=self.request_namespace,
+                    stage_observer=self.stage_observer,
+                    release_remaining_candidates=(
+                        self.config.engine_fork_release_remaining_candidates
+                    ),
+                    adaptive_release=self.config.engine_fork_adaptive_release,
+                    adaptive_runnable_fraction=(
+                        self.config.engine_fork_adaptive_runnable_fraction
+                    ),
+                )
+                self._streamed_rollouts[step_index] = forked
+                return proposals
+            if (
+                self.config.fused_candidate_rollout_paths
+                and remaining > self.config.block_size
+            ):
+                if self.base_backend is not self.rollout_backend:
+                    raise ValueError("fused paths require one shared model backend")
+                if self.base_sampling != self.rollout_sampling:
+                    raise ValueError(
+                        "fused paths require identical candidate/rollout sampling"
+                    )
+                proposals, fused = _sample_fused_candidate_rollout_paths(
+                    backend=self.base_backend,
+                    prefix=self.prompt + state,
+                    candidate_count=self.config.candidate_count,
+                    candidate_length=min(self.config.block_size, remaining),
+                    total_path_length=remaining,
+                    rollout_count=self.config.rollout_count,
+                    sampling=self.base_sampling,
+                    seeds=seeds,
+                    step_index=step_index,
+                    confidence_top_k=getattr(
+                        self.reward, "generation_confidence_top_k", None
+                    ),
+                    request_namespace=self.request_namespace,
+                    stage_observer=self.stage_observer,
+                )
+                self._streamed_rollouts[step_index] = fused
+                return proposals
             if self.config.stream_candidate_rollouts:
                 proposals, streamed = _sample_candidates_with_streamed_rollouts(
                     base_backend=self.base_backend,
@@ -1231,6 +1734,9 @@ class AutoregressiveStepwiseAdapter:
                 generated_prefix_statistics=self._statistics_by_state.get(state),
                 rollout_submission_batch_size=(
                     self.config.rollout_submission_batch_size
+                ),
+                rollout_subtree_max_active_batches=(
+                    self.config.rollout_subtree_max_active_batches
                 ),
                 rollout_admission_controller=self.rollout_admission_controller,
                 precomputed_rollouts=self._streamed_rollouts.pop(step_index, None),

@@ -92,3 +92,100 @@ def test_generation_request_validates_arithmetic_uniform() -> None:
                 "invalid",
                 arithmetic_uniform=value,
             )
+
+
+def test_generation_request_validates_segmented_rng() -> None:
+    with pytest.raises(ValueError, match="both a boundary"):
+        GenerationRequest(
+            (), 4, SamplingConfig(), 1, "missing-seed", rng_switch_after_tokens=2
+        )
+    with pytest.raises(ValueError, match="inside"):
+        GenerationRequest(
+            (),
+            4,
+            SamplingConfig(),
+            1,
+            "invalid-boundary",
+            rng_switch_after_tokens=4,
+            rng_switch_seed=2,
+        )
+    with pytest.raises(ValueError, match="requires segmented RNG"):
+        GenerationRequest(
+            (),
+            4,
+            SamplingConfig(),
+            1,
+            "missing-boundary",
+            rng_prefix_group="group",
+            rng_prefix_group_size=2,
+        )
+    request = GenerationRequest(
+        (),
+        4,
+        SamplingConfig(),
+        1,
+        "valid",
+        rng_switch_after_tokens=2,
+        rng_switch_seed=3,
+        rng_prefix_group="group",
+        rng_prefix_group_size=2,
+    )
+    assert request.rng_switch_after_tokens == 2
+    assert request.rng_switch_seed == 3
+    assert request.rng_prefix_group == "group"
+    assert request.rng_prefix_group_size == 2
+
+
+def test_generation_request_validates_fork_waiter_parent() -> None:
+    with pytest.raises(ValueError, match="requires a parent"):
+        GenerationRequest(
+            (), 4, SamplingConfig(), 1, "orphan", fork_wait_for_parent=True
+        )
+
+
+def test_generation_request_validates_fork_group_metadata() -> None:
+    with pytest.raises(ValueError, match="provided together"):
+        GenerationRequest(
+            (),
+            4,
+            SamplingConfig(),
+            1,
+            "partial-group",
+            fork_expected_children=2,
+            fork_group_id="step-0",
+        )
+    with pytest.raises(ValueError, match="fork_release_remaining"):
+        GenerationRequest(
+            (),
+            4,
+            SamplingConfig(),
+            1,
+            "bad-threshold",
+            fork_expected_children=2,
+            fork_group_id="step-0",
+            fork_group_size=4,
+            fork_release_remaining=4,
+        )
+    with pytest.raises(ValueError, match="requires fork group metadata"):
+        GenerationRequest(
+            (),
+            4,
+            SamplingConfig(),
+            1,
+            "adaptive-without-group",
+            fork_adaptive_release=True,
+        )
+    with pytest.raises(ValueError, match="must be in"):
+        GenerationRequest(
+            (),
+            4,
+            SamplingConfig(),
+            1,
+            "bad-adaptive-fraction",
+            fork_expected_children=2,
+            fork_group_id="step-0",
+            fork_group_size=4,
+            fork_release_remaining=0,
+            fork_adaptive_release=True,
+            fork_adaptive_runnable_fraction=0.0,
+        )

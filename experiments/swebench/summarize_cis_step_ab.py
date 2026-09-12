@@ -51,6 +51,28 @@ RESAMPLE_GC = re.compile(
     r"stale=(?P<stale>\d+) active=(?P<active>\d+) "
     r"protected=(?P<protected>\d+)"
 )
+ENGINE_FORK_PARK = re.compile(
+    r"CIS_ENGINE_FORK parked child=(?P<child>\S+) parent=(?P<parent>\S+)"
+    r"(?: compact=(?P<compact>[01]) prompt_tokens_elided=(?P<elided>\d+))?"
+)
+ENGINE_FORK_ACTIVATE = re.compile(
+    r"CIS_ENGINE_FORK activated children=(?P<children>\d+) "
+    r"parent=(?P<parent>\S+) candidate_tokens=(?P<tokens>\d+)"
+)
+ENGINE_FORK_CANCEL = re.compile(
+    r"CIS_ENGINE_FORK cancelled children=(?P<children>\d+) "
+    r"parent=(?P<parent>\S+) status=(?P<status>\S+)"
+)
+ENGINE_FORK_GROUP_RELEASE = re.compile(
+    r"CIS_ENGINE_FORK group_release group=(?P<group>\S+) "
+    r"parents=(?P<parents>\d+) remaining=(?P<remaining>\d+) "
+    r"threshold=(?P<threshold>\d+)"
+)
+ENGINE_FORK_ADAPTIVE_RELEASE = re.compile(
+    r"CIS_ENGINE_FORK adaptive_release group=(?P<group>\S+) "
+    r"parents=(?P<parents>\d+) children=(?P<children>\d+) "
+    r"runnable=(?P<runnable>\d+) target=(?P<target>\d+)"
+)
 
 
 def _percentile(values: Iterable[float], quantile: float) -> float | None:
@@ -109,15 +131,16 @@ def _step_concurrency(intervals: list[tuple[float, float]]) -> dict[str, float]:
 
 def summarize(root: Path) -> dict[str, Any]:
     benchmark = json.loads((root / "benchmark.json").read_text(encoding="utf-8"))
+    run_namespace = str(benchmark.get("run_namespace", ""))
     algorithms = [
         record
         for record in _jsonl(sorted((root / "algorithm-traces").glob("*.jsonl")))
-        if ":public:" in str(record.get("request_id", ""))
+        if str(record.get("request_id", "")).startswith(run_namespace)
     ]
     lifecycle = [
         record
         for record in _jsonl(sorted((root / "request-traces").glob("*.jsonl")))
-        if ":public:" in str(record.get("request_id", ""))
+        if str(record.get("request_id", "")).startswith(run_namespace)
     ]
 
     block_ms = []
@@ -125,6 +148,11 @@ def summarize(root: Path) -> dict[str, Any]:
     admission_wait_ms = []
     candidate_rollout_overlap_ms = []
     streamed_rollout_submission_batches = []
+    subtree_rollout_submission_batches = []
+    subtree_peak_active_batches = []
+    fused_path_ms = []
+    fused_repeated_candidate_tokens = []
+    engine_fork_ms = []
     kv_gc_ms = []
     kv_gc_evicted_blocks = []
     intervals = []
@@ -167,6 +195,20 @@ def summarize(root: Path) -> dict[str, Any]:
                 streamed_rollout_submission_batches.append(
                     float(event.get("submission_batches", 0.0))
                 )
+            elif name == "rollout" and event.get("subtree_max_active_batches"):
+                subtree_rollout_submission_batches.append(
+                    float(event.get("submission_batches", 0.0))
+                )
+                subtree_peak_active_batches.append(
+                    float(event.get("subtree_peak_active_batches", 0.0))
+                )
+            elif name == "candidate_rollout_fused":
+                fused_path_ms.append(duration_ms)
+                fused_repeated_candidate_tokens.append(
+                    float(event.get("repeated_candidate_tokens", 0.0))
+                )
+            elif name == "candidate_rollout_engine_fork":
+                engine_fork_ms.append(duration_ms)
             elif name == "resample" and event.get("kv_gc_seconds") is not None:
                 kv_gc_ms.append(float(event.get("kv_gc_seconds", 0.0)) * 1_000.0)
                 kv_gc_evicted_blocks.append(
@@ -206,14 +248,41 @@ def summarize(root: Path) -> dict[str, Any]:
         path.read_text(encoding="utf-8", errors="replace")
         for path in sorted((root / "logs").glob("*.log"))
     )
+    measured_runtime_log = "\n".join(
+        line for line in runtime_log.splitlines() if run_namespace in line
+    )
+    engine_fork_parks = list(ENGINE_FORK_PARK.finditer(measured_runtime_log))
+    engine_fork_activations = list(
+        ENGINE_FORK_ACTIVATE.finditer(measured_runtime_log)
+    )
+    engine_fork_cancellations = list(
+        ENGINE_FORK_CANCEL.finditer(measured_runtime_log)
+    )
+    activated_engine_fork_children = sum(
+        int(match.group("children")) for match in engine_fork_activations
+    )
+    cancelled_engine_fork_children = sum(
+        int(match.group("children")) for match in engine_fork_cancellations
+    )
+    engine_fork_group_releases = list(
+        ENGINE_FORK_GROUP_RELEASE.finditer(measured_runtime_log)
+    )
+    first_group_release: dict[str, re.Match[str]] = {}
+    for match in engine_fork_group_releases:
+        first_group_release.setdefault(match.group("group"), match)
+    engine_fork_adaptive_releases = list(
+        ENGINE_FORK_ADAPTIVE_RELEASE.finditer(measured_runtime_log)
+    )
     fork_capture_by_parent = {
-        match.group("parent"): match for match in FORK_CAPTURE.finditer(runtime_log)
+        match.group("parent"): match
+        for match in FORK_CAPTURE.finditer(measured_runtime_log)
     }
     fork_hit_by_child = {
-        match.group("child"): match for match in FORK_HIT.finditer(runtime_log)
+        match.group("child"): match
+        for match in FORK_HIT.finditer(measured_runtime_log)
     }
     fork_miss_by_child: dict[str, set[str]] = defaultdict(set)
-    for match in FORK_MISS.finditer(runtime_log):
+    for match in FORK_MISS.finditer(measured_runtime_log):
         fork_miss_by_child[match.group("child")].add(match.group("reason"))
     for child in fork_hit_by_child:
         fork_miss_by_child.pop(child, None)
@@ -229,9 +298,15 @@ def summarize(root: Path) -> dict[str, Any]:
     fork_leased_blocks = [
         int(match.group("leased") or 0) for match in fork_capture_by_parent.values()
     ]
-    fork_lease_release_records = list(FORK_LEASE_RELEASE.finditer(runtime_log))
-    fork_lease_expire_records = list(FORK_LEASE_EXPIRE.finditer(runtime_log))
-    fork_terminal_parent_records = list(FORK_TERMINAL_PARENT.finditer(runtime_log))
+    fork_lease_release_records = list(
+        FORK_LEASE_RELEASE.finditer(measured_runtime_log)
+    )
+    fork_lease_expire_records = list(
+        FORK_LEASE_EXPIRE.finditer(measured_runtime_log)
+    )
+    fork_terminal_parent_records = list(
+        FORK_TERMINAL_PARENT.finditer(measured_runtime_log)
+    )
     fork_lease_scopes = sorted(
         {
             scope
@@ -257,15 +332,17 @@ def summarize(root: Path) -> dict[str, Any]:
         )
         fork_miss_reasons[reason] += 1
     branch_demote_by_request = {
-        match.group("request"): match for match in BRANCH_DEMOTE.finditer(runtime_log)
+        match.group("request"): match
+        for match in BRANCH_DEMOTE.finditer(measured_runtime_log)
     }
     branch_demoted_blocks = [
         int(match.group("blocks")) for match in branch_demote_by_request.values()
     ]
     branch_record_by_request = {
-        match.group("request"): match for match in BRANCH_RECORD.finditer(runtime_log)
+        match.group("request"): match
+        for match in BRANCH_RECORD.finditer(measured_runtime_log)
     }
-    resample_gc_records = list(RESAMPLE_GC.finditer(runtime_log))
+    resample_gc_records = list(RESAMPLE_GC.finditer(measured_runtime_log))
     wall_seconds = float(benchmark.get("wall_seconds", 0.0) or 0.0)
     prefill_tokens = float(backend.get("prefill_tokens", 0.0) or 0.0)
     cached_tokens = float(
@@ -273,14 +350,52 @@ def summarize(root: Path) -> dict[str, Any]:
     )
     generated_tokens = float(backend.get("generated_tokens", 0.0) or 0.0)
     engine_requests = float(backend.get("engine_requests", 0.0) or 0.0)
+    submitted_prefix_tokens = {
+        str(event.get("request_id")): int(event.get("prefix_tokens", 0) or 0)
+        for event in lifecycle
+        if event.get("event") == "submitted"
+    }
+    cancelled_parent_handles = {
+        re.sub(r"-[0-9a-f]{8}$", "", match.group("parent"))
+        for match in engine_fork_cancellations
+    }
+    zero_compute_children = {
+        request_id
+        for request_id in submitted_prefix_tokens
+        if any(
+            request_id.startswith(f"{parent}:rollout:")
+            for parent in cancelled_parent_handles
+        )
+    }
+    zero_compute_prompt_tokens = sum(
+        submitted_prefix_tokens[request_id] for request_id in zero_compute_children
+    )
+    measured_forward_slots = float(
+        backend.get("generation_forward_token_slots", 0.0) or 0.0
+    )
+    # Older fork-waiter artifacts charged every cancelled placeholder's logical
+    # prompt as prefill. Newer runtimes exclude it at collection time. In an
+    # already-corrected artifact the cancelled logical prompts exceed the whole
+    # measured prefill count, so do not subtract them twice.
+    recorded_zero_compute_prompt_tokens = (
+        zero_compute_prompt_tokens
+        if zero_compute_prompt_tokens <= prefill_tokens
+        else 0
+    )
+    corrected_prefill_tokens = max(
+        0.0, prefill_tokens - recorded_zero_compute_prompt_tokens
+    )
+    corrected_forward_slots = max(
+        0.0, measured_forward_slots - recorded_zero_compute_prompt_tokens
+    )
     return {
         "root": str(root),
         "wall_seconds": wall_seconds,
         "success_rate": benchmark.get("success_rate"),
         "jobs_per_second": benchmark.get("jobs_per_second"),
         "job_latency_seconds": benchmark.get("latency_seconds"),
-        "forward_token_slots_per_second": benchmark.get("throughput", {}).get(
-            "generation_forward_token_slots_per_second"
+        "forward_token_slots_per_second": (
+            corrected_forward_slots / wall_seconds if wall_seconds else None
         ),
         "preemptions": backend.get("num_preemptions"),
         "engine_requests": engine_requests,
@@ -291,11 +406,13 @@ def summarize(root: Path) -> dict[str, Any]:
         "generated_tokens_per_second": (
             generated_tokens / wall_seconds if wall_seconds else None
         ),
-        "prefill_tokens": prefill_tokens,
+        "prefill_tokens": corrected_prefill_tokens,
+        "zero_compute_cancelled_children": len(zero_compute_children),
+        "zero_compute_prompt_tokens_excluded": recorded_zero_compute_prompt_tokens,
         "shared_prefill_tokens_saved": cached_tokens,
         "apc_token_hit_ratio": (
-            cached_tokens / (cached_tokens + prefill_tokens)
-            if cached_tokens + prefill_tokens
+            cached_tokens / (cached_tokens + corrected_prefill_tokens)
+            if cached_tokens + corrected_prefill_tokens
             else None
         ),
         "maximum_in_flight_requests": backend.get("maximum_in_flight_requests"),
@@ -426,6 +543,84 @@ def summarize(root: Path) -> dict[str, Any]:
                 _percentile(streamed_rollout_submission_batches, 0.95) or 0.0
             ),
             "max": max(streamed_rollout_submission_batches, default=0.0),
+        },
+        "subtree_rollout_batches": {
+            "submission_mean": (
+                statistics.fmean(subtree_rollout_submission_batches)
+                if subtree_rollout_submission_batches
+                else 0.0
+            ),
+            "peak_active_mean": (
+                statistics.fmean(subtree_peak_active_batches)
+                if subtree_peak_active_batches
+                else 0.0
+            ),
+            "peak_active_max": max(subtree_peak_active_batches, default=0.0),
+        },
+        "fused_candidate_rollout_paths": {
+            "stages": len(fused_path_ms),
+            "duration_ms_mean": (
+                statistics.fmean(fused_path_ms) if fused_path_ms else None
+            ),
+            "duration_ms_p95": _percentile(fused_path_ms, 0.95),
+            "repeated_candidate_tokens": sum(fused_repeated_candidate_tokens),
+        },
+        "engine_fork": {
+            "stages": len(engine_fork_ms),
+            "duration_ms_mean": (
+                statistics.fmean(engine_fork_ms) if engine_fork_ms else None
+            ),
+            "duration_ms_p95": _percentile(engine_fork_ms, 0.95),
+            "parked_children": len(engine_fork_parks),
+            "compact_parked_children": sum(
+                match.group("compact") == "1" for match in engine_fork_parks
+            ),
+            "compact_prompt_tokens_elided": sum(
+                int(match.group("elided") or 0) for match in engine_fork_parks
+            ),
+            "activated_parents": len(engine_fork_activations),
+            "activated_children": activated_engine_fork_children,
+            "cancelled_parents": len(engine_fork_cancellations),
+            "cancelled_children": cancelled_engine_fork_children,
+            "unresolved_children": max(
+                0,
+                len(engine_fork_parks)
+                - activated_engine_fork_children
+                - cancelled_engine_fork_children,
+            ),
+            "group_release_events": len(engine_fork_group_releases),
+            "groups_released": len(first_group_release),
+            "parents_released": sum(
+                int(match.group("parents"))
+                for match in engine_fork_group_releases
+            ),
+            "first_release_remaining": sorted(
+                {
+                    int(match.group("remaining"))
+                    for match in first_group_release.values()
+                }
+            ),
+            "release_thresholds": sorted(
+                {
+                    int(match.group("threshold"))
+                    for match in engine_fork_group_releases
+                }
+            ),
+            "adaptive_release_events": len(engine_fork_adaptive_releases),
+            "adaptive_parents_released": sum(
+                int(match.group("parents"))
+                for match in engine_fork_adaptive_releases
+            ),
+            "adaptive_children_released": sum(
+                int(match.group("children"))
+                for match in engine_fork_adaptive_releases
+            ),
+            "adaptive_targets": sorted(
+                {
+                    int(match.group("target"))
+                    for match in engine_fork_adaptive_releases
+                }
+            ),
         },
         "rollout_barrier_tail_ms": {
             "mean": statistics.fmean(barrier_tail_ms) if barrier_tail_ms else None,

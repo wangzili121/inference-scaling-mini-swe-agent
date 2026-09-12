@@ -1,0 +1,94 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -66,6 +66,7 @@ logger = init_logger(__name__)
+
+ class Scheduler(SchedulerInterface):
+     cis_fork_waiter_supported = True
++    cis_fork_compact_waiter_supported = True
+
+     def __init__(
+         self,
+@@ -1784,10 +1785,17 @@ class Scheduler(SchedulerInterface):
+                 self._cis_fork_waiters[parent_id].append(request)
+                 self._cis_fork_parent_by_child[request.request_id] = parent_id
++                compact_waiter = bool(
++                    (extra_args or {}).get("cis_fork_compact_waiter", False)
++                )
++                frontend_tokens = int(
++                    (extra_args or {}).get("cis_fork_frontend_prompt_tokens", 0)
++                )
+                 logger.info(
+-                    "CIS_ENGINE_FORK parked child=%s parent=%s",
++                    "CIS_ENGINE_FORK parked child=%s parent=%s compact=%d "
++                    "prompt_tokens_elided=%d",
+                     request.request_id,
+                     parent_id,
++                    int(compact_waiter),
++                    max(0, frontend_tokens - request.num_prompt_tokens),
+                 )
+                 if parent_id in self._cis_fork_released_parents:
+@@ -1990,9 +1991,27 @@ class Scheduler(SchedulerInterface):
+         for child in children:
+             self._cis_fork_parent_by_child.pop(child.request_id, None)
+             if child.prompt_token_ids is None or child.prompt_embeds is not None:
+                 raise RuntimeError("CIS engine fork currently requires token prompts")
+-            child.prompt_token_ids.extend(candidate_tokens)
+-            child._all_token_ids.extend(candidate_tokens)
+-            child.num_prompt_tokens += len(candidate_tokens)
++            child_params = child.sampling_params
++            child_extra_args = (
++                None if child_params is None else child_params.extra_args
++            )
++            compact_waiter = bool(
++                (child_extra_args or {}).get("cis_fork_compact_waiter", False)
++            )
++            if compact_waiter:
++                if parent.prompt_token_ids is None or parent.prompt_embeds is not None:
++                    raise RuntimeError(
++                        "compact CIS fork waiters require a token parent prompt"
++                    )
++                full_prompt = list(parent.prompt_token_ids)
++                full_prompt.extend(candidate_tokens)
++                child.prompt_token_ids[:] = full_prompt
++                child._all_token_ids[:] = full_prompt
++                child.num_prompt_tokens = len(full_prompt)
++                child.block_hashes.clear()
++            else:
++                child.prompt_token_ids.extend(candidate_tokens)
++                child._all_token_ids.extend(candidate_tokens)
++                child.num_prompt_tokens += len(candidate_tokens)
+             child.update_block_hashes()
+             self._enqueue_waiting_request(child)
+         logger.info(
+diff --git a/vllm/v1/engine/async_llm.py b/vllm/v1/engine/async_llm.py
+--- a/vllm/v1/engine/async_llm.py
++++ b/vllm/v1/engine/async_llm.py
+@@ -418,8 +418,25 @@ class AsyncLLM(EngineClient):
+         # Add the request to OutputProcessor (this process).
+         self.output_processor.add_request(request, prompt, parent_req, index, queue)
+
++        # A CIS fork child is dormant until its parent reaches the branch
++        # point. Keep the complete prompt in the frontend OutputProcessor,
++        # but send only one sentinel token over EngineCore IPC. The scheduler
++        # reconstructs the exact prompt from the completed parent before the
++        # child is admitted, so the sentinel is never computed.
++        engine_request = request
++        params = request.sampling_params
++        extra_args = None if params is None else params.extra_args
++        if bool((extra_args or {}).get("cis_fork_compact_waiter", False)):
++            if request.prompt_token_ids is None or request.prompt_embeds is not None:
++                raise RuntimeError(
++                    "compact CIS fork waiters require a token prompt"
++                )
++            if not request.prompt_token_ids:
++                raise RuntimeError("compact CIS fork waiter prompt is empty")
++            engine_request = copy(request)
++            engine_request.prompt_token_ids = request.prompt_token_ids[-1:]
++
+         # Add the EngineCoreRequest to EngineCore (separate process).
+-        await self.engine_core.add_request_async(request)
++        await self.engine_core.add_request_async(engine_request)
+
+         if self.log_requests:
+             logger.info("Added request %s.", request.request_id)

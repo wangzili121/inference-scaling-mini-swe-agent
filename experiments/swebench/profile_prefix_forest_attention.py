@@ -194,6 +194,20 @@ def _screen_cis_forest_shape(
     expanded_candidate_value = candidate_value.repeat_interleave(
         rollout_count, dim=0
     )
+    candidate_prefix_key = torch.cat(
+        (
+            trunk_key.expand(candidate_count, -1, -1, -1),
+            candidate_key,
+        ),
+        dim=2,
+    ).contiguous()
+    candidate_prefix_value = torch.cat(
+        (
+            trunk_value.expand(candidate_count, -1, -1, -1),
+            candidate_value,
+        ),
+        dim=2,
+    ).contiguous()
     full_key = torch.cat(
         (
             trunk_key.expand(branches, -1, -1, -1),
@@ -272,6 +286,44 @@ def _screen_cis_forest_shape(
         )
         return output, total_lse
 
+    def candidate_group_decomposed() -> tuple[torch.Tensor, torch.Tensor]:
+        """Use one shared prefix per candidate and merge only the unique tail.
+
+        This intentionally rereads the trunk C times instead of once, but it
+        reduces the three-level forest path to two FIA launches.  It is a
+        useful bridge implementation for 6-8K CIS workloads where launch and
+        merge overhead can dominate the theoretical trunk I/O saving.
+        """
+
+        prefix_output, prefix_lse = _attention(
+            candidate_query,
+            candidate_prefix_key,
+            candidate_prefix_value,
+            query_heads=query_heads,
+            kv_heads=kv_heads,
+        )
+        unique_output, unique_lse = _attention(
+            query,
+            unique_key,
+            unique_value,
+            query_heads=query_heads,
+            kv_heads=kv_heads,
+        )
+        prefix_output = (
+            prefix_output.permute(0, 2, 1, 3)
+            .reshape(branches, query_heads, 1, head_dim)
+        )
+        prefix_lse = (
+            prefix_lse.permute(0, 2, 1, 3)
+            .reshape(branches, query_heads, 1, -1)
+        )
+        total_lse = torch.logaddexp(prefix_lse, unique_lse)
+        output = (
+            torch.exp(prefix_lse - total_lse).to(dtype) * prefix_output
+            + torch.exp(unique_lse - total_lse).to(dtype) * unique_output
+        )
+        return output, total_lse
+
     def parallel_decomposed() -> tuple[torch.Tensor, torch.Tensor]:
         with torch.npu.stream(trunk_stream):
             trunk_output, trunk_lse = _attention(
@@ -323,10 +375,16 @@ def _screen_cis_forest_shape(
 
     baseline_output, baseline_lse = baseline()
     shared_output, shared_lse = decomposed()
+    candidate_group_output, candidate_group_lse = candidate_group_decomposed()
     parallel_output, parallel_lse = parallel_decomposed()
     _synchronize()
     baseline_latency = _measure(baseline, warmup=warmup, iterations=iterations)
     shared_latency = _measure(decomposed, warmup=warmup, iterations=iterations)
+    candidate_group_latency = _measure(
+        candidate_group_decomposed,
+        warmup=warmup,
+        iterations=iterations,
+    )
     parallel_latency = _measure(
         parallel_decomposed, warmup=warmup, iterations=iterations
     )
@@ -338,6 +396,10 @@ def _screen_cis_forest_shape(
         + candidate_count * candidate_tokens
         + branches * unique_tokens
     )
+    candidate_group_kv_tokens = (
+        candidate_count * (trunk_tokens + candidate_tokens)
+        + branches * unique_tokens
+    )
     return {
         "candidate_count": candidate_count,
         "rollout_count": rollout_count,
@@ -347,17 +409,30 @@ def _screen_cis_forest_shape(
         "unique_tokens": unique_tokens,
         "baseline": baseline_latency,
         "cis_forest": shared_latency,
+        "candidate_group_forest": candidate_group_latency,
         "cis_forest_parallel": parallel_latency,
         "p50_speedup": baseline_latency["p50_ms"] / shared_latency["p50_ms"],
         "parallel_p50_speedup": (
             baseline_latency["p50_ms"] / parallel_latency["p50_ms"]
         ),
+        "candidate_group_p50_speedup": (
+            baseline_latency["p50_ms"] / candidate_group_latency["p50_ms"]
+        ),
         "ideal_kv_read_reduction": baseline_kv_tokens / shared_kv_tokens,
+        "candidate_group_ideal_kv_read_reduction": (
+            baseline_kv_tokens / candidate_group_kv_tokens
+        ),
         "maximum_output_error": float(
             (baseline_output.float() - shared_output.float()).abs().max().cpu()
         ),
         "maximum_lse_error": float(
             (baseline_lse.float() - shared_lse.float()).abs().max().cpu()
+        ),
+        "candidate_group_maximum_output_error": float(
+            (baseline_output.float() - candidate_group_output.float()).abs().max().cpu()
+        ),
+        "candidate_group_maximum_lse_error": float(
+            (baseline_lse.float() - candidate_group_lse.float()).abs().max().cpu()
         ),
         "parallel_maximum_output_error": float(
             (baseline_output.float() - parallel_output.float()).abs().max().cpu()

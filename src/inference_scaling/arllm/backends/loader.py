@@ -34,7 +34,10 @@ _VLLM_SETTINGS = {
     "max_num_seqs",
     "mh_fused_logprobs",
     "native_parallel_sampling",
+    "native_segmented_rng",
     "native_kv_fork",
+    "native_kv_fork_compact_waiters",
+    "native_kv_fork_waiters",
     "native_kv_fork_lease",
     "native_kv_fork_lease_max_fraction",
     "native_kv_fork_lease_scope",
@@ -292,11 +295,31 @@ def load_backend_from_config(
                 "native_parallel_sampling requires runtime.backend='vllm'"
             )
         acceleration_kwargs["native_parallel_sampling"] = True
+    native_segmented_rng = bool(settings.pop("native_segmented_rng", False))
+    if native_segmented_rng:
+        if not asynchronous:
+            raise ValueError("native_segmented_rng requires runtime.backend='vllm'")
+        acceleration_kwargs["native_segmented_rng"] = True
     native_kv_fork = bool(settings.pop("native_kv_fork", False))
     if native_kv_fork:
         if not asynchronous:
             raise ValueError("native_kv_fork requires runtime.backend='vllm'")
         acceleration_kwargs["native_kv_fork"] = True
+    native_kv_fork_waiters = bool(settings.pop("native_kv_fork_waiters", False))
+    if native_kv_fork_waiters:
+        if not asynchronous:
+            raise ValueError("native_kv_fork_waiters requires runtime.backend='vllm'")
+        acceleration_kwargs["native_kv_fork_waiters"] = True
+    native_kv_fork_compact_waiters = bool(
+        settings.pop("native_kv_fork_compact_waiters", False)
+    )
+    if native_kv_fork_compact_waiters:
+        if not native_kv_fork_waiters:
+            raise ValueError(
+                "native_kv_fork_compact_waiters requires "
+                "native_kv_fork_waiters=true"
+            )
+        acceleration_kwargs["native_kv_fork_compact_waiters"] = True
     native_kv_fork_lease = bool(settings.pop("native_kv_fork_lease", False))
     if native_kv_fork_lease:
         if not native_kv_fork:
