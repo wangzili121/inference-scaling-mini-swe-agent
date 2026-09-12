@@ -1,0 +1,140 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import os
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -65,6 +66,8 @@ logger = init_logger(__name__)
+
+
+ class Scheduler(SchedulerInterface):
++    cis_forest_window_supported = True
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -110,6 +113,28 @@ class Scheduler(SchedulerInterface):
+             else self.scheduler_config.max_num_batched_tokens
+         )
+         self.max_model_len = vllm_config.model_config.max_model_len
++        self._cis_forest_window_max_steps = int(
++            os.environ.get("VLLM_CIS_FOREST_WINDOW_MAX_STEPS", "0")
++        )
++        self._cis_forest_window_min_saved_reads = int(
++            os.environ.get("VLLM_CIS_FOREST_WINDOW_MIN_SAVED_READS", "196608")
++        )
++        self._cis_forest_window_min_packed_fraction = float(
++            os.environ.get("VLLM_CIS_FOREST_WINDOW_MIN_PACKED_FRACTION", "0.75")
++        )
++        if self._cis_forest_window_max_steps < 0:
++            raise ValueError("VLLM_CIS_FOREST_WINDOW_MAX_STEPS must be non-negative")
++        if self._cis_forest_window_min_saved_reads < 0:
++            raise ValueError(
++                "VLLM_CIS_FOREST_WINDOW_MIN_SAVED_READS must be non-negative"
++            )
++        if not 0.0 <= self._cis_forest_window_min_packed_fraction <= 1.0:
++            raise ValueError(
++                "VLLM_CIS_FOREST_WINDOW_MIN_PACKED_FRACTION must be in [0, 1]"
++            )
++        self._cis_forest_window_streak = 0
++        self._cis_forest_window_activations = 0
+         self.enable_kv_cache_events = (
+             self.kv_events_config is not None
+             and self.kv_events_config.enable_kv_cache_events
+@@ -335,6 +360,64 @@ class Scheduler(SchedulerInterface):
+                 pass
+         return num_new_tokens
+
++    def _should_hold_waiting_for_cis_forest(
++        self,
++        scheduled_running_reqs: list[Request],
++        num_scheduled_tokens: dict[str, int],
++    ) -> bool:
++        """Open bounded pure-decode windows for dense CIS sibling work."""
++
++        if (
++            self._cis_forest_window_max_steps == 0
++            or not scheduled_running_reqs
++            or not (self.waiting or self.skipped_waiting)
++        ):
++            self._cis_forest_window_streak = 0
++            return False
++        from inference_scaling.arllm.backends.packed_forest_attention import (
++            ForestWindowBranch,
++            estimate_forest_decode_window,
++        )
++
++        branches = []
++        for request in scheduled_running_reqs:
++            params = request.sampling_params
++            extra_args = None if params is None else params.extra_args
++            branches.append(
++                ForestWindowBranch(
++                    group_id=(extra_args or {}).get("cis_forest_group_id"),
++                    branch_index=(extra_args or {}).get(
++                        "cis_forest_branch_index"
++                    ),
++                    group_size=(extra_args or {}).get("cis_forest_group_size"),
++                    query_length=int(
++                        num_scheduled_tokens.get(request.request_id, 0)
++                    ),
++                    shared_prefix_tokens=int(request.num_prompt_tokens),
++                )
++            )
++        estimate = estimate_forest_decode_window(
++            branches,
++            block_size=self.block_size,
++            minimum_saved_kv_token_reads=(
++                self._cis_forest_window_min_saved_reads
++            ),
++            minimum_packed_query_fraction=(
++                self._cis_forest_window_min_packed_fraction
++            ),
++        )
++        if not estimate.enabled:
++            self._cis_forest_window_streak = 0
++            return False
++        if self._cis_forest_window_streak >= self._cis_forest_window_max_steps:
++            self._cis_forest_window_streak = 0
++            return False
++        self._cis_forest_window_streak += 1
++        self._cis_forest_window_activations += 1
++        activated = self._cis_forest_window_activations
++        if activated == 1 or activated % 100 == 0:
++            logger.info(
++                "CIS_FOREST_WINDOW activations=%d streak=%d groups=%d "
++                "packed_queries=%d total_queries=%d saved_reads=%d",
++                activated,
++                self._cis_forest_window_streak,
++                estimate.complete_groups,
++                estimate.packed_queries,
++                estimate.total_queries,
++                estimate.estimated_saved_kv_token_reads,
++            )
++        return True
++
+     def schedule(self) -> SchedulerOutput:
+         # NOTE(woosuk) on the scheduling algorithm:
+         # There's no "decoding phase" nor "prefill phase" in the scheduler.
+@@ -551,7 +634,12 @@ class Scheduler(SchedulerInterface):
+             assert len(scheduled_loras) <= self.lora_config.max_loras
+
+         # Next, schedule the WAITING requests.
+-        if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
++        cis_forest_window = self._should_hold_waiting_for_cis_forest(
++            scheduled_running_reqs,
++            num_scheduled_tokens,
++        )
++        if (
++            not preempted_reqs
++            and self._pause_state == PauseState.UNPAUSED
++            and not cis_forest_window
++        ):
+             step_skipped_waiting = create_request_queue(self.policy)
+
+             while (self.waiting or self.skipped_waiting) and token_budget > 0:

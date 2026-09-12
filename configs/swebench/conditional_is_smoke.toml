@@ -62,6 +62,7 @@ max_num_batched_tokens = 32768
 enable_prefix_caching = true
 request_priority_policy = "none"
 native_parallel_sampling = false
+native_packed_forest_attention = false
 native_segmented_rng = false
 native_kv_fork = false
 native_kv_fork_waiters = false

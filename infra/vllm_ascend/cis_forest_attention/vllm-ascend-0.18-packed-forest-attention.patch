@@ -1,0 +1,506 @@
+diff --git a/vllm_ascend/attention/attention_v1.py b/vllm_ascend/attention/attention_v1.py
+--- a/vllm_ascend/attention/attention_v1.py
++++ b/vllm_ascend/attention/attention_v1.py
+@@ -140,6 +140,15 @@ class AscendAttentionState(Enum):
+     SpecDecoding = 4
+
+
++@dataclass
++class CISPackedForestAttentionBucket:
++    sibling_count: int
++    query_indices: torch.Tensor
++    contiguous_query_start: int | None
++    block_tables: torch.Tensor
++    attention_masks: torch.Tensor
++    kv_sequence_lengths: list[int]
++
++
+ @dataclass
+ class AscendMetadata:
+@@ -189,6 +198,11 @@ class AscendMetadata:
+     # sliding window attention mask
+     swa_mask: torch.Tensor | None = None
+
++    # Exact candidate-sibling packing for Conditional IS decode requests.
++    cis_forest_buckets: tuple[CISPackedForestAttentionBucket, ...] = ()
++    cis_forest_normal_query_indices: torch.Tensor | None = None
++    cis_forest_normal_query_start: int | None = None
++    cis_forest_normal_seq_lens: list[int] | None = None
++    cis_forest_normal_seq_lens_tensor: torch.Tensor | None = None
++    cis_forest_saved_kv_token_reads: int = 0
++
+
+ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
+@@ -838,6 +852,94 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         output[:num_tokens] = attn_output[:num_tokens]
+         return output
+
++    def _forward_cis_packed_forest_attention(
++        self,
++        query: torch.Tensor,
++        attn_metadata: AscendMetadata,
++        output: torch.Tensor,
++    ) -> torch.Tensor:
++        """Read each sibling group's shared physical KV blocks once."""
++
++        assert attn_metadata.attn_state == AscendAttentionState.DecodeOnly
++        assert not _EXTRA_CTX.capturing
++        assert self.sliding_window is None and self.sinks is None
++        assert self.key_cache is not None and self.value_cache is not None
++        num_blocks, block_size, _, _ = self.key_cache.shape
++        key_cache = self.key_cache.view(num_blocks, block_size, -1)
++        value_cache = self.value_cache.view(num_blocks, block_size, -1)
++
++        normal_indices = attn_metadata.cis_forest_normal_query_indices
++        if (
++            len(attn_metadata.cis_forest_buckets) == 1
++            and (normal_indices is None or not normal_indices.numel())
++        ):
++            bucket = attn_metadata.cis_forest_buckets[0]
++            if (
++                bucket.contiguous_query_start == 0
++                and bucket.query_indices.numel() == query.shape[0]
++            ):
++                group_count = bucket.block_tables.shape[0]
++                packed_query = query.view(
++                    group_count,
++                    bucket.sibling_count,
++                    self.num_heads * self.head_size,
++                )
++                packed_output, _ = torch_npu.npu_fused_infer_attention_score(
++                    query=packed_query,
++                    key=key_cache,
++                    value=value_cache,
++                    atten_mask=bucket.attention_masks,
++                    block_table=bucket.block_tables,
++                    input_layout="BSH",
++                    block_size=block_size,
++                    actual_seq_lengths_kv=bucket.kv_sequence_lengths,
++                    num_key_value_heads=self.num_kv_heads,
++                    num_heads=self.num_heads,
++                    scale=self.scale,
++                    pre_tokens=SWA_INT_MAX,
++                    next_tokens=SWA_INT_MAX,
++                    sparse_mode=0,
++                )
++                return packed_output.view(
++                    -1, self.num_heads, self.head_size
++                )
++        if normal_indices is not None and normal_indices.numel():
++            normal_start = attn_metadata.cis_forest_normal_query_start
++            if normal_start is None:
++                normal_query = query.index_select(0, normal_indices)
++                normal_block_tables = attn_metadata.block_tables.index_select(
++                    0, normal_indices
++                )
++            else:
++                normal_count = normal_indices.numel()
++                normal_query = query.narrow(0, normal_start, normal_count)
++                normal_block_tables = attn_metadata.block_tables.narrow(
++                    0, normal_start, normal_count
++                )
++            normal_seq_lens = (
++                attn_metadata.cis_forest_normal_seq_lens_tensor
++            )
++            assert normal_seq_lens is not None
++            normal_output = torch.empty_like(normal_query)
++            torch_npu._npu_paged_attention(
++                query=normal_query,
++                key_cache=self.key_cache,
++                value_cache=self.value_cache,
++                block_table=normal_block_tables,
++                context_lens=normal_seq_lens,
++                num_kv_heads=self.num_kv_heads,
++                num_heads=self.num_heads,
++                scale_value=self.scale,
++                out=normal_output,
++            )
++            if normal_start is None:
++                output.index_copy_(0, normal_indices, normal_output)
++            else:
++                output.narrow(0, normal_start, normal_indices.numel()).copy_(
++                    normal_output
++                )
++
++        for bucket in attn_metadata.cis_forest_buckets:
++            group_count = bucket.block_tables.shape[0]
++            if bucket.contiguous_query_start is None:
++                selected_query = query.index_select(0, bucket.query_indices)
++            else:
++                selected_query = query.narrow(
++                    0,
++                    bucket.contiguous_query_start,
++                    bucket.query_indices.numel(),
++                )
++            packed_query = selected_query.view(
++                group_count,
++                bucket.sibling_count,
++                self.num_heads * self.head_size,
++            )
++            packed_output, _ = torch_npu.npu_fused_infer_attention_score(
++                query=packed_query,
++                key=key_cache,
++                value=value_cache,
++                atten_mask=bucket.attention_masks,
++                block_table=bucket.block_tables,
++                input_layout="BSH",
++                block_size=block_size,
++                actual_seq_lengths_kv=bucket.kv_sequence_lengths,
++                num_key_value_heads=self.num_kv_heads,
++                num_heads=self.num_heads,
++                scale=self.scale,
++                pre_tokens=SWA_INT_MAX,
++                next_tokens=SWA_INT_MAX,
++                sparse_mode=0,
++            )
++            unpacked_output = packed_output.view(
++                -1, self.num_heads, self.head_size
++            )
++            if bucket.contiguous_query_start is None:
++                output.index_copy_(0, bucket.query_indices, unpacked_output)
++            else:
++                output.narrow(
++                    0,
++                    bucket.contiguous_query_start,
++                    bucket.query_indices.numel(),
++                ).copy_(unpacked_output)
++        return output
++
+     def forward_paged_attention(
+         self,
+         query: torch.Tensor,
+@@ -917,6 +1019,13 @@ class AscendAttentionBackendImpl(AttentionImpl):
+         output: torch.Tensor,
+     ):
+         num_tokens = query.shape[0]
++        if attn_metadata.cis_forest_buckets:
++            return self._forward_cis_packed_forest_attention(
++                query,
++                attn_metadata,
++                output,
++            )
+         if (
+             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+             and using_paged_attention(num_tokens, self.vllm_config)
+diff --git a/vllm_ascend/platform.py b/vllm_ascend/platform.py
+--- a/vllm_ascend/platform.py
++++ b/vllm_ascend/platform.py
+@@ -357,10 +357,6 @@ class NPUPlatform(Platform):
+-        # TODO: Full graph is fully supported later, and the default value will be set to full graph.
+-        if compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE:
+-            compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+-
+         # encoder-decoder models currently only support piecewise mode
+         if model_config and model_config.is_encoder_decoder is True:
+             if compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+@@ -375,6 +371,22 @@ class NPUPlatform(Platform):
+         if compilation_config.cudagraph_mode == CUDAGraphMode.NONE:
+             compilation_config.mode = CompilationMode.NONE
+             ascend_config.ascend_compilation_config.enable_npugraph_ex = False
++        elif compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE:
++            logger.info(
++                "Experimental FULL_AND_PIECEWISE compilation enabled for "
++                "CIS Forest Attention"
++            )
++            assert compilation_config.mode == CompilationMode.VLLM_COMPILE, (
++                "FULL_AND_PIECEWISE requires VLLM_COMPILE"
++            )
++            compilation_config.set_splitting_ops_for_v1(
++                all2all_backend=vllm_config.parallel_config.all2all_backend,
++                data_parallel_size=vllm_config.parallel_config.data_parallel_size,
++            )
++            compilation_config.use_inductor = False
++            compilation_config.splitting_ops.extend(["vllm::mla_forward"])
++            update_aclgraph_sizes(vllm_config)
+         elif compilation_config.cudagraph_mode == CUDAGraphMode.PIECEWISE:
+             logger.info("PIECEWISE compilation enabled on NPU. use_inductor not supported - using only ACL Graph mode")
+             assert compilation_config.mode == CompilationMode.VLLM_COMPILE, (
+diff --git a/vllm_ascend/worker/model_runner_v1.py b/vllm_ascend/worker/model_runner_v1.py
+--- a/vllm_ascend/worker/model_runner_v1.py
++++ b/vllm_ascend/worker/model_runner_v1.py
+@@ -115,7 +115,10 @@ from vllm_ascend.ascend_config import get_ascend_config
+-from vllm_ascend.attention.attention_v1 import AscendAttentionState
++from vllm_ascend.attention.attention_v1 import (
++    CISPackedForestAttentionBucket,
++    AscendAttentionState,
++)
+ from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+@@ -221,6 +224,8 @@ class ExecuteModelState(NamedTuple):
+
+
+ class NPUModelRunner(GPUModelRunner):
++    cis_packed_forest_attention_supported = True
++
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+@@ -846,6 +851,81 @@ class NPUModelRunner(GPUModelRunner):
+         return (
+             logits_indices,
+             spec_decode_metadata,
+             total_num_scheduled_tokens,
+         )
+
++    def _build_cis_packed_forest_plan(
++        self,
++        num_scheduled_tokens: np.ndarray,
++    ):
++        if (
++            self.attn_state != AscendAttentionState.DecodeOnly
++            or self.pcp_size != 1
++            or self.dcp_size != 1
++            or len(self.kv_cache_config.kv_cache_groups) != 1
++            or self.speculative_config is not None
++        ):
++            return None
++        from inference_scaling.arllm.backends.packed_forest_attention import (
++            ForestBranchLayout,
++            build_packed_forest_plan,
++        )
++
++        block_table = self.input_batch.block_table[0]
++        block_table_np = block_table.get_numpy_array()
++        branches = []
++        query_start = 0
++        for request_index, request_id in enumerate(self.input_batch.req_ids):
++            request = self.requests[request_id]
++            params = request.sampling_params
++            extra_args = None if params is None else params.extra_args
++            query_length = int(num_scheduled_tokens[request_index])
++            sequence_length = int(self.seq_lens.np[request_index])
++            used_blocks = math.ceil(sequence_length / block_table.block_size)
++            branches.append(
++                ForestBranchLayout(
++                    request_index=request_index,
++                    query_start=query_start,
++                    query_length=query_length,
++                    sequence_length=sequence_length,
++                    block_ids=tuple(
++                        int(value)
++                        for value in block_table_np[request_index, :used_blocks]
++                    ),
++                    group_id=(extra_args or {}).get("cis_forest_group_id"),
++                    branch_index=(extra_args or {}).get(
++                        "cis_forest_branch_index"
++                    ),
++                    group_size=(extra_args or {}).get("cis_forest_group_size"),
++                )
++            )
++            query_start += query_length
++        plan = build_packed_forest_plan(
++            branches,
++            materialize_attention_masks=False,
++        )
++        if not plan.enabled:
++            return None
++
++        runtime_buckets = []
++        for bucket in plan.buckets:
++            query_indices_tuple = tuple(bucket.query_indices)
++            first_query = min(query_indices_tuple)
++            contiguous_query_start = (
++                first_query
++                if query_indices_tuple
++                == tuple(range(first_query, first_query + len(query_indices_tuple)))
++                else None
++            )
++            row_tokens = bucket.kv_sequence_lengths[0]
++            positions_cache = getattr(
++                self,
++                "_cis_forest_positions_cache",
++                None,
++            )
++            if positions_cache is None:
++                positions_cache = {}
++                self._cis_forest_positions_cache = positions_cache
++            positions = positions_cache.get(row_tokens)
++            if positions is None:
++                positions = torch.arange(
++                    row_tokens,
++                    dtype=torch.int32,
++                    device=self.device,
++                )
++                positions_cache[row_tokens] = positions
++            shared_lengths = torch.tensor(
++                bucket.shared_prefix_tokens,
++                dtype=torch.int32,
++                device=self.device,
++            ).view(-1, 1, 1)
++            tail_lengths = torch.tensor(
++                bucket.tail_tokens,
++                dtype=torch.int32,
++                device=self.device,
++            ).unsqueeze(-1)
++            tail_starts = (
++                bucket.max_shared_blocks
++                + torch.arange(
++                    bucket.sibling_count,
++                    dtype=torch.int32,
++                    device=self.device,
++                )
++                * bucket.max_tail_blocks
++            ).view(1, -1, 1) * block_table.block_size
++            positions_3d = positions.view(1, 1, -1)
++            attention_masks = ~(
++                (positions_3d < shared_lengths)
++                | (
++                    (positions_3d >= tail_starts)
++                    & (positions_3d < tail_starts + tail_lengths)
++                )
++            )
++            runtime_buckets.append(
++                CISPackedForestAttentionBucket(
++                    sibling_count=bucket.sibling_count,
++                    query_indices=torch.tensor(
++                        query_indices_tuple,
++                        dtype=torch.long,
++                        device=self.device,
++                    ),
++                    contiguous_query_start=contiguous_query_start,
++                    block_tables=torch.tensor(
++                        bucket.block_tables,
++                        dtype=torch.int32,
++                        device=self.device,
++                    ),
++                    attention_masks=attention_masks,
++                    kv_sequence_lengths=list(bucket.kv_sequence_lengths),
++                )
++            )
++        buckets = tuple(runtime_buckets)
++        normal_indices = torch.tensor(
++            plan.normal_request_indices,
++            dtype=torch.long,
++            device=self.device,
++        )
++        normal_seq_lens = [
++            int(self.seq_lens.np[index])
++            for index in plan.normal_request_indices
++        ]
++        normal_indices_tuple = tuple(plan.normal_request_indices)
++        normal_first = min(normal_indices_tuple, default=0)
++        normal_query_start = (
++            normal_first
++            if normal_indices_tuple
++            == tuple(range(normal_first, normal_first + len(normal_indices_tuple)))
++            else None
++        )
++        normal_seq_lens_tensor = torch.tensor(
++            normal_seq_lens,
++            dtype=torch.int32,
++            device="cpu",
++        )
++        activated = getattr(self, "_cis_packed_forest_activations", 0) + 1
++        self._cis_packed_forest_activations = activated
++        group_count = sum(bucket.block_tables.shape[0] for bucket in buckets)
++        query_count = sum(bucket.query_indices.numel() for bucket in buckets)
++        cumulative_groups = (
++            getattr(self, "_cis_packed_forest_groups", 0) + group_count
++        )
++        cumulative_queries = (
++            getattr(self, "_cis_packed_forest_queries", 0) + query_count
++        )
++        cumulative_saved_reads = (
++            getattr(self, "_cis_packed_forest_saved_kv_token_reads", 0)
++            + plan.estimated_saved_kv_token_reads
++        )
++        self._cis_packed_forest_groups = cumulative_groups
++        self._cis_packed_forest_queries = cumulative_queries
++        self._cis_packed_forest_saved_kv_token_reads = cumulative_saved_reads
++        if activated == 1 or activated % 100 == 0:
++            logger.info(
++                "CIS packed Forest Attention: activations=%d, "
++                "cumulative_groups=%d, cumulative_queries=%d, "
++                "cumulative_saved_kv_token_reads=%d, current_groups=%d, "
++                "current_queries=%d, current_normal_queries=%d, "
++                "current_bucket_shapes=%s, masked_tail_token_slots=%d, "
++                "padding_ratio=%.3f",
++                activated,
++                cumulative_groups,
++                cumulative_queries,
++                cumulative_saved_reads,
++                group_count,
++                query_count,
++                normal_indices.numel(),
++                [
++                    (
++                        bucket.sibling_count,
++                        int(bucket.block_tables.shape[0]),
++                        int(bucket.block_tables.shape[1]),
++                    )
++                    for bucket in buckets
++                ],
++                plan.estimated_masked_tail_token_slots,
++                plan.padded_to_logical_block_ratio,
++            )
++        return (
++            buckets,
++            normal_indices,
++            normal_query_start,
++            normal_seq_lens,
++            normal_seq_lens_tensor,
++            plan.estimated_saved_kv_token_reads,
++        )
++
+     def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
+         if np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0):
+@@ -1179,6 +1255,9 @@ class NPUModelRunner(GPUModelRunner):
+                 ) = self._prepare_inputs(
+                     scheduler_output,
+                     num_scheduled_tokens_np,
+                 )
++                cis_forest_plan = self._build_cis_packed_forest_plan(
++                    num_scheduled_tokens_np
++                )
+
+                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+@@ -1215,7 +1294,9 @@ class NPUModelRunner(GPUModelRunner):
+                     num_scheduled_tokens_np=num_scheduled_tokens_np,
+                     max_num_scheduled_tokens=max_num_scheduled_tokens,
+-                    use_cascade_attn=cascade_attn_prefix_lens is not None,
++                    use_cascade_attn=(
++                        cascade_attn_prefix_lens is not None
++                        or cis_forest_plan is not None
++                    ),
+                     force_eager=self.model_config.enforce_eager,
+                     num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                 )
+@@ -1284,6 +1365,7 @@ class NPUModelRunner(GPUModelRunner):
+                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                     num_scheduled_tokens_np=num_scheduled_tokens_np,
+                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
++                    cis_forest_plan=cis_forest_plan,
+                 )
+@@ -2022,6 +2104,7 @@ class NPUModelRunner(GPUModelRunner):
+         num_scheduled_tokens: dict[str, int] | None = None,
+         num_scheduled_tokens_np: np.ndarray | None = None,
+         cascade_attn_prefix_lens: list[list[int]] | None = None,
++        cis_forest_plan=None,
+     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
+@@ -2243,6 +2326,19 @@ class NPUModelRunner(GPUModelRunner):
+                 for _metadata in attn_metadata.values():
+                     _metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
+
++        if cis_forest_plan is not None:
++            (
++                buckets,
++                normal_indices,
++                normal_query_start,
++                normal_seq_lens,
++                normal_seq_lens_tensor,
++                saved_reads,
++            ) = cis_forest_plan
++            metadata_groups = (
++                [metadata for group in attn_metadata for metadata in group.values()]
++                if isinstance(attn_metadata, list)
++                else list(attn_metadata.values())
++            )
++            for metadata in metadata_groups:
++                metadata.cis_forest_buckets = buckets
++                metadata.cis_forest_normal_query_indices = normal_indices
++                metadata.cis_forest_normal_query_start = normal_query_start
++                metadata.cis_forest_normal_seq_lens = normal_seq_lens
++                metadata.cis_forest_normal_seq_lens_tensor = (
++                    normal_seq_lens_tensor
++                )
++                metadata.cis_forest_saved_kv_token_reads = saved_reads
++
+         if spec_decode_common_attn_metadata is not None and (
+             num_reqs != num_reqs_padded or num_tokens != num_tokens_padded

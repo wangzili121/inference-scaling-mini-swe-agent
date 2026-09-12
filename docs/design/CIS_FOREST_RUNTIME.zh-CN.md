@@ -186,6 +186,14 @@ FTS/s 仍分别下降 3.6% 和 5.9%，Job/Step P95 分别恶化 37.0% 和 24.9%�
 作为完整负结果保留，不再继续微调 release policy。调度侧已经完成问题收敛，下一
 主线直接进入 Forest Attention。
 
+2026-09-12 在 Forest Attention v3 上又做了最后一个窄调度验证：仅当 running
+decode 已包含足够完整 sibling group 时，最多 4 个 scheduler tick 暂缓接纳 waiting
+prefill。4-job smoke 曾显示约 45% FTS/s 提升，但固定 P0 64-request 饱和 A/B 中
+jobs/s/FTS/s 为 `-0.27%/-0.12%`，Job mean `-6.6%`、P95 `+6.5%`，整轮只触发
+一次 window。该结果未证明 batch-shape 控制的稳定收益，因此不扩展完整 tree
+scheduler。只有融合 Forest CANN op 能留在 FULL graph 并取得收益后，才依据新的
+trace 重新评估 scheduler 与 barrier priority。
+
 ## 5. 跨 Instance Branch Parallel
 
 whole-job routing 只能改善多 job 负载均衡，不能缩短单个重型 CIS job。后续四卡

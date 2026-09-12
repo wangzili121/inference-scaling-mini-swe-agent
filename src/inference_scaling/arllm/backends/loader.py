@@ -34,6 +34,7 @@ _VLLM_SETTINGS = {
     "max_num_seqs",
     "mh_fused_logprobs",
     "native_parallel_sampling",
+    "native_packed_forest_attention",
     "native_segmented_rng",
     "native_kv_fork",
     "native_kv_fork_compact_waiters",
@@ -295,6 +296,15 @@ def load_backend_from_config(
                 "native_parallel_sampling requires runtime.backend='vllm'"
             )
         acceleration_kwargs["native_parallel_sampling"] = True
+    native_packed_forest_attention = bool(
+        settings.pop("native_packed_forest_attention", False)
+    )
+    if native_packed_forest_attention:
+        if not asynchronous:
+            raise ValueError(
+                "native_packed_forest_attention requires runtime.backend='vllm'"
+            )
+        acceleration_kwargs["native_packed_forest_attention"] = True
     native_segmented_rng = bool(settings.pop("native_segmented_rng", False))
     if native_segmented_rng:
         if not asynchronous:

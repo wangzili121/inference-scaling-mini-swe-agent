@@ -487,6 +487,10 @@ def _rollout_requests_for_candidate(
     else:
         arithmetic_uniforms = (None,) * rollout_count
     requests = []
+    forest_group_id = (
+        f"{request_namespace}:step:{step_index}:candidate:{candidate_index}:"
+        f"rollout-batch:{rollout_index_offset}"
+    )
     for rollout_index in range(rollout_count):
         global_rollout_index = rollout_index_offset + rollout_index
         requests.append(
@@ -511,6 +515,9 @@ def _rollout_requests_for_candidate(
                 arithmetic_uniform=arithmetic_uniforms[rollout_index],
                 confidence_top_k=confidence_top_k,
                 fork_parent_request_id=candidate.request_id,
+                forest_group_id=(forest_group_id if rollout_count >= 2 else None),
+                forest_branch_index=(rollout_index if rollout_count >= 2 else None),
+                forest_group_size=(rollout_count if rollout_count >= 2 else None),
             )
         )
     return requests, [rollout_prefix] * rollout_count, False
@@ -827,6 +834,15 @@ def _sample_engine_fork_candidate_rollouts(
                     confidence_top_k=confidence_top_k,
                     fork_parent_request_id=parent.request_id,
                     fork_wait_for_parent=True,
+                    forest_group_id=(
+                        parent.request_id if rollout_count >= 2 else None
+                    ),
+                    forest_branch_index=(
+                        rollout_index if rollout_count >= 2 else None
+                    ),
+                    forest_group_size=(
+                        rollout_count if rollout_count >= 2 else None
+                    ),
                 )
             )
 

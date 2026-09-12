@@ -679,6 +679,13 @@ def main() -> None:
     parser.add_argument("--profile-seconds", type=float, default=30.0)
     parser.add_argument("--telemetry-interval", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=20260908)
+    parser.add_argument(
+        "--run-namespace",
+        help=(
+            "stable request namespace for reproducible A/B sampling; "
+            "defaults to a unique namespace"
+        ),
+    )
     parser.add_argument("--profile-prefix", default="conditional-is")
     parser.add_argument("--profile-memory", action="store_true")
     parser.add_argument("--profile-stack", action="store_true")
@@ -723,6 +730,11 @@ def main() -> None:
                 workers=min(args.workers, len(warmup)),
                 timeout=args.request_timeout,
                 seed=args.seed,
+                run_namespace=(
+                    f"{args.run_namespace}:warmup"
+                    if args.run_namespace
+                    else None
+                ),
                 conditional_overrides=_conditional_overrides(args),
                 routing=args.routing,
             )
@@ -742,6 +754,7 @@ def main() -> None:
             workers=args.workers,
             timeout=args.request_timeout,
             seed=args.seed,
+            run_namespace=args.run_namespace,
             conditional_overrides=_conditional_overrides(args),
             routing=args.routing,
             after_release=lifecycle,

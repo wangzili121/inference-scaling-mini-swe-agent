@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
   echo "usage: $0 VARIANT DEVICES OUTPUT PORT CONTAINER" >&2
-  echo "VARIANT: baseline | step-gang | step-gang-6 | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
+  echo "VARIANT: baseline | step-gang | step-gang-6 | step-gang-piecewise | step-gang-dual-graph | step-forest-attention | step-forest-attention-piecewise | step-forest-attention-dual-graph | step-forest-window-N | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
   exit 2
 fi
 
@@ -22,6 +22,7 @@ categorical=${CIS_CATEGORICAL_DIR:-/data/disk/wangzili/vllm-categorical-runtime}
 cache=${CIS_VLLM_CACHE:-/data/disk/wangzili/vllm-cache-v018-cis-forest}
 limit=${CIS_LIMIT:-64}
 workers=${CIS_WORKERS:-32}
+run_namespace=${CIS_RUN_NAMESPACE:-cis-forest-ab-20260912}
 candidate_count=${CIS_CANDIDATE_COUNT:-15}
 rollout_count=${CIS_ROLLOUT_COUNT:-3}
 block_size=${CIS_BLOCK_SIZE:-128}
@@ -43,6 +44,10 @@ done
   echo "workers must not exceed workload limit" >&2
   exit 2
 }
+[[ "$run_namespace" =~ ^[A-Za-z0-9._:-]+$ ]] || {
+  echo "run namespace contains unsupported characters" >&2
+  exit 2
+}
 
 for path in "$workspace" "$model" "$public_workload" "$self_workload" "$categorical"; do
   [[ -e "$path" ]] || { echo "missing dependency: $path" >&2; exit 1; }
@@ -62,6 +67,57 @@ case "$variant" in
       --set conditional_is.active_step_limit="$active_step_limit"
       --set 'vllm.request_priority_policy=\"step_fifo\"'
     )
+    ;;
+  step-gang-piecewise)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set 'vllm.engine_kwargs.compilation_config={\"cudagraph_mode\":\"PIECEWISE\"}'
+    )
+    ;;
+  step-gang-dual-graph)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set 'vllm.engine_kwargs.compilation_config={\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}'
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm-ascend && git apply --recount --check /workspace/infra/vllm_ascend/cis_forest_attention/vllm-ascend-0.18-packed-forest-attention.patch && git apply --recount /workspace/infra/vllm_ascend/cis_forest_attention/vllm-ascend-0.18-packed-forest-attention.patch'
+    ;;
+  step-forest-window-*)
+    forest_window_steps=${variant##*-}
+    [[ "$forest_window_steps" =~ ^[1-9][0-9]*$ ]] || {
+      echo "invalid Forest window length: $forest_window_steps" >&2
+      exit 2
+    }
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_packed_forest_attention=true
+      --set 'vllm.engine_kwargs.compilation_config={\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}'
+    )
+    variant_docker_env=(
+      -e VLLM_CIS_FOREST_WINDOW_MAX_STEPS="$forest_window_steps"
+      -e VLLM_CIS_FOREST_WINDOW_MIN_SAVED_READS=196608
+      -e VLLM_CIS_FOREST_WINDOW_MIN_PACKED_FRACTION=0.75
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --recount --check /workspace/infra/vllm_ascend/cis_forest_attention/vllm-0.18-cis-forest-window.patch && git apply --recount /workspace/infra/vllm_ascend/cis_forest_attention/vllm-0.18-cis-forest-window.patch && cd /vllm-workspace/vllm-ascend && git apply --recount --check /workspace/infra/vllm_ascend/cis_forest_attention/vllm-ascend-0.18-packed-forest-attention.patch && git apply --recount /workspace/infra/vllm_ascend/cis_forest_attention/vllm-ascend-0.18-packed-forest-attention.patch'
+    ;;
+  step-forest-attention|step-forest-attention-piecewise|step-forest-attention-dual-graph)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set vllm.native_packed_forest_attention=true
+    )
+    if [[ "$variant" == step-forest-attention-piecewise ]]; then
+      variant_args+=(
+        --set 'vllm.engine_kwargs.compilation_config={\"cudagraph_mode\":\"PIECEWISE\"}'
+      )
+    elif [[ "$variant" == step-forest-attention-dual-graph ]]; then
+      variant_args+=(
+        --set 'vllm.engine_kwargs.compilation_config={\"cudagraph_mode\":\"FULL_AND_PIECEWISE\"}'
+      )
+    fi
+    native_runtime_setup='cd /vllm-workspace/vllm-ascend && git apply --recount --check /workspace/infra/vllm_ascend/cis_forest_attention/vllm-ascend-0.18-packed-forest-attention.patch && git apply --recount /workspace/infra/vllm_ascend/cis_forest_attention/vllm-ascend-0.18-packed-forest-attention.patch'
     ;;
   step-fused-paths)
     variant_args=(
@@ -373,6 +429,7 @@ CIS_CATEGORICAL_DIR=$categorical
 CIS_VLLM_CACHE=$cache
 CIS_LIMIT=$limit
 CIS_WORKERS=$workers
+CIS_RUN_NAMESPACE=$run_namespace
 CIS_CANDIDATE_COUNT=$candidate_count
 CIS_ROLLOUT_COUNT=$rollout_count
 CIS_BLOCK_SIZE=$block_size
@@ -414,6 +471,8 @@ docker run -d \
     set -euo pipefail
     $native_runtime_setup
     export PYTHONPATH=/workspace/src:\$PYTHONPATH
+    cd /workspace
+    /usr/local/python3.11.14/bin/python -c 'import inference_scaling.swe_agent.profile as p; print(p.__file__)'
     exec /usr/local/python3.11.14/bin/python -m inference_scaling.swe_agent.profile \
       --config /workspace/configs/swebench/conditional_is_smoke.toml \
       --workload /workloads/public/public-256.jsonl \
@@ -422,6 +481,7 @@ docker run -d \
       --pipeline-parallel-size 1 \
       --profiler none \
       --limit $limit \
+      --run-namespace $run_namespace \
       --categorical-root /categorical \
       --set generation.max_new_tokens=512 \
       --set vllm.max_model_len=65536 \

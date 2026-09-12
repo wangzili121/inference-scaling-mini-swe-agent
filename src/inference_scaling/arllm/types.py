@@ -37,6 +37,9 @@ class GenerationRequest:
     rng_switch_seed: int | None = None
     rng_prefix_group: str | None = None
     rng_prefix_group_size: int | None = None
+    forest_group_id: str | None = None
+    forest_branch_index: int | None = None
+    forest_group_size: int | None = None
 
     def __post_init__(self) -> None:
         if self.max_new_tokens <= 0:
@@ -120,6 +123,25 @@ class GenerationRequest:
                 raise ValueError("rng_prefix_group cannot be empty")
             if self.rng_prefix_group_size is None or self.rng_prefix_group_size < 2:
                 raise ValueError("rng_prefix_group_size must be at least two")
+        forest_fields = (
+            self.forest_group_id,
+            self.forest_branch_index,
+            self.forest_group_size,
+        )
+        if any(value is not None for value in forest_fields):
+            if any(value is None for value in forest_fields):
+                raise ValueError("forest branch metadata must be provided together")
+            if not self.forest_group_id:
+                raise ValueError("forest_group_id cannot be empty")
+            if self.forest_group_size is None or self.forest_group_size < 2:
+                raise ValueError("forest_group_size must be at least two")
+            if (
+                self.forest_branch_index is None
+                or not 0 <= self.forest_branch_index < self.forest_group_size
+            ):
+                raise ValueError(
+                    "forest_branch_index must lie inside the sibling group"
+                )
 
 
 @dataclass(frozen=True, slots=True)

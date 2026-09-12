@@ -730,6 +730,49 @@ def test_async_vllm_segmented_rng_adds_boundary_metadata() -> None:
     }
 
 
+def test_async_vllm_packed_forest_attention_adds_sibling_metadata() -> None:
+    request = GenerationRequest(
+        (1, 2),
+        4,
+        SamplingConfig(),
+        7,
+        "job-a:step:0:candidate:0:rollout:1",
+        forest_group_id="job-a:step:0:candidate:0",
+        forest_branch_index=1,
+        forest_group_size=3,
+    )
+    disabled = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+    )
+    try:
+        assert getattr(disabled._sampling_params(request), "extra_args", None) is None
+    finally:
+        disabled.close()
+
+    enabled = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        native_packed_forest_attention=True,
+    )
+    try:
+        params = enabled._sampling_params(request)
+    finally:
+        enabled.close()
+
+    assert params.extra_args == {
+        "cis_forest_group_id": "job-a:step:0:candidate:0",
+        "cis_forest_branch_index": 1,
+        "cis_forest_group_size": 3,
+    }
+
+
 def test_async_vllm_native_kv_fork_adds_parent_child_metadata() -> None:
     backend = AsyncVLLMBackend(
         _AsyncEngine(),

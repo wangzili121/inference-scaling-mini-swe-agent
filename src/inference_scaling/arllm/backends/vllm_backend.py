@@ -1409,6 +1409,7 @@ class AsyncVLLMBackend(VLLMBackend):
         native_suffix_speculation: bool = False,
         request_priority_policy: str = "none",
         native_parallel_sampling: bool = False,
+        native_packed_forest_attention: bool = False,
         native_segmented_rng: bool = False,
         native_kv_fork: bool = False,
         native_kv_fork_waiters: bool = False,
@@ -1445,6 +1446,9 @@ class AsyncVLLMBackend(VLLMBackend):
             raise ValueError("unknown CIS request priority policy")
         self._request_priority_policy = request_priority_policy
         self._native_parallel_sampling = bool(native_parallel_sampling)
+        self._native_packed_forest_attention = bool(
+            native_packed_forest_attention
+        )
         self._native_segmented_rng = bool(native_segmented_rng)
         self._native_kv_fork = bool(native_kv_fork)
         self._native_kv_fork_waiters = bool(native_kv_fork_waiters)
@@ -1560,6 +1564,7 @@ class AsyncVLLMBackend(VLLMBackend):
         engine_kwargs: dict[str, Any] | None = None,
         request_priority_policy: str = "none",
         native_parallel_sampling: bool = False,
+        native_packed_forest_attention: bool = False,
         native_segmented_rng: bool = False,
         native_kv_fork: bool = False,
         native_kv_fork_waiters: bool = False,
@@ -1590,6 +1595,24 @@ class AsyncVLLMBackend(VLLMBackend):
             raise RuntimeError(
                 "native_parallel_sampling requires the CIS ParentRequest runtime patch"
             )
+        if native_packed_forest_attention:
+            try:
+                from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+            except ImportError as error:
+                raise RuntimeError(
+                    "native_packed_forest_attention requires vLLM-Ascend"
+                ) from error
+            if not bool(
+                getattr(
+                    NPUModelRunner,
+                    "cis_packed_forest_attention_supported",
+                    False,
+                )
+            ):
+                raise RuntimeError(
+                    "native_packed_forest_attention requires the CIS packed "
+                    "forest-attention runtime patch"
+                )
         if native_segmented_rng and not bool(
             getattr(GPUModelRunner, "cis_segmented_rng_supported", False)
         ):
@@ -1742,6 +1765,7 @@ class AsyncVLLMBackend(VLLMBackend):
             native_suffix_speculation=speculation is not None,
             request_priority_policy=request_priority_policy,
             native_parallel_sampling=native_parallel_sampling,
+            native_packed_forest_attention=native_packed_forest_attention,
             native_segmented_rng=native_segmented_rng,
             native_kv_fork=native_kv_fork,
             native_kv_fork_waiters=native_kv_fork_waiters,
@@ -1774,9 +1798,23 @@ class AsyncVLLMBackend(VLLMBackend):
                 )
             params.extra_args = extra_args
         if (
+            self._native_packed_forest_attention
+            and request.forest_group_id is not None
+        ):
+            assert request.forest_branch_index is not None
+            assert request.forest_group_size is not None
+            extra_args = dict(getattr(params, "extra_args", None) or {})
+            extra_args["cis_forest_group_id"] = request.forest_group_id
+            extra_args["cis_forest_branch_index"] = int(
+                request.forest_branch_index
+            )
+            extra_args["cis_forest_group_size"] = int(request.forest_group_size)
+            params.extra_args = extra_args
+        if (
             not self._native_kv_fork
             and not self._native_kv_branch_eviction
             and not self._native_kv_resample_gc
+            and not self._native_packed_forest_attention
         ):
             return params
         extra_args = dict(getattr(params, "extra_args", None) or {})
