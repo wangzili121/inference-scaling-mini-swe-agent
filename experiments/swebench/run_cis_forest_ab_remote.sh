@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
   echo "usage: $0 VARIANT DEVICES OUTPUT PORT CONTAINER" >&2
-  echo "VARIANT: baseline | step-cap-only | step-priority-only | step-cohort-auto | step-cohort-N | step-tree-adaptive | step-tree-fractional | step-gang | step-gang-6 | step-gang-piecewise | step-gang-dual-graph | step-forest-attention | step-forest-attention-piecewise | step-forest-attention-dual-graph | step-forest-window-N | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
+  echo "VARIANT: baseline | step-cap-only | step-priority-only | job-gang | step-cohort-auto | step-cohort-N | step-tree-adaptive | step-tree-fractional | step-tree-tail-borrow | step-tree-continuation | step-tree-work-conserving | step-gang | step-gang-6 | step-gang-piecewise | step-gang-dual-graph | step-forest-attention | step-forest-attention-piecewise | step-forest-attention-dual-graph | step-forest-window-N | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
   exit 2
 fi
 
@@ -37,8 +37,13 @@ tree_kv_high_watermark=${CIS_TREE_KV_HIGH_WATERMARK:-0.92}
 tree_adjust_interval=${CIS_TREE_ADJUST_INTERVAL:-1.0}
 tree_candidate_idle_grace=${CIS_TREE_CANDIDATE_IDLE_GRACE:-5.0}
 tree_initial_window=${CIS_TREE_INITIAL_WINDOW:-$active_step_limit}
+tree_max_window=${CIS_TREE_MAX_WINDOW:-}
+tree_tail_borrow_limit=${CIS_TREE_TAIL_BORROW_LIMIT:-2}
+tree_continuation_grace_ms=${CIS_TREE_CONTINUATION_GRACE_MS:-1500}
+fixed_length=${CIS_FIXED_LENGTH:-0}
 native_runtime_setup=:
 variant_docker_env=()
+fixed_length_arg=
 
 for value in "$limit" "$workers" "$candidate_count" "$rollout_count" "$block_size" "$active_step_limit"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
@@ -50,6 +55,14 @@ done
   echo "tree initial window must be a positive integer" >&2
   exit 2
 }
+if [[ -n "$tree_max_window" && ! "$tree_max_window" =~ ^[1-9][0-9]*$ ]]; then
+  echo "tree max window must be empty or a positive integer" >&2
+  exit 2
+fi
+[[ "$tree_continuation_grace_ms" =~ ^[0-9]+$ ]] || {
+  echo "tree continuation grace must be a non-negative integer" >&2
+  exit 2
+}
 (( workers <= limit )) || {
   echo "workers must not exceed workload limit" >&2
   exit 2
@@ -58,6 +71,13 @@ done
   echo "run namespace contains unsupported characters" >&2
   exit 2
 }
+[[ "$fixed_length" == 0 || "$fixed_length" == 1 ]] || {
+  echo "CIS_FIXED_LENGTH must be 0 or 1" >&2
+  exit 2
+}
+if [[ "$fixed_length" == 1 ]]; then
+  fixed_length_arg='--set generation.ignore_eos=true'
+fi
 
 for path in "$workspace" "$model" "$public_workload" "$self_workload" "$categorical"; do
   [[ -e "$path" ]] || { echo "missing dependency: $path" >&2; exit 1; }
@@ -80,6 +100,12 @@ case "$variant" in
   step-priority-only)
     variant_args=(
       --set 'vllm.request_priority_policy=\"step_fifo\"'
+    )
+    ;;
+  job-gang)
+    variant_args=(
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"job_fifo\"'
     )
     ;;
   step-cohort-auto)
@@ -105,6 +131,7 @@ case "$variant" in
       --set 'vllm.scheduler_cls=\"inference_scaling.arllm.backends.cis_scheduler.CISTreeScheduler\"'
     )
     variant_docker_env=(
+      -e VLLM_CIS_INITIAL_WINDOW="$tree_initial_window"
       -e VLLM_CIS_TARGET_RUNNING_FRACTION="$tree_target_running_fraction"
       -e VLLM_CIS_KV_LOW_WATERMARK="$tree_kv_low_watermark"
       -e VLLM_CIS_KV_HIGH_WATERMARK="$tree_kv_high_watermark"
@@ -121,6 +148,46 @@ case "$variant" in
     variant_docker_env=(
       -e VLLM_CIS_ADMISSION_MODE=fractional_work
       -e VLLM_CIS_INITIAL_WINDOW="$tree_initial_window"
+      -e VLLM_CIS_CANDIDATE_IDLE_GRACE="$tree_candidate_idle_grace"
+      -e VLLM_CIS_SCHEDULER_TRACE=/artifacts/cis-scheduler-trace.jsonl
+    )
+    ;;
+  step-tree-tail-borrow)
+    variant_args=(
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set 'vllm.scheduler_cls=\"inference_scaling.arllm.backends.cis_scheduler.CISTreeScheduler\"'
+    )
+    variant_docker_env=(
+      -e VLLM_CIS_ADMISSION_MODE=tail_borrow
+      -e VLLM_CIS_INITIAL_WINDOW="$tree_initial_window"
+      -e VLLM_CIS_KV_LOW_WATERMARK="$tree_kv_low_watermark"
+      -e VLLM_CIS_TAIL_BORROW_LIMIT="$tree_tail_borrow_limit"
+      -e VLLM_CIS_CANDIDATE_IDLE_GRACE="$tree_candidate_idle_grace"
+      -e VLLM_CIS_SCHEDULER_TRACE=/artifacts/cis-scheduler-trace.jsonl
+    )
+    ;;
+  step-tree-continuation)
+    variant_args=(
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set 'vllm.scheduler_cls=\"inference_scaling.arllm.backends.cis_scheduler.CISTreeScheduler\"'
+    )
+    variant_docker_env=(
+      -e VLLM_CIS_INITIAL_WINDOW="$tree_initial_window"
+      -e VLLM_CIS_CONTINUATION_GRACE_MS="$tree_continuation_grace_ms"
+      -e VLLM_CIS_CANDIDATE_IDLE_GRACE="$tree_candidate_idle_grace"
+      -e VLLM_CIS_SCHEDULER_TRACE=/artifacts/cis-scheduler-trace.jsonl
+    )
+    ;;
+  step-tree-work-conserving)
+    variant_args=(
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set 'vllm.scheduler_cls=\"inference_scaling.arllm.backends.cis_scheduler.CISTreeScheduler\"'
+    )
+    variant_docker_env=(
+      -e VLLM_CIS_INITIAL_WINDOW="$tree_initial_window"
+      -e VLLM_CIS_CONTINUATION_GRACE_MS="$tree_continuation_grace_ms"
+      -e VLLM_CIS_CONTINUATION_WORK_CONSERVING=1
+      -e VLLM_CIS_TARGET_RUNNING_FRACTION="$tree_target_running_fraction"
       -e VLLM_CIS_CANDIDATE_IDLE_GRACE="$tree_candidate_idle_grace"
       -e VLLM_CIS_SCHEDULER_TRACE=/artifacts/cis-scheduler-trace.jsonl
     )
@@ -457,6 +524,12 @@ case "$variant" in
     ;;
 esac
 
+if [[ -n "$tree_max_window" && "$variant" == step-tree-* ]]; then
+  variant_docker_env+=(
+    -e VLLM_CIS_MAX_WINDOW="$tree_max_window"
+  )
+fi
+
 IFS=, read -r -a device_ids <<<"$devices"
 device_args=()
 logical_ids=()
@@ -506,6 +579,10 @@ CIS_TREE_KV_LOW_WATERMARK=$tree_kv_low_watermark
 CIS_TREE_KV_HIGH_WATERMARK=$tree_kv_high_watermark
 CIS_TREE_ADJUST_INTERVAL=$tree_adjust_interval
 CIS_TREE_CANDIDATE_IDLE_GRACE=$tree_candidate_idle_grace
+CIS_TREE_MAX_WINDOW=$tree_max_window
+CIS_TREE_TAIL_BORROW_LIMIT=$tree_tail_borrow_limit
+CIS_TREE_CONTINUATION_GRACE_MS=$tree_continuation_grace_ms
+CIS_FIXED_LENGTH=$fixed_length
 EOF
 
 docker run -d \
@@ -552,6 +629,7 @@ docker run -d \
       --run-namespace $run_namespace \
       --categorical-root /categorical \
       --set generation.max_new_tokens=512 \
+      $fixed_length_arg \
       --set vllm.max_model_len=65536 \
       --set vllm.max_num_seqs=256 \
       --set vllm.max_num_batched_tokens=32768 \

@@ -1098,3 +1098,52 @@ f9278b1cf1c84a37226b753736961f711be8342e04e1938934c735982c58543e
 
 服务器 `159.138.5.111` 的实验均只使用启动前空闲的物理 NPU 1/4；结束后容器已退出，
 卡已释放。第二台服务器检查时只有单张 7 号卡空闲，未占用。
+
+## 20. 2026-09-14 Predictive Continuation 实验
+
+当前本地分支为 `cis-predictive-scheduler`。在上一节 EngineCore dynamic 基础上完成：
+
+- 用 candidate `RequestStatus` 准确识别 terminal candidate，推导实际 rollout 数；
+- all-terminal step 立即关闭，不再依赖 idle timeout；
+- 实现 continuation reservation/claim/expire 和 work-conserving release；
+- 增加 `job_fifo` 消融与 performance-only fixed-work 模式；
+- P1 fixed-work 保证各方案均为3328个 engine request、720896个 generated token。
+
+P1 相对静态 `step_fifo + cap16` 的关键结果：
+
+| 策略 | jobs/s 变化 | Job mean 变化 | Job P95 变化 | prefill |
+|---|---:|---:|---:|---:|
+| job_fifo + cap16 | -0.22% | -2.33% | -0.47% | 627240 |
+| EngineCore，无 continuation | -10.24% | +54.25% | +10.92% | 1688232 |
+| work-conserving release | -0.78% | +11.40% | +0.03% | 707368 |
+| continuation 5s | **+0.73%** | **-4.67%** | **-1.44%** | **627240** |
+
+无 continuation 会先处理所有 job 的 step0，再处理 step1，导致跨 step prefix 重算；
+5秒 continuation 的96次 reservation 全部 claim，恢复与静态基线完全相同的 prefill
+和总 FTS，并形成小幅 Pareto 改善。work-conserving 版本释放4个长上下文 reservation
+后恰好多出约80K prefill，证明只看 running request 数量会低估换树成本。
+
+P0 `C15/R3` 迁移失败：5秒 continuation 相对静态 cap16 的 jobs/s `-15.20%`、
+FTS/s `-12.24%`、Job P95 `+3.06%`；53次 reservation 只有11次 claim、42次
+timeout。固定 grace 随 C/R 改变，不具备通用性。P2 的窗口32等于 workers32，
+continuation 不改变 admission 集合，未重复占卡。
+
+最终决策：当前生产 baseline 仍是静态 CIS `step_fifo/cap`；新动态代码只作为研究
+variant，不默认启用。若继续，必须由算法层显式发送 `step_closed/next_step_ready`，
+并将 prefix bytes、剩余 rollout token 和 decode 饱和点纳入换树代价，而不是继续扫
+timeout。
+
+完整报告和机器可读数据：
+
+```text
+docs/experiments/CIS_PREDICTIVE_CONTINUATION_20260914.zh-CN.md
+docs/experiments/data/cis_predictive_continuation_20260914.json
+```
+
+原始数据：
+
+```text
+/data/disk/wangzili/cis-predictive-scheduler-20260913
+```
+
+本轮只使用服务器 `159.138.5.111` 启动前空闲的物理 NPU 1/4；实验结束后已释放。

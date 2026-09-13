@@ -1445,6 +1445,7 @@ class AsyncVLLMBackend(VLLMBackend):
         self._request_trace_observer: Callable[[Mapping[str, Any]], None] | None = None
         if request_priority_policy not in {
             "none",
+            "job_fifo",
             "step_fifo",
             "step_cohort",
             "rollout_first",
@@ -1555,16 +1556,21 @@ class AsyncVLLMBackend(VLLMBackend):
         )
         if metadata is None and match is None:
             return 0
-        step_key = (
-            metadata.step_key
-            if metadata is not None
-            else f"{match.group('job')}:step:{match.group('step')}"
-        )
+        if self._request_priority_policy == "job_fifo":
+            priority_key = (
+                metadata.job_id if metadata is not None else match.group("job")
+            )
+        else:
+            priority_key = (
+                metadata.step_key
+                if metadata is not None
+                else f"{match.group('job')}:step:{match.group('step')}"
+            )
         with self._step_priority_lock:
-            priority = self._step_priorities.get(step_key)
+            priority = self._step_priorities.get(priority_key)
             if priority is None:
                 priority = next(self._next_step_priority)
-                self._step_priorities[step_key] = priority
+                self._step_priorities[priority_key] = priority
         if (
             self._request_priority_policy == "rollout_first"
             and (

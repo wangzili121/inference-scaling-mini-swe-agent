@@ -1211,3 +1211,37 @@ def test_async_vllm_priority_prefers_structured_cis_metadata() -> None:
         }
     finally:
         backend.close()
+
+
+def test_async_vllm_job_fifo_keeps_later_steps_with_their_job() -> None:
+    backend = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        request_priority_policy="job_fifo",
+    )
+    try:
+        def request(job: str, step: int) -> GenerationRequest:
+            return GenerationRequest(
+                (1,),
+                1,
+                SamplingConfig(),
+                step,
+                f"{job}:step:{step}:candidate:0",
+                cis=CISRequestMetadata(
+                    job_id=job,
+                    step_index=step,
+                    node_type="candidate",
+                    candidate_index=0,
+                    candidate_count=1,
+                ),
+            )
+
+        assert backend._request_priority(request("job-a", 0)) == 0
+        assert backend._request_priority(request("job-b", 0)) == 1
+        assert backend._request_priority(request("job-a", 1)) == 0
+        assert backend._step_priorities == {"job-a": 0, "job-b": 1}
+    finally:
+        backend.close()

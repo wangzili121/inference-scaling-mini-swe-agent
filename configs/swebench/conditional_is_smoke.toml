@@ -8,6 +8,7 @@ base = "${CIS_MODEL_PATH}"
 
 [generation]
 max_new_tokens = 512
+ignore_eos = false
 
 [sampling]
 temperature = 1.0

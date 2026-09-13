@@ -254,11 +254,14 @@ class ConditionalISRunner:
             conditional.get("engine_fork_release_remaining_candidates", -1)
         )
         self.maximum = int(generation["max_new_tokens"])
+        eos_token_id = getattr(backend.tokenizer, "eos_token_id", None)
+        if bool(generation.get("ignore_eos", False)):
+            eos_token_id = None
         self.sampling = SamplingConfig(
             temperature=float(sampling.get("temperature", 1.0)),
             top_p=float(sampling.get("top_p", 1.0)),
             top_k=(None if sampling.get("top_k") is None else int(sampling["top_k"])),
-            eos_token_id=getattr(backend.tokenizer, "eos_token_id", None),
+            eos_token_id=eos_token_id,
         )
         self.conditional = ConditionalISConfig(
             candidate_count=int(conditional["candidate_count"]),

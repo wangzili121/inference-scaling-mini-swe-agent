@@ -19,7 +19,7 @@ from typing import Any
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine import EngineCoreEventType
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 
 _METADATA_KEY = "cis_request"
@@ -35,12 +35,15 @@ def _float_env(name: str, default: float) -> float:
 @dataclass(slots=True)
 class _StepState:
     key: str
+    job_id: str
     order: int
     candidate_count: int
     rollouts_per_candidate: int
     active: bool = False
     phase: str = "candidate"
     seen_candidates: set[int] = field(default_factory=set)
+    finished_candidates: set[int] = field(default_factory=set)
+    terminal_candidates: set[int] = field(default_factory=set)
     seen_rollouts: set[tuple[int, int]] = field(default_factory=set)
     rollout_request_count: int | None = None
     live_request_ids: set[str] = field(default_factory=set)
@@ -53,8 +56,9 @@ class CISTreeScheduler(Scheduler):
 
     Adaptive-window mode grows a conservative initial window from observed
     engine pressure. Fractional-work mode lends capacity as rollout branches
-    complete. Requests inside admitted steps still use vLLM's native priority
-    scheduler and continuous batching. Both modes are opt-in experiments.
+    complete, while continuation leases preserve cross-step locality. Requests
+    inside admitted steps still use vLLM's native priority scheduler and
+    continuous batching. Every policy in this class is opt-in.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -69,9 +73,14 @@ class CISTreeScheduler(Scheduler):
         self._cis_admission_mode = os.environ.get(
             "VLLM_CIS_ADMISSION_MODE", "adaptive_window"
         )
-        if self._cis_admission_mode not in {"adaptive_window", "fractional_work"}:
+        if self._cis_admission_mode not in {
+            "adaptive_window",
+            "fractional_work",
+            "tail_borrow",
+        }:
             raise ValueError(
-                "VLLM_CIS_ADMISSION_MODE must be adaptive_window or fractional_work"
+                "VLLM_CIS_ADMISSION_MODE must be adaptive_window, fractional_work, "
+                "or tail_borrow"
             )
         configured_window = os.environ.get("VLLM_CIS_INITIAL_WINDOW")
         self._cis_configured_initial_window = (
@@ -82,6 +91,18 @@ class CISTreeScheduler(Scheduler):
             and self._cis_configured_initial_window <= 0
         ):
             raise ValueError("VLLM_CIS_INITIAL_WINDOW must be positive")
+        configured_max_window = os.environ.get("VLLM_CIS_MAX_WINDOW")
+        self._cis_max_window = (
+            None if configured_max_window is None else int(configured_max_window)
+        )
+        if self._cis_max_window is not None and self._cis_max_window <= 0:
+            raise ValueError("VLLM_CIS_MAX_WINDOW must be positive")
+        if (
+            self._cis_configured_initial_window is not None
+            and self._cis_max_window is not None
+            and self._cis_configured_initial_window > self._cis_max_window
+        ):
+            raise ValueError("VLLM_CIS_MAX_WINDOW must not be below the initial window")
         self._cis_target_running_fraction = _float_env(
             "VLLM_CIS_TARGET_RUNNING_FRACTION", 0.50
         )
@@ -103,11 +124,33 @@ class CISTreeScheduler(Scheduler):
         )
         if self._cis_candidate_idle_grace <= 0:
             raise ValueError("VLLM_CIS_CANDIDATE_IDLE_GRACE must be positive")
+        self._cis_tail_borrow_limit = int(
+            os.environ.get("VLLM_CIS_TAIL_BORROW_LIMIT", "2")
+        )
+        if self._cis_tail_borrow_limit < 0:
+            raise ValueError("VLLM_CIS_TAIL_BORROW_LIMIT must not be negative")
         self._cis_last_adjusted = time.monotonic()
         self._cis_preemptions = 0
         self._cis_observed_preemptions = 0
         self._cis_completed_steps = 0
         self._cis_last_growth_completion = 0
+        self._cis_continuation_grace = (
+            float(os.environ.get("VLLM_CIS_CONTINUATION_GRACE_MS", "0"))
+            / 1_000.0
+        )
+        if self._cis_continuation_grace < 0:
+            raise ValueError(
+                "VLLM_CIS_CONTINUATION_GRACE_MS must not be negative"
+            )
+        work_conserving = os.environ.get(
+            "VLLM_CIS_CONTINUATION_WORK_CONSERVING", "0"
+        )
+        if work_conserving not in {"0", "1"}:
+            raise ValueError(
+                "VLLM_CIS_CONTINUATION_WORK_CONSERVING must be 0 or 1"
+            )
+        self._cis_continuation_work_conserving = work_conserving == "1"
+        self._cis_continuation_reservations: dict[str, float] = {}
         trace_path = os.environ.get("VLLM_CIS_SCHEDULER_TRACE")
         self._cis_trace_path = Path(trace_path) if trace_path else None
         if self._cis_trace_path is not None:
@@ -138,7 +181,11 @@ class CISTreeScheduler(Scheduler):
             "wall_time_seconds": time.time(),
             "window": self._cis_window,
             "initial_window": self._cis_initial_window,
+            "max_window": self._cis_max_window,
             "active_steps": len(self._cis_active_steps),
+            "continuation_reservations": len(
+                self._cis_continuation_reservations
+            ),
             "deferred_steps": sum(
                 bool(state.deferred) for state in self._cis_steps.values()
             ),
@@ -150,6 +197,10 @@ class CISTreeScheduler(Scheduler):
             "kv_usage": self.kv_cache_manager.usage,
             "preemptions": self._cis_preemptions,
             "admission_mode": self._cis_admission_mode,
+            "tail_borrow_limit": self._cis_tail_borrow_limit,
+            "continuation_work_conserving": (
+                self._cis_continuation_work_conserving
+            ),
             "normalized_active_load": self._normalized_active_load(),
             **values,
         }
@@ -167,6 +218,7 @@ class CISTreeScheduler(Scheduler):
             raise ValueError("CIS scheduler received an invalid candidate count")
         state = _StepState(
             key=key,
+            job_id=str(metadata["job_id"]),
             order=self._cis_next_order,
             candidate_count=candidate_count,
             rollouts_per_candidate=rollouts,
@@ -181,6 +233,8 @@ class CISTreeScheduler(Scheduler):
                 else max(1, ceil(self.max_num_running_reqs / fanout))
             )
             self._cis_window = self._cis_initial_window
+            if self._cis_max_window is not None:
+                self._cis_window = min(self._cis_window, self._cis_max_window)
             self._trace(
                 "window_initialized",
                 candidate_count=candidate_count,
@@ -235,6 +289,40 @@ class CISTreeScheduler(Scheduler):
             and self.kv_cache_manager.usage < self._cis_kv_low_watermark
         )
 
+    @staticmethod
+    def _remaining_rollouts(state: _StepState) -> int | None:
+        if state.phase != "rollout" or state.rollout_request_count is None:
+            return None
+        finished = len(state.seen_rollouts) - len(state.live_request_ids)
+        return max(0, state.rollout_request_count - finished)
+
+    def _tail_borrow_capacity(self) -> int:
+        """Return conservative extra slots backed by near-complete CIS steps."""
+        assert self._cis_initial_window is not None
+        active = len(self._cis_active_steps)
+        if active < self._cis_initial_window:
+            return self._cis_initial_window - active
+        if (
+            self._cis_tail_borrow_limit == 0
+            or len(self.waiting) + len(self.skipped_waiting) != 0
+            or self.kv_cache_manager.usage >= self._cis_kv_low_watermark
+        ):
+            return 0
+        tail_steps = 0
+        for key in self._cis_active_steps:
+            state = self._cis_steps.get(key)
+            if state is None:
+                continue
+            remaining = self._remaining_rollouts(state)
+            if remaining is not None and remaining <= max(
+                1, state.rollouts_per_candidate
+            ):
+                tail_steps += 1
+        desired = self._cis_initial_window + min(
+            self._cis_tail_borrow_limit, tail_steps
+        )
+        return max(0, desired - active)
+
     def _admit_deferred_steps(self, *, reason: str) -> None:
         assert self._cis_window is not None
         if self._cis_admission_mode == "fractional_work":
@@ -244,8 +332,14 @@ class CISTreeScheduler(Scheduler):
             available = int(
                 self._cis_initial_window - self._normalized_active_load() + 1e-9
             )
+        elif self._cis_admission_mode == "tail_borrow":
+            available = self._tail_borrow_capacity()
         else:
-            available = self._cis_window - len(self._cis_active_steps)
+            available = (
+                self._cis_window
+                - len(self._cis_active_steps)
+                - len(self._cis_continuation_reservations)
+            )
         if available <= 0:
             return
         deferred_states = sorted(
@@ -263,9 +357,102 @@ class CISTreeScheduler(Scheduler):
                 self._normalized_active_load() + 1.0
                 <= self._cis_initial_window + 1e-9
             )
-        return len(self._cis_active_steps) < self._cis_window
+        if self._cis_admission_mode == "tail_borrow":
+            return self._tail_borrow_capacity() > 0
+        return (
+            len(self._cis_active_steps)
+            + len(self._cis_continuation_reservations)
+            < self._cis_window
+        )
+
+    def _claim_continuation(self, state: _StepState) -> bool:
+        reserved_until = self._cis_continuation_reservations.pop(
+            state.job_id, None
+        )
+        if reserved_until is None:
+            return False
+        self._activate(state, reason="job_continuation")
+        self._trace(
+            "continuation_claimed",
+            step_key=state.key,
+            remaining_grace_ms=max(
+                0.0, (reserved_until - time.monotonic()) * 1_000.0
+            ),
+        )
+        return True
+
+    def _reserve_continuation(self, state: _StepState) -> bool:
+        if (
+            self._cis_continuation_grace <= 0
+            or state.rollouts_per_candidate == 0
+            or state.rollout_request_count == 0
+        ):
+            return False
+        reserved_until = time.monotonic() + self._cis_continuation_grace
+        self._cis_continuation_reservations[state.job_id] = reserved_until
+        self._trace(
+            "continuation_reserved",
+            step_key=state.key,
+            grace_ms=self._cis_continuation_grace * 1_000.0,
+        )
+        return True
+
+    def _expire_continuation_reservations(self) -> None:
+        if not self._cis_continuation_reservations:
+            return
+        now = time.monotonic()
+        expired = sorted(
+            job_id
+            for job_id, reserved_until in self._cis_continuation_reservations.items()
+            if reserved_until <= now
+        )
+        for job_id in expired:
+            del self._cis_continuation_reservations[job_id]
+        if expired:
+            self._trace("continuation_expired", expired_jobs=expired)
+            self._admit_deferred_steps(reason="continuation_expired")
+
+    def _release_continuations_for_underfill(self) -> None:
+        if (
+            not self._cis_continuation_work_conserving
+            or not self._cis_continuation_reservations
+        ):
+            return
+        deferred_states = [
+            state for state in self._cis_steps.values() if state.deferred
+        ]
+        if not deferred_states:
+            return
+        engine_work = (
+            len(self.running) + len(self.waiting) + len(self.skipped_waiting)
+        )
+        target = ceil(
+            self.max_num_running_reqs * self._cis_target_running_fraction
+        )
+        deficit = target - engine_work
+        if deficit <= 0:
+            return
+        candidate_width = max(
+            1, min(state.candidate_count for state in deferred_states)
+        )
+        release_count = min(
+            len(self._cis_continuation_reservations),
+            len(deferred_states),
+            ceil(deficit / candidate_width),
+        )
+        released_jobs = list(self._cis_continuation_reservations)[:release_count]
+        for job_id in released_jobs:
+            del self._cis_continuation_reservations[job_id]
+        self._trace(
+            "continuation_released_for_underfill",
+            released_jobs=released_jobs,
+            engine_work=engine_work,
+            target_running_requests=target,
+        )
+        self._admit_deferred_steps(reason="continuation_underfill")
 
     def add_request(self, request: Request) -> None:
+        self._expire_continuation_reservations()
         metadata = self._metadata(request)
         if metadata is None:
             super().add_request(request)
@@ -298,12 +485,18 @@ class CISTreeScheduler(Scheduler):
             if not state.active:
                 self._activate(state, reason="rollout_ready")
             super().add_request(request)
+            if self._cis_admission_mode == "tail_borrow":
+                self._admit_deferred_steps(reason="rollout_tail")
             return
         if node_type != "candidate":
             raise ValueError(f"unknown CIS node type: {node_type}")
         state.seen_candidates.add(candidate_index)
         assert self._cis_window is not None
-        if state.active or self._can_activate_step():
+        if (
+            state.active
+            or self._claim_continuation(state)
+            or self._can_activate_step()
+        ):
             self._activate(state, reason="within_window")
             super().add_request(request)
         else:
@@ -318,8 +511,8 @@ class CISTreeScheduler(Scheduler):
             (
                 (state.phase == "rollout" and rollout_batch_complete)
                 or (
-                    state.rollouts_per_candidate == 0
-                    and len(state.seen_candidates) == state.candidate_count
+                    len(state.finished_candidates) == state.candidate_count
+                    and state.rollout_request_count == 0
                 )
             )
             and not state.live_request_ids
@@ -330,6 +523,7 @@ class CISTreeScheduler(Scheduler):
         self, request: Request, delay_free_blocks: bool = False
     ) -> dict[str, Any] | None:
         metadata = self._metadata(request)
+        finished_status = request.status
         result = super()._free_request(request, delay_free_blocks=delay_free_blocks)
         if metadata is None:
             return result
@@ -339,20 +533,32 @@ class CISTreeScheduler(Scheduler):
             return result
         state.live_request_ids.discard(request.request_id)
         state.deferred.pop(request.request_id, None)
-        if (
-            state.phase == "candidate"
-            and state.rollouts_per_candidate > 0
-            and not state.live_request_ids
-            and not state.deferred
-        ):
-            state.idle_since = time.monotonic()
+        if str(metadata["node_type"]) == "candidate":
+            candidate_index = int(metadata["candidate_index"])
+            state.finished_candidates.add(candidate_index)
+            if finished_status != RequestStatus.FINISHED_LENGTH_CAPPED:
+                state.terminal_candidates.add(candidate_index)
+            if len(state.finished_candidates) == state.candidate_count:
+                nonterminal_candidates = (
+                    state.candidate_count - len(state.terminal_candidates)
+                )
+                state.rollout_request_count = (
+                    nonterminal_candidates * state.rollouts_per_candidate
+                )
+                self._trace(
+                    "candidate_phase_closed",
+                    step_key=key,
+                    terminal_candidates=len(state.terminal_candidates),
+                    expected_rollout_requests=state.rollout_request_count,
+                )
         if self._step_finished(state):
             self._cis_active_steps.discard(key)
             del self._cis_steps[key]
             self._cis_completed_steps += 1
             self._trace("step_completed", step_key=key)
-            self._admit_deferred_steps(reason="step_completed")
-        elif self._cis_admission_mode == "fractional_work":
+            if not self._reserve_continuation(state):
+                self._admit_deferred_steps(reason="step_completed")
+        elif self._cis_admission_mode in {"fractional_work", "tail_borrow"}:
             self._admit_deferred_steps(reason="rollout_capacity_released")
         return result
 
@@ -383,7 +589,7 @@ class CISTreeScheduler(Scheduler):
     def _adjust_window(self) -> None:
         if self._cis_window is None or self._cis_initial_window is None:
             return
-        if self._cis_admission_mode == "fractional_work":
+        if self._cis_admission_mode in {"fractional_work", "tail_borrow"}:
             return
         now = time.monotonic()
         if now - self._cis_last_adjusted < self._cis_adjust_interval:
@@ -412,6 +618,8 @@ class CISTreeScheduler(Scheduler):
                 and kv_usage < self._cis_kv_low_watermark
             ):
                 self._cis_window += 1
+                if self._cis_max_window is not None:
+                    self._cis_window = min(self._cis_window, self._cis_max_window)
                 self._cis_last_growth_completion = self._cis_completed_steps
                 reason = "underfilled"
         if self._cis_window != old_window:
@@ -425,7 +633,9 @@ class CISTreeScheduler(Scheduler):
                 self._admit_deferred_steps(reason="window_grew")
 
     def schedule(self):
+        self._expire_continuation_reservations()
         self._expire_idle_candidate_steps()
+        self._release_continuations_for_underfill()
         output = super().schedule()
         self._adjust_window()
         return output

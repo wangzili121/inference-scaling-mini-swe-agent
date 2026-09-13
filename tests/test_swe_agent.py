@@ -155,6 +155,18 @@ def test_runner_executes_one_complete_cis_job_and_records_trace(tmp_path: Path) 
     assert len(record["conditional_steps"][0]["candidates"]) == 2
 
 
+def test_runner_can_disable_eos_for_fixed_work_performance_runs(
+    tmp_path: Path,
+) -> None:
+    backend = _AgentBackend()
+    config = _runner_config(tmp_path / "trace.jsonl")
+    config["generation"]["ignore_eos"] = True
+
+    runner = ConditionalISRunner(backend, config)
+
+    assert runner.sampling.eos_token_id is None
+
+
 def test_runner_coalesces_retry_equivalent_request_ids(tmp_path: Path) -> None:
     trace = tmp_path / "calls.jsonl"
     backend = _AgentBackend()

@@ -1,0 +1,163 @@
+{
+  "schema_version": 1,
+  "created_at": "2026-09-14",
+  "fixed_conditions": {
+    "model": "Qwen3-Coder-30B-A3B-Instruct",
+    "runtime": "vLLM-Ascend v0.18 MRV1",
+    "topology": "TP2 single instance",
+    "devices": [1, 4],
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 32768,
+    "gpu_memory_utilization": 0.9,
+    "workers": 32
+  },
+  "p1_fixed_work": {
+    "algorithm": {"candidate_count": 8, "rollout_count": 3, "block_size": 128, "total_length": 512},
+    "jobs": 32,
+    "engine_requests": 3328,
+    "generated_tokens": 720896,
+    "runs": {
+      "static_step_cap16": {
+        "path": "/data/disk/wangzili/cis-predictive-scheduler-20260913/fixed-work/p1-static16-v2",
+        "benchmark_sha256": "cbca636123bbe0a8d122d327802e5b3a633b7e49bb6ad9b82b8dc187bf126fd8",
+        "wall_seconds": 609.4297942137346,
+        "jobs_per_second": 0.05250809905230397,
+        "job_mean_seconds": 420.56260536237096,
+        "job_p95_seconds": 609.3970167636405,
+        "forward_token_slots_per_second": 2206.6659896978376,
+        "prefill_tokens": 627240,
+        "maximum_in_flight_requests": 288,
+        "preemptions": 0
+      },
+      "job_fifo_cap16": {
+        "path": "/data/disk/wangzili/cis-predictive-scheduler-20260913/fixed-work/p1-job-gang16-v1",
+        "benchmark_sha256": "db3850784cac13ede441f9e98d97b82c414d78e1c13dd86986d691387f97350e",
+        "wall_seconds": 610.7807643190026,
+        "jobs_per_second": 0.05239195775210568,
+        "job_mean_seconds": 410.78463957486383,
+        "job_p95_seconds": 606.5250143741723,
+        "forward_token_slots_per_second": 2201.785122521679,
+        "prefill_tokens": 627240,
+        "maximum_in_flight_requests": 288,
+        "preemptions": 0
+      },
+      "enginecore_no_continuation": {
+        "path": "/data/disk/wangzili/cis-predictive-scheduler-20260913/fixed-work/p1-engine16-v1",
+        "benchmark_sha256": "1b7d24364a27b27022eadf229842650c4e2aed8cf042b888833c04a83faab4ff",
+        "scheduler_trace_sha256": "fe08d347ec9df13be75d5f3c7cc16a1a44215583e96521f46f59306f598ad616",
+        "wall_seconds": 678.9440227937885,
+        "jobs_per_second": 0.047132015196662484,
+        "job_mean_seconds": 648.7157122540375,
+        "job_p95_seconds": 675.9297412473709,
+        "forward_token_slots_per_second": 3543.443817504082,
+        "prefill_tokens": 1688232,
+        "maximum_in_flight_requests": 416,
+        "preemptions": 0
+      },
+      "continuation_1000ms": {
+        "path": "/data/disk/wangzili/cis-predictive-scheduler-20260913/fixed-work/p1-continuation16-grace1000-v1",
+        "benchmark_sha256": "630f0118b21a7b29a8e38588c200b46196cf31f833d383f736f5556d9be47f58",
+        "scheduler_trace_sha256": "c6e05b0d46b7aba98e04ddb9cddab67eb4aaf0fd9b8acb2940d1b33181b6fedb",
+        "wall_seconds": 598.9811232108623,
+        "jobs_per_second": 0.05342405421470166,
+        "job_mean_seconds": 430.41899043504964,
+        "job_p95_seconds": 598.9479909401387,
+        "forward_token_slots_per_second": 2319.311821636397,
+        "prefill_tokens": 671656,
+        "maximum_in_flight_requests": 416,
+        "preemptions": 0
+      },
+      "continuation_1500ms": {
+        "path": "/data/disk/wangzili/cis-predictive-scheduler-20260913/fixed-work/p1-continuation16-grace1500-v1",
+        "benchmark_sha256": "4465b2f98a2d318abe5ec01e1ea46edced7b06ced186d4189de7a012f8105473",
+        "scheduler_trace_sha256": "28a555ce77d62658c81c36fa7451ac701b9c33383dcb3ba90ed4b533c10714e9",
+        "wall_seconds": 607.1437672530301,
+        "jobs_per_second": 0.05270580334667892,
+        "job_mean_seconds": 418.87257677789603,
+        "job_p95_seconds": 604.0987509975444,
+        "forward_token_slots_per_second": 2221.93172813678,
+        "prefill_tokens": 631464,
+        "maximum_in_flight_requests": 416,
+        "preemptions": 0
+      },
+      "work_conserving_release": {
+        "path": "/data/disk/wangzili/cis-predictive-scheduler-20260913/fixed-work/p1-work-conserving16-v1",
+        "benchmark_sha256": "72bcc4fa736fb31e467f8e953fca00decd6e31fe93671c72234251eb5f1f7dbc",
+        "scheduler_trace_sha256": "bdac2612e49812b23bcac0dc9a30da72c71140e3a59d9bb8c82b473f8c01006d",
+        "wall_seconds": 614.2123762271367,
+        "jobs_per_second": 0.05209924325615729,
+        "job_mean_seconds": 468.5004045780224,
+        "job_p95_seconds": 609.5769128855784,
+        "forward_token_slots_per_second": 2319.940227764242,
+        "prefill_tokens": 707368,
+        "maximum_in_flight_requests": 416,
+        "preemptions": 0,
+        "continuation_reserved": 96,
+        "continuation_claimed": 92,
+        "continuation_released_for_underfill": 4,
+        "continuation_expired": 0
+      },
+      "continuation_5000ms": {
+        "path": "/data/disk/wangzili/cis-predictive-scheduler-20260913/fixed-work/p1-continuation16-grace5000-v1",
+        "benchmark_sha256": "9e1ea9b8e8b81abd7285eb6ec38a784ca7091eb6b4a568d33735e9f90c21f5dd",
+        "scheduler_trace_sha256": "44a1ac689ade5e6d750664d1547f3943c405441efa7c24ff905a4e3cbe1a5f3e",
+        "wall_seconds": 604.9951732079498,
+        "jobs_per_second": 0.05289298397261909,
+        "job_mean_seconds": 400.9278715711407,
+        "job_p95_seconds": 600.6420486831106,
+        "forward_token_slots_per_second": 2222.8408746953105,
+        "prefill_tokens": 627240,
+        "maximum_in_flight_requests": 416,
+        "preemptions": 0,
+        "continuation_reserved": 96,
+        "continuation_claimed": 96,
+        "continuation_expired": 0
+      }
+    }
+  },
+  "p0_real_eos": {
+    "algorithm": {"candidate_count": 15, "rollout_count": 3, "block_size": 128, "total_length": 512},
+    "jobs": 64,
+    "runs": {
+      "static_step_cap16": {
+        "path": "/data/disk/wangzili/cis-dynamic-scheduler-20260913/full/p0-cap16",
+        "benchmark_sha256": "4df8851dcbcd503661aa1af050bb18b21f87b753dfb44c08b4fbc4dbddd33238",
+        "jobs_per_second": 0.19442637859455902,
+        "generated_tokens_per_second": 630.7343617215771,
+        "forward_token_slots_per_second": 3382.4478600582056,
+        "job_mean_seconds": 134.7356570222546,
+        "job_p95_seconds": 233.96512549794278,
+        "barrier_p95_seconds": 112.83434207763671,
+        "preemptions": 0
+      },
+      "enginecore_no_continuation": {
+        "path": "/data/disk/wangzili/cis-predictive-scheduler-20260913/full/p0-engine16-v1",
+        "benchmark_sha256": "e9f66356a395830fb0ec9652802f835b3a404eef8b0cd99be6fe114b6ca95e6f",
+        "scheduler_trace_sha256": "27d340b6b46d28a6e0c1f3dbcb776174c18c0dde5dc7429dafd6241b00c4f640",
+        "jobs_per_second": 0.1717919486617869,
+        "generated_tokens_per_second": 635.2973631480794,
+        "forward_token_slots_per_second": 3124.525119768602,
+        "job_mean_seconds": 140.36764293345186,
+        "job_p95_seconds": 249.88185395272447,
+        "barrier_p95_seconds": 123.98880915527343,
+        "preemptions": 0
+      },
+      "continuation_5000ms": {
+        "path": "/data/disk/wangzili/cis-predictive-scheduler-20260913/full/p0-continuation16-grace5000-v1",
+        "benchmark_sha256": "1151f642b30df44911e9c145f3e9a72ee3448633a1f784c5116b78edb226b867",
+        "scheduler_trace_sha256": "573b0ac29709437f41539b40dbde73c3539e3f45987d1e74588c05c47fdf8bad",
+        "jobs_per_second": 0.16487922470578664,
+        "generated_tokens_per_second": 611.8513454558581,
+        "forward_token_slots_per_second": 2968.5139002197293,
+        "job_mean_seconds": 142.94245829529245,
+        "job_p95_seconds": 241.12797872687213,
+        "barrier_p95_seconds": 100.69171064453124,
+        "preemptions": 0,
+        "continuation_reserved": 53,
+        "continuation_claimed": 11,
+        "continuation_expired": 42
+      }
+    }
+  },
+  "decision": "Keep static CIS step priority/cap as the production baseline; retain predictive continuation variants for research only."
+}
