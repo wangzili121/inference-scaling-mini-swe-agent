@@ -16,6 +16,50 @@ from inference_scaling.shared.types import TokenSequence
 
 
 @dataclass(frozen=True, slots=True)
+class CISRequestMetadata:
+    """Structured Conditional-IS dependency metadata for runtime policies."""
+
+    job_id: str
+    step_index: int
+    node_type: str
+    candidate_index: int
+    candidate_count: int
+    rollout_index: int | None = None
+    expected_rollouts: int = 0
+    step_rollout_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.job_id:
+            raise ValueError("CIS job_id cannot be empty")
+        if self.step_index < 0:
+            raise ValueError("CIS step_index must be non-negative")
+        if self.node_type not in {"candidate", "rollout"}:
+            raise ValueError("CIS node_type must be candidate or rollout")
+        if self.candidate_index < 0:
+            raise ValueError("CIS candidate_index must be non-negative")
+        if self.candidate_count <= 0:
+            raise ValueError("CIS candidate_count must be positive")
+        if self.candidate_index >= self.candidate_count:
+            raise ValueError("CIS candidate_index must be below candidate_count")
+        if self.expected_rollouts < 0:
+            raise ValueError("CIS expected_rollouts must be non-negative")
+        if self.step_rollout_count is not None and self.step_rollout_count < 0:
+            raise ValueError("CIS step_rollout_count must be non-negative")
+        if self.node_type == "candidate" and self.rollout_index is not None:
+            raise ValueError("a CIS candidate cannot have a rollout_index")
+        if self.node_type == "rollout" and (
+            self.rollout_index is None or self.rollout_index < 0
+        ):
+            raise ValueError("a CIS rollout requires a non-negative rollout_index")
+        if self.node_type == "candidate" and self.step_rollout_count is not None:
+            raise ValueError("a CIS candidate cannot declare step_rollout_count")
+
+    @property
+    def step_key(self) -> str:
+        return f"{self.job_id}:step:{self.step_index}"
+
+
+@dataclass(frozen=True, slots=True)
 class GenerationRequest:
     prefix: TokenSequence
     max_new_tokens: int
@@ -40,6 +84,7 @@ class GenerationRequest:
     forest_group_id: str | None = None
     forest_branch_index: int | None = None
     forest_group_size: int | None = None
+    cis: CISRequestMetadata | None = None
 
     def __post_init__(self) -> None:
         if self.max_new_tokens <= 0:

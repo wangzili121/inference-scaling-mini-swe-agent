@@ -14,7 +14,11 @@ from inference_scaling.arllm.algorithms.mh import run_mh_chain
 from inference_scaling.arllm.backends import AsyncVLLMBackend, VLLMBackend
 from inference_scaling.arllm.backends.vllm_backend import _load_vllm_sampling_api
 from inference_scaling.arllm.config import MHConfig, SamplingConfig
-from inference_scaling.arllm.types import GenerationRequest, ScoreRequest
+from inference_scaling.arllm.types import (
+    CISRequestMetadata,
+    GenerationRequest,
+    ScoreRequest,
+)
 from inference_scaling.shared.rng import SeedStream
 
 
@@ -1130,5 +1134,80 @@ def test_async_vllm_assigns_step_and_rollout_priorities() -> None:
         assert backend._request_priority(first) == 0
         assert backend._request_priority(child) == -1_000_000
         assert backend._request_priority(later) == 1
+    finally:
+        backend.close()
+
+
+def test_async_vllm_groups_steps_into_work_conserving_priority_cohorts() -> None:
+    backend = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        request_priority_policy="step_cohort",
+        request_priority_cohort_size=2,
+    )
+    try:
+        requests = [
+            GenerationRequest(
+                (1,),
+                1,
+                SamplingConfig(),
+                index,
+                f"job-{index}:step:0:candidate:0",
+            )
+            for index in range(5)
+        ]
+        assert [backend._request_priority(request) for request in requests] == [
+            0,
+            0,
+            1,
+            1,
+            2,
+        ]
+    finally:
+        backend.close()
+
+
+def test_async_vllm_priority_prefers_structured_cis_metadata() -> None:
+    backend = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        request_priority_policy="step_fifo",
+    )
+    try:
+        request = GenerationRequest(
+            (1,),
+            1,
+            SamplingConfig(),
+            1,
+            "opaque-request-id",
+            cis=CISRequestMetadata(
+                job_id="job-a",
+                step_index=3,
+                node_type="candidate",
+                candidate_index=0,
+                candidate_count=1,
+                expected_rollouts=3,
+            ),
+        )
+        assert backend._request_priority(request) == 0
+        assert backend._step_priorities == {"job-a:step:3": 0}
+        assert backend._sampling_params(request).extra_args == {
+            "cis_request": {
+                "job_id": "job-a",
+                "step_index": 3,
+                "node_type": "candidate",
+                "candidate_index": 0,
+                "candidate_count": 1,
+                "rollout_index": None,
+                "expected_rollouts": 3,
+                "step_rollout_count": None,
+            }
+        }
     finally:
         backend.close()

@@ -1408,6 +1408,7 @@ class AsyncVLLMBackend(VLLMBackend):
         speculation: ActiveBatchSpeculationConfig | None = None,
         native_suffix_speculation: bool = False,
         request_priority_policy: str = "none",
+        request_priority_cohort_size: int = 1,
         native_parallel_sampling: bool = False,
         native_packed_forest_attention: bool = False,
         native_segmented_rng: bool = False,
@@ -1442,9 +1443,24 @@ class AsyncVLLMBackend(VLLMBackend):
             native_suffix_speculation=native_suffix_speculation,
         )
         self._request_trace_observer: Callable[[Mapping[str, Any]], None] | None = None
-        if request_priority_policy not in {"none", "step_fifo", "rollout_first"}:
+        if request_priority_policy not in {
+            "none",
+            "step_fifo",
+            "step_cohort",
+            "rollout_first",
+        }:
             raise ValueError("unknown CIS request priority policy")
+        if request_priority_cohort_size <= 0:
+            raise ValueError("request priority cohort size must be positive")
+        if (
+            request_priority_policy != "step_cohort"
+            and request_priority_cohort_size != 1
+        ):
+            raise ValueError(
+                "request priority cohort size requires step_cohort policy"
+            )
         self._request_priority_policy = request_priority_policy
+        self._request_priority_cohort_size = int(request_priority_cohort_size)
         self._native_parallel_sampling = bool(native_parallel_sampling)
         self._native_packed_forest_attention = bool(
             native_packed_forest_attention
@@ -1514,13 +1530,36 @@ class AsyncVLLMBackend(VLLMBackend):
         if observer is not None:
             observer(event)
 
+    @staticmethod
+    def _cis_trace_fields(request: GenerationRequest | None) -> dict[str, Any]:
+        metadata = None if request is None else request.cis
+        if metadata is None:
+            return {}
+        return {
+            "cis_job_id": metadata.job_id,
+            "cis_step_index": metadata.step_index,
+            "cis_node_type": metadata.node_type,
+            "cis_candidate_index": metadata.candidate_index,
+            "cis_candidate_count": metadata.candidate_count,
+            "cis_rollout_index": metadata.rollout_index,
+            "cis_expected_rollouts": metadata.expected_rollouts,
+            "cis_step_rollout_count": metadata.step_rollout_count,
+        }
+
     def _request_priority(self, request: GenerationRequest | None) -> int:
         if request is None or self._request_priority_policy == "none":
             return 0
-        match = _CIS_STEP_REQUEST.match(request.request_id)
-        if match is None:
+        metadata = request.cis
+        match = None if metadata is not None else _CIS_STEP_REQUEST.match(
+            request.request_id
+        )
+        if metadata is None and match is None:
             return 0
-        step_key = f"{match.group('job')}:step:{match.group('step')}"
+        step_key = (
+            metadata.step_key
+            if metadata is not None
+            else f"{match.group('job')}:step:{match.group('step')}"
+        )
         with self._step_priority_lock:
             priority = self._step_priorities.get(step_key)
             if priority is None:
@@ -1528,9 +1567,15 @@ class AsyncVLLMBackend(VLLMBackend):
                 self._step_priorities[step_key] = priority
         if (
             self._request_priority_policy == "rollout_first"
-            and match.group("rollout") is not None
+            and (
+                metadata.node_type == "rollout"
+                if metadata is not None
+                else match.group("rollout") is not None
+            )
         ):
             return priority - 1_000_000
+        if self._request_priority_policy == "step_cohort":
+            return priority // self._request_priority_cohort_size
         return priority
 
     @classmethod
@@ -1563,6 +1608,7 @@ class AsyncVLLMBackend(VLLMBackend):
         dynamic_speculation: bool = False,
         engine_kwargs: dict[str, Any] | None = None,
         request_priority_policy: str = "none",
+        request_priority_cohort_size: int = 1,
         native_parallel_sampling: bool = False,
         native_packed_forest_attention: bool = False,
         native_segmented_rng: bool = False,
@@ -1764,6 +1810,7 @@ class AsyncVLLMBackend(VLLMBackend):
             speculation=speculation,
             native_suffix_speculation=speculation is not None,
             request_priority_policy=request_priority_policy,
+            request_priority_cohort_size=request_priority_cohort_size,
             native_parallel_sampling=native_parallel_sampling,
             native_packed_forest_attention=native_packed_forest_attention,
             native_segmented_rng=native_segmented_rng,
@@ -1779,6 +1826,20 @@ class AsyncVLLMBackend(VLLMBackend):
 
     def _sampling_params(self, request: GenerationRequest) -> Any:
         params = super()._sampling_params(request)
+        if request.cis is not None:
+            metadata = request.cis
+            extra_args = dict(getattr(params, "extra_args", None) or {})
+            extra_args["cis_request"] = {
+                "job_id": metadata.job_id,
+                "step_index": metadata.step_index,
+                "node_type": metadata.node_type,
+                "candidate_index": metadata.candidate_index,
+                "candidate_count": metadata.candidate_count,
+                "rollout_index": metadata.rollout_index,
+                "expected_rollouts": metadata.expected_rollouts,
+                "step_rollout_count": metadata.step_rollout_count,
+            }
+            params.extra_args = extra_args
         if request.rng_switch_after_tokens is not None:
             assert request.rng_switch_seed is not None
             if not self._native_segmented_rng:
@@ -1986,6 +2047,7 @@ class AsyncVLLMBackend(VLLMBackend):
                     "max_new_tokens": request.max_new_tokens,
                     "seed": request.seed,
                     "priority": priority,
+                    **self._cis_trace_fields(request),
                 }
             )
 
@@ -2154,6 +2216,7 @@ class AsyncVLLMBackend(VLLMBackend):
             "max_new_tokens": None if request is None else request.max_new_tokens,
             "seed": None if request is None else request.seed,
             "priority": priority,
+            **self._cis_trace_fields(request),
         }
         self._observe_request(
             {

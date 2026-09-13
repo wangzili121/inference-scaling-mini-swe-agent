@@ -1014,3 +1014,87 @@ docs/experiments/CIS_STEP_ADMISSION_PRIORITY_ABLATION_20260913.zh-CN.md
 下一步不应再重复固定 cap sweep。针对调度的最小后续是用统一 trace 解释 D 的吞吐
 提升与 preemption 上升，以及 E 的 barrier 收益和设备利用率损失；更高技术含量的
 主线仍是能进入 FULL graph 的 CANN Forest Attention。
+
+## 19. 2026-09-13 Dynamic Tree Scheduler 实验已完成
+
+当前本地分支为 `cis-dynamic-scheduler`。本轮先新增结构化 `CISRequestMetadata`，将
+job、step、candidate、rollout、C/R 和准确的 step rollout 总数传入 vLLM
+`SamplingParams.extra_args`；`step_fifo` 优先读取结构化元数据，旧 request-ID regex
+只作为兼容 fallback。实验源码入口：
+
+```text
+src/inference_scaling/arllm/backends/cis_scheduler.py
+experiments/swebench/run_cis_forest_ab_remote.sh
+```
+
+完成三类策略：
+
+1. `step_cohort`：相邻 N 个 step 共用 priority，不 hard cap；
+2. `step-tree-adaptive`：EngineCore 保留 deferred tree，依据 running/KV/preemption
+   将窗口从保守起点逐步扩张；
+3. `step-tree-fractional`：按剩余 rollout 分支比例归还 step budget，并测试普通
+   queue/KV 安全门控。
+
+固定 P0、TP2、MNS256、MBT32768、memory0.90、64 requests/workers32 的核心结果：
+
+| 策略 | jobs/s | generated tok/s | FTS/s | Job P95 | Barrier P95 | preempt |
+|---|---:|---:|---:|---:|---:|---:|
+| flat 两轮均值 | 0.1539 | 552.7 | 3904 | 327.6 s | 173.0 s | 0.5 |
+| priority 两轮均值 | 0.1824 | 602.9 | 3428 | 276.1 s | 153.6 s | 10 |
+| fixed cap6 | 0.1667 | 553.4 | 2901 | 230.4 s | 46.4 s | 0 |
+| fixed cap16 | 0.1944 | **630.7** | 3382 | 234.0 s | 112.8 s | 0 |
+| EngineCore adaptive 6->16 | **0.1988** | 612.1 | **3432** | **227.0 s** | **94.9 s** | 0 |
+| fractional cap16 | 0.1884 | 611.9 | 3493 | 294.3 s | 150.2 s | 2 |
+| fractional + safe gate | 0.1793 | 595.1 | 3367 | 287.0 s | 153.0 s | 0 |
+
+解释边界：adaptive 相对 fixed cap16 只有 jobs/s `+2.2%`、FTS/s `+1.5%`、Job P95
+`-3.0%`，generated-token/s `-3.0%`；较明确的增量是 Barrier P95 `-15.9%`。
+因此它是弱 Pareto 点，不足以证明当前动态规则有明显产品价值。fractional 两版均使
+Job/Barrier tail 明显恶化；无门控版 KV 99.27%并有 2 次 preemption，安全门控版
+虽零 preemption，KV 仍达 97.66%，说明当前 KV 水位无法预测新 tree 后续增量。
+
+P1 `C8/R3`：Cohort11 无收益；EngineCore adaptive 11->22 为 0.2583 jobs/s、
+FTS4058、Job P95 183.3s、Barrier P95 88.1s、零 preemption，优于 flat 但不如已测
+fixed cap16 的 0.2752 jobs/s、FTS4150、Job P95 173.2s、Barrier P95 75.4s。
+P2 在 workers32 下自动窗口/cohort 均为 32，策略退化为已有 priority，未重复占卡。
+
+另一个语义缺口：P0/P1 中分别有 22/31 个 all-terminal candidate step 不产生 rollout。
+当前 scheduler 用 5 秒 idle grace 回收；trace 证实本轮所有 expired step 后续均未
+出现 rollout，但正式版本应由算法显式发 `step_closed` 或使用准确 finish reason，
+不能依赖超时。
+
+准确结论：
+
+- vLLM priority 是现成原语；CIS 元数据、step 映射和 EngineCore tree admission 是
+  本仓库新增，不是漏开的框架选项。
+- 固定 cap16 能复现 dynamic 的大部分 P0 收益；不要把当前实现描述成成熟的新
+  scheduler。
+- Host 侧 cohort、瞬时 running/KV 窗口、按分支归还预算都已得到反例，不继续调
+  水位或堆规则。
+- 当前可用基线仍是 P0 fixed cap16、P1 fixed cap16、P2 elastic；实验 scheduler
+  只保留在 variant 中，不默认启用。
+- 若重启动态调度研究，前置条件是显式 tree lifecycle、可校准的增量 KV/remaining
+  token 模型，并用同 workload 证明超过 fixed cap16。
+
+完整报告与派生数据：
+
+```text
+docs/experiments/CIS_WORK_CONSERVING_COHORT_SCHEDULER_20260913.zh-CN.md
+docs/experiments/CIS_DYNAMIC_TREE_ADMISSION_20260913.zh-CN.md
+docs/experiments/data/cis_dynamic_tree_admission_20260913.json
+```
+
+派生数据 SHA256：
+
+```text
+f9278b1cf1c84a37226b753736961f711be8342e04e1938934c735982c58543e
+```
+
+原始数据根目录：
+
+```text
+/data/disk/wangzili/cis-dynamic-scheduler-20260913
+```
+
+服务器 `159.138.5.111` 的实验均只使用启动前空闲的物理 NPU 1/4；结束后容器已退出，
+卡已释放。第二台服务器检查时只有单张 7 号卡空闲，未占用。

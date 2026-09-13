@@ -80,6 +80,29 @@ def test_loader_builds_one_active_batch_schedule_for_both_backends(monkeypatch) 
     assert vllm_calls[0][1]["dynamic_speculation"] is False
     assert vllm_calls[0][1]["request_priority_policy"] == "rollout_first"
 
+    config["vllm"] = {
+        "request_priority_policy": "step_cohort",
+        "request_priority_cohort_size": 6,
+    }
+    assert loader.load_backend_from_config("base-model", config) == "vllm"
+    assert vllm_calls[-1][1]["request_priority_policy"] == "step_cohort"
+    assert vllm_calls[-1][1]["request_priority_cohort_size"] == 6
+
+    config["conditional_is"] = {"candidate_count": 15, "rollout_count": 3}
+    config["vllm"] = {
+        "max_num_seqs": 256,
+        "request_priority_policy": "step_cohort",
+        "request_priority_cohort_size": "auto",
+    }
+    assert loader.load_backend_from_config("base-model", config) == "vllm"
+    assert vllm_calls[-1][1]["request_priority_cohort_size"] == 6
+
+    config["vllm"] = {"scheduler_cls": "example.CustomScheduler"}
+    assert loader.load_backend_from_config("base-model", config) == "vllm"
+    assert vllm_calls[-1][1]["engine_kwargs"]["scheduler_cls"] == (
+        "example.CustomScheduler"
+    )
+
 
 def test_vllm_dynamic_speculation_is_opt_in() -> None:
     config = _config("vllm")

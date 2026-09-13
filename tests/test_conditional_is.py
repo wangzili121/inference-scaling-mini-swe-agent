@@ -397,9 +397,18 @@ def test_conditional_is_exposes_candidate_rollout_fork_edges() -> None:
 
     candidates, rollouts = backend.batches
     assert all(request.fork_expected_children == 2 for request in candidates)
+    assert all(request.cis is not None for request in candidates)
+    assert all(request.cis.node_type == "candidate" for request in candidates)
+    assert all(request.cis.candidate_count == 3 for request in candidates)
+    assert all(request.cis.expected_rollouts == 2 for request in candidates)
     candidate_ids = {request.request_id for request in candidates}
     assert all(request.fork_parent_request_id in candidate_ids for request in rollouts)
     assert all(request.fork_expected_children == 0 for request in rollouts)
+    assert all(request.cis is not None for request in rollouts)
+    assert all(request.cis.node_type == "rollout" for request in rollouts)
+    assert all(request.cis.candidate_count == 3 for request in rollouts)
+    assert {request.cis.rollout_index for request in rollouts} == {0, 1}
+    assert all(request.cis.step_rollout_count == 6 for request in rollouts)
 
 
 def test_rollout_submission_batch_size_must_be_positive() -> None:

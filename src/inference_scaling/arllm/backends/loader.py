@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from math import ceil
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +49,9 @@ _VLLM_SETTINGS = {
     "pipeline_parallel_size",
     "quantization",
     "request_priority_policy",
+    "request_priority_cohort_size",
     "revision",
+    "scheduler_cls",
     "seed",
     "tensor_parallel_size",
     "trust_remote_code",
@@ -268,6 +271,13 @@ def load_backend_from_config(
         settings.pop("engine_kwargs", None),
         name="vllm.engine_kwargs",
     )
+    scheduler_cls = str(settings.pop("scheduler_cls", "")).strip()
+    if scheduler_cls:
+        if "scheduler_cls" in engine_kwargs:
+            raise ValueError(
+                "vLLM scheduler_cls cannot be set both directly and in engine_kwargs"
+            )
+        engine_kwargs["scheduler_cls"] = scheduler_cls
     collisions = sorted(_EXPLICIT_ENGINE_SETTINGS.intersection(engine_kwargs))
     if collisions:
         raise ValueError(
@@ -283,10 +293,31 @@ def load_backend_from_config(
     loader = AsyncVLLMBackend if asynchronous else VLLMBackend
     acceleration_kwargs: dict[str, Any] = {}
     request_priority_policy = str(settings.pop("request_priority_policy", "none"))
+    cohort_size_setting = settings.pop("request_priority_cohort_size", 1)
+    if cohort_size_setting == "auto":
+        conditional = _mapping(
+            config.get("conditional_is"), name="conditional_is"
+        )
+        candidate_count = int(conditional["candidate_count"])
+        rollout_count = int(conditional["rollout_count"])
+        if candidate_count <= 0 or rollout_count <= 0:
+            raise ValueError(
+                "automatic step cohort sizing requires positive C and R"
+            )
+        max_num_seqs = int(settings.get("max_num_seqs", 256))
+        request_priority_cohort_size = max(
+            1,
+            ceil(max_num_seqs / (candidate_count * rollout_count)),
+        )
+    else:
+        request_priority_cohort_size = int(cohort_size_setting)
     if request_priority_policy != "none":
         if not asynchronous:
             raise ValueError("request_priority_policy requires runtime.backend='vllm'")
         acceleration_kwargs["request_priority_policy"] = request_priority_policy
+        acceleration_kwargs["request_priority_cohort_size"] = (
+            request_priority_cohort_size
+        )
     native_parallel_sampling = bool(
         settings.pop("native_parallel_sampling", False)
     )

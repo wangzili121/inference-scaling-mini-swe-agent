@@ -16,7 +16,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from math import exp, isfinite, log
 from threading import Condition
@@ -41,6 +41,7 @@ from inference_scaling.shared.stepwise import (
 from inference_scaling.shared.verifier import TokenBatchReward, TokenReward
 from inference_scaling.arllm.types import (
     AutoregressiveBackend,
+    CISRequestMetadata,
     GeneratedSequenceStatistics,
     GenerationRequest,
     ScoreRequest,
@@ -402,6 +403,14 @@ def _candidate_requests(
             fork_release_remaining=fork_release_remaining,
             fork_adaptive_release=fork_adaptive_release,
             fork_adaptive_runnable_fraction=fork_adaptive_runnable_fraction,
+            cis=CISRequestMetadata(
+                job_id=request_namespace,
+                step_index=step_index,
+                node_type="candidate",
+                candidate_index=candidate_index,
+                candidate_count=count,
+                expected_rollouts=fork_expected_children,
+            ),
         )
         for candidate_index in range(count)
     ]
@@ -432,6 +441,7 @@ def _rollout_requests_for_candidate(
     prompt: TokenSequence,
     generated_prefix: TokenSequence,
     candidate_index: int,
+    candidate_count: int,
     candidate: SequenceSample,
     rollout_length: int,
     rollout_count: int,
@@ -518,6 +528,15 @@ def _rollout_requests_for_candidate(
                 forest_group_id=(forest_group_id if rollout_count >= 2 else None),
                 forest_branch_index=(rollout_index if rollout_count >= 2 else None),
                 forest_group_size=(rollout_count if rollout_count >= 2 else None),
+                cis=CISRequestMetadata(
+                    job_id=request_namespace,
+                    step_index=step_index,
+                    node_type="rollout",
+                    candidate_index=candidate_index,
+                    candidate_count=candidate_count,
+                    rollout_index=global_rollout_index,
+                    expected_rollouts=rollout_count,
+                ),
             )
         )
     return requests, [rollout_prefix] * rollout_count, False
@@ -548,6 +567,7 @@ def _prepare_rollout_requests(
                 prompt=prompt,
                 generated_prefix=generated_prefix,
                 candidate_index=candidate_index,
+                candidate_count=len(candidates),
                 candidate=candidate,
                 rollout_length=rollout_length,
                 rollout_count=rollout_count,
@@ -565,8 +585,19 @@ def _prepare_rollout_requests(
         requests.extend(candidate_requests)
         candidate_indices.extend([candidate_index] * len(candidate_requests))
         prefixes.extend(candidate_prefixes)
+    step_rollout_count = len(requests)
+    requests_with_step_count = [
+        replace(
+            request,
+            cis=replace(request.cis, step_rollout_count=step_rollout_count),
+        )
+        for request in requests
+        if request.cis is not None
+    ]
+    if len(requests_with_step_count) != step_rollout_count:
+        raise RuntimeError("a rollout request is missing CIS metadata")
     return _RolloutRequestPlan(
-        tuple(requests),
+        tuple(requests_with_step_count),
         tuple(candidate_indices),
         tuple(prefixes),
         frozenset(terminal_candidates),
@@ -640,6 +671,7 @@ def _sample_candidates_with_streamed_rollouts(
                     prompt=prompt,
                     generated_prefix=generated_prefix,
                     candidate_index=candidate_index,
+                    candidate_count=candidate_count,
                     candidate=candidate,
                     rollout_length=fixed_rollout_length,
                     rollout_count=rollout_count,
@@ -843,6 +875,15 @@ def _sample_engine_fork_candidate_rollouts(
                     forest_group_size=(
                         rollout_count if rollout_count >= 2 else None
                     ),
+                    cis=CISRequestMetadata(
+                        job_id=request_namespace,
+                        step_index=step_index,
+                        node_type="rollout",
+                        candidate_index=candidate_index,
+                        candidate_count=candidate_count,
+                        rollout_index=rollout_index,
+                        expected_rollouts=rollout_count,
+                    ),
                 )
             )
 
@@ -950,6 +991,15 @@ def _sample_fused_candidate_rollout_paths(
                     ),
                     rng_prefix_group=logical_candidate_id,
                     rng_prefix_group_size=rollout_count,
+                    cis=CISRequestMetadata(
+                        job_id=request_namespace,
+                        step_index=step_index,
+                        node_type="rollout",
+                        candidate_index=candidate_index,
+                        candidate_count=candidate_count,
+                        rollout_index=rollout_index,
+                        expected_rollouts=rollout_count,
+                    ),
                 )
             )
 
@@ -1701,7 +1751,11 @@ class AutoregressiveStepwiseAdapter:
                 ),
                 request_namespace=self.request_namespace,
                 stage_observer=self.stage_observer,
-                fork_expected_children=self.config.rollout_count,
+                fork_expected_children=(
+                    self.config.rollout_count
+                    if remaining > min(self.config.block_size, remaining)
+                    else 0
+                ),
             )
         except BaseException:
             self._release_step(step_index)
@@ -1891,7 +1945,9 @@ def _bounded_conditional_is_step(
         confidence_top_k=getattr(reward, "generation_confidence_top_k", None),
         request_namespace=request_namespace,
         stage_observer=stage_observer,
-        fork_expected_children=config.rollout_count,
+        fork_expected_children=(
+            config.rollout_count if remaining_length > candidate_length else 0
+        ),
     )
     rollout_length = max(0, remaining_length - len(proposals[0].token_ids))
     eos = rollout_sampling.eos_token_id
