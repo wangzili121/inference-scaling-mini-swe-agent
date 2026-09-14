@@ -1,0 +1,262 @@
+{
+  "P0-real-EOS": {
+    "schema_version": 1,
+    "capacity_tokens": 458035,
+    "max_num_seqs": 256,
+    "claim_count": 71,
+    "fixed_order": {
+      "full_reservation": {
+        "kv_only": {
+          "steps": 16,
+          "candidate_sequences": 240,
+          "candidate_tokens": 172160,
+          "maximum_tokens": 448640,
+          "post_candidate_max_tokens": 194048,
+          "realized_peak_tokens": 180096,
+          "maximum_overcommit_ratio": 0.9794884670385451,
+          "post_candidate_pressure_ratio": 0.42365321427401836
+        },
+        "mns_bound": {
+          "steps": 16,
+          "candidate_sequences": 240,
+          "candidate_tokens": 172160,
+          "maximum_tokens": 448640,
+          "post_candidate_max_tokens": 194048,
+          "realized_peak_tokens": 180096,
+          "maximum_overcommit_ratio": 0.9794884670385451,
+          "post_candidate_pressure_ratio": 0.42365321427401836
+        }
+      },
+      "two_phase_safe": {
+        "kv_only": {
+          "steps": 35,
+          "candidate_sequences": 525,
+          "candidate_tokens": 436352,
+          "maximum_tokens": 1041152,
+          "post_candidate_max_tokens": 536576,
+          "realized_peak_tokens": 485632,
+          "maximum_overcommit_ratio": 2.2730839346338163,
+          "post_candidate_pressure_ratio": 1.1714737956706365
+        },
+        "mns_bound": {
+          "steps": 17,
+          "candidate_sequences": 255,
+          "candidate_tokens": 187008,
+          "maximum_tokens": 480768,
+          "post_candidate_max_tokens": 212352,
+          "realized_peak_tokens": 196352,
+          "maximum_overcommit_ratio": 1.0496315783728318,
+          "post_candidate_pressure_ratio": 0.46361522591068366
+        }
+      },
+      "candidate_only": {
+        "kv_only": {
+          "steps": 37,
+          "candidate_sequences": 555,
+          "candidate_tokens": 446208,
+          "maximum_tokens": 1085568,
+          "post_candidate_max_tokens": 551040,
+          "realized_peak_tokens": 497024,
+          "maximum_overcommit_ratio": 2.3700546901437662,
+          "post_candidate_pressure_ratio": 1.203052168502407
+        },
+        "mns_bound": {
+          "steps": 17,
+          "candidate_sequences": 255,
+          "candidate_tokens": 187008,
+          "maximum_tokens": 480768,
+          "post_candidate_max_tokens": 212352,
+          "realized_peak_tokens": 196352,
+          "maximum_overcommit_ratio": 1.0496315783728318,
+          "post_candidate_pressure_ratio": 0.46361522591068366
+        }
+      }
+    },
+    "order_sensitivity": {
+      "full_reservation:kv_only": {
+        "count": 500,
+        "mean": 13.62,
+        "p50": 14.0,
+        "p95": 15.0,
+        "min": 11,
+        "max": 16
+      },
+      "full_reservation:mns_bound": {
+        "count": 500,
+        "mean": 13.62,
+        "p50": 14.0,
+        "p95": 15.0,
+        "min": 11,
+        "max": 16
+      },
+      "two_phase_safe:kv_only": {
+        "count": 500,
+        "mean": 27.666,
+        "p50": 28.0,
+        "p95": 32.0,
+        "min": 20,
+        "max": 36
+      },
+      "two_phase_safe:mns_bound": {
+        "count": 500,
+        "mean": 17.0,
+        "p50": 17.0,
+        "p95": 17.0,
+        "min": 17,
+        "max": 17
+      },
+      "candidate_only:kv_only": {
+        "count": 500,
+        "mean": 28.166,
+        "p50": 28.0,
+        "p95": 33.0,
+        "min": 20,
+        "max": 36
+      },
+      "candidate_only:mns_bound": {
+        "count": 500,
+        "mean": 17.0,
+        "p50": 17.0,
+        "p95": 17.0,
+        "min": 17,
+        "max": 17
+      }
+    },
+    "interpretation": {
+      "full_reservation": "reserve every tree's worst rollout peak",
+      "two_phase_safe": "admit candidate allocations only when a worst-case safe completion order still exists",
+      "candidate_only": "unsafe upper bound that ignores future rollout expansion",
+      "mns_bound": "also require all admitted candidate branches to fit max_num_seqs; this is an execution headroom model"
+    }
+  },
+  "P1-fixed-work": {
+    "schema_version": 1,
+    "capacity_tokens": 458035,
+    "max_num_seqs": 256,
+    "claim_count": 128,
+    "fixed_order": {
+      "full_reservation": {
+        "kv_only": {
+          "steps": 40,
+          "candidate_sequences": 320,
+          "candidate_tokens": 262656,
+          "maximum_tokens": 446976,
+          "post_candidate_max_tokens": 446976,
+          "realized_peak_tokens": 446976,
+          "maximum_overcommit_ratio": 0.9758555568897573,
+          "post_candidate_pressure_ratio": 0.9758555568897573
+        },
+        "mns_bound": {
+          "steps": 32,
+          "candidate_sequences": 256,
+          "candidate_tokens": 219648,
+          "maximum_tokens": 367104,
+          "post_candidate_max_tokens": 367104,
+          "realized_peak_tokens": 367104,
+          "maximum_overcommit_ratio": 0.801475869747945,
+          "post_candidate_pressure_ratio": 0.801475869747945
+        }
+      },
+      "two_phase_safe": {
+        "kv_only": {
+          "steps": 51,
+          "candidate_sequences": 408,
+          "candidate_tokens": 457088,
+          "maximum_tokens": 696704,
+          "post_candidate_max_tokens": 696704,
+          "realized_peak_tokens": 696704,
+          "maximum_overcommit_ratio": 1.5210715338347507,
+          "post_candidate_pressure_ratio": 1.5210715338347507
+        },
+        "mns_bound": {
+          "steps": 32,
+          "candidate_sequences": 256,
+          "candidate_tokens": 219648,
+          "maximum_tokens": 367104,
+          "post_candidate_max_tokens": 367104,
+          "realized_peak_tokens": 367104,
+          "maximum_overcommit_ratio": 0.801475869747945,
+          "post_candidate_pressure_ratio": 0.801475869747945
+        }
+      },
+      "candidate_only": {
+        "kv_only": {
+          "steps": 51,
+          "candidate_sequences": 408,
+          "candidate_tokens": 457088,
+          "maximum_tokens": 696704,
+          "post_candidate_max_tokens": 696704,
+          "realized_peak_tokens": 696704,
+          "maximum_overcommit_ratio": 1.5210715338347507,
+          "post_candidate_pressure_ratio": 1.5210715338347507
+        },
+        "mns_bound": {
+          "steps": 32,
+          "candidate_sequences": 256,
+          "candidate_tokens": 219648,
+          "maximum_tokens": 367104,
+          "post_candidate_max_tokens": 367104,
+          "realized_peak_tokens": 367104,
+          "maximum_overcommit_ratio": 0.801475869747945,
+          "post_candidate_pressure_ratio": 0.801475869747945
+        }
+      }
+    },
+    "order_sensitivity": {
+      "full_reservation:kv_only": {
+        "count": 500,
+        "mean": 22.734,
+        "p50": 23.0,
+        "p95": 27.0,
+        "min": 15,
+        "max": 31
+      },
+      "full_reservation:mns_bound": {
+        "count": 500,
+        "mean": 22.734,
+        "p50": 23.0,
+        "p95": 27.0,
+        "min": 15,
+        "max": 31
+      },
+      "two_phase_safe:kv_only": {
+        "count": 500,
+        "mean": 29.79,
+        "p50": 30.0,
+        "p95": 36.0,
+        "min": 19,
+        "max": 41
+      },
+      "two_phase_safe:mns_bound": {
+        "count": 500,
+        "mean": 29.174,
+        "p50": 30.0,
+        "p95": 32.0,
+        "min": 19,
+        "max": 32
+      },
+      "candidate_only:kv_only": {
+        "count": 500,
+        "mean": 29.79,
+        "p50": 30.0,
+        "p95": 36.0,
+        "min": 19,
+        "max": 41
+      },
+      "candidate_only:mns_bound": {
+        "count": 500,
+        "mean": 29.174,
+        "p50": 30.0,
+        "p95": 32.0,
+        "min": 19,
+        "max": 32
+      }
+    },
+    "interpretation": {
+      "full_reservation": "reserve every tree's worst rollout peak",
+      "two_phase_safe": "admit candidate allocations only when a worst-case safe completion order still exists",
+      "candidate_only": "unsafe upper bound that ignores future rollout expansion",
+      "mns_bound": "also require all admitted candidate branches to fit max_num_seqs; this is an execution headroom model"
+    }
+  }
+}

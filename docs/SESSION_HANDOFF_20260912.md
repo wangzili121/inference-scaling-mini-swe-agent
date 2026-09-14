@@ -1353,3 +1353,29 @@ capacity guard 和 telemetry。不能为了“纯 scheduler”形式牺牲实际
 ```text
 docs/experiments/CIS_SCHEDULER_PLUGIN_DESIGN_20260914.zh-CN.md
 ```
+## 27. CIS 两阶段安全准入容量验证（2026-09-14）
+
+为判断 runtime-KV worst-case reservation 是否值得继续复杂化，新增
+`experiments/swebench/simulate_cis_two_phase_admission.py`。它将完整 step 拆成 candidate
+allocation 与 rollout maximum claim，并使用 Banker-style 安全完成序列；同时加入 MNS
+candidate branch 边界，避免把更深 waiting queue 误报为可执行并行度。
+
+在458035-token 软预算、MNS 256下，固定顺序 P0 的 KV-only frontier 从16提升到35，但
+MNS-bound 仅16提升到17；P1 的 KV-only 从40提升到51，MNS-bound 均为32。500次固定 seed
+shuffle 中，P0/P1 MNS-bound 中位数分别14->17、23->30。结论是该策略在异构上下文和
+高 terminal rate 下可能减少 head-of-line blocking，但当前固定 workload 不能仅凭容量
+模型证明端到端收益。
+
+模拟器及 scheduler/backend 相关用例已在真实 vLLM-Ascend v0.18 镜像中通过，结果为
+`43 passed`。这次验证不占用 NPU，只证明实现与目标运行时兼容。
+
+仓库也已成功构建 wheel，并在未挂载源码的干净 v0.18 容器中 `--no-deps` 安装后导入
+`CISTreeScheduler`。wheel SHA256 为
+`c7558333abcb6811868e90369f62016d8c28cc169428fe81fa423466133c613c`。当前 wheel 仍包含
+完整 inference-scaling 包，待 NPU A/B 确认默认策略后再拆为轻量独立插件。
+
+暂不修改默认 scheduler。先等待安全 TP2 完成 static、算法层 runtime-KV、EngineCore
+runtime-KV 严格 A/B。只有 profile 显示保守 reservation 导致欠填，才实现显式
+`candidate_closed -> rollout_granted`，并加入 completion lane、expansion 优先、KV
+residency 监控和 full-reservation fallback。详细报告见
+`docs/experiments/CIS_TWO_PHASE_SAFE_ADMISSION_20260914.zh-CN.md`。

@@ -102,3 +102,46 @@ Job/Barrier P95、prefill、APC 和 preemption，不能只用 jobs/s。
 128 token 得到508928-token capacity；0.9安全系数得到458035-token budget。相关
 `cis_scheduler` 与 backend 测试为 `37 passed`。两台服务器检查时仍无未被运行中容器
 映射的安全 TP2，因此尚无本模式的 NPU 性能结论。
+
+## 7. 下一策略的准入门槛
+
+已增加两阶段安全准入容量模拟器，但不直接加入默认运行时。它把一个 step 拆成 candidate
+当前 allocation 和 rollout maximum claim，并用 Banker-style 安全序列避免所有 tree
+同时等待 expansion 的死锁。
+
+在458035-token 软预算、MNS 256下，固定 trace 顺序的 P0 纯 KV frontier 从16扩大到35，
+但加入 candidate branch 执行边界后只从16变成17；P1则都被32棵 tree、256条 branch限制。
+500次 shuffle 中，P0/P1 的 MNS-bound 中位数分别从14/23提高到17/30，说明它更可能解决
+异构上下文 head-of-line blocking，而不是稳定长度 workload 的首要瓶颈。
+
+新增模拟器及原有 scheduler/backend 相关用例已在真实 vLLM-Ascend v0.18 镜像中运行，
+结果为 `43 passed`；该验证不占用 NPU，也不代表两阶段策略已经取得性能收益。
+
+当前仓库已成功构建 `inference_scaling-0.1.0-py3-none-any.whl`，并在未挂载源码的干净
+vLLM-Ascend v0.18 容器中以 `--no-deps` 安装后导入
+`inference_scaling.arllm.backends.cis_scheduler.CISTreeScheduler`。wheel SHA256 为
+`c7558333abcb6811868e90369f62016d8c28cc169428fe81fa423466133c613c`。这证明现有
+`scheduler_cls` 接口可按插件方式装载；待 NPU A/B 确认默认策略后，再拆分轻量独立 wheel，
+不提前固化实验接口。
+
+因此产品路线为：
+
+1. 先完成 static、算法层 runtime-KV、EngineCore runtime-KV 的 NPU A/B；
+2. 只有 profile 证明 full reservation 导致欠填或异构 head-of-line blocking，才实现
+   `candidate_closed -> rollout_granted` 两阶段运行时；
+3. 运行时版本必须有 completion lane、expansion 优先、KV residency 监控和 full-reservation
+   fallback，不能采用固定预测折扣。
+
+完整模型、结果和相关工作见
+`docs/experiments/CIS_TWO_PHASE_SAFE_ADMISSION_20260914.zh-CN.md`。
+
+## 8. 与近期工作的关系
+
+- MISA-T 将 mixed-rollout admission 建模为 KV commitment，并保持 continuation；它支持
+  gateway 插件形态，但没有 CIS 的 candidate/rollout/barrier 两阶段树语义。
+- TOPAS 面向 multi-agent workflow DAG 的关键路径与 prefix state；本插件限定在一次 CIS
+  调用内部，不引入多轮 Agent 执行感知。
+- BatchLLM 联合 prefix grouping、token batching 和 attention；它说明 grouping 不能脱离
+  batch shape，符合我们 candidate-subtree 小批量路径的负结果。
+- vLLM priority 与 scheduler_cls 是底层通用原语，不提供 CIS claim、barrier 或原子跨 step
+  transition。通用 scheduler plugin RFC 若落地，可成为标准装载接口，而非替代策略本身。
