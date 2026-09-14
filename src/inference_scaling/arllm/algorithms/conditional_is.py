@@ -13,6 +13,7 @@ each candidate's future reward weighting under the rollout proposal itself.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
@@ -133,14 +134,34 @@ class StepAdmissionController:
         self._condition = Condition()
         self._active = 0
 
-    def acquire(self) -> float:
+    def acquire(
+        self,
+        *,
+        claim_id: str | None = None,
+        estimated_tokens: int | None = None,
+        reference_sample: bool = False,
+    ) -> float:
+        del claim_id, estimated_tokens, reference_sample
         started = perf_counter()
         with self._condition:
             self._condition.wait_for(lambda: self._active < self.limit)
             self._active += 1
         return perf_counter() - started
 
-    def release(self) -> None:
+    def resize(self, claim_id: str, estimated_tokens: int) -> None:
+        del claim_id, estimated_tokens
+
+    def transition(
+        self,
+        claim_id: str,
+        next_claim_id: str,
+        estimated_tokens: int,
+    ) -> bool:
+        del claim_id, next_claim_id, estimated_tokens
+        return False
+
+    def release(self, claim_id: str | None = None) -> None:
+        del claim_id
         with self._condition:
             if self._active <= 0:
                 raise RuntimeError("step admission released without acquisition")
@@ -169,7 +190,14 @@ class OccupancyAwareStepAdmissionController(StepAdmissionController):
         self.active_requests = active_requests
         self.borrowed_admissions = 0
 
-    def acquire(self) -> float:
+    def acquire(
+        self,
+        *,
+        claim_id: str | None = None,
+        estimated_tokens: int | None = None,
+        reference_sample: bool = False,
+    ) -> float:
+        del claim_id, estimated_tokens, reference_sample
         started = perf_counter()
         with self._condition:
             while True:
@@ -183,7 +211,175 @@ class OccupancyAwareStepAdmissionController(StepAdmissionController):
                     break
                 self._condition.wait(timeout=0.05)
             self._active += 1
+            return perf_counter() - started
+
+
+class PeakTokenStepAdmissionController(StepAdmissionController):
+    """Bound the predicted peak token footprint of complete CIS steps."""
+
+    def __init__(
+        self,
+        limit: int,
+        *,
+        max_active_steps: int,
+        reference_window: int = 32,
+        queue_policy: str = "fifo",
+        coalesce_seconds: float = 0.0,
+    ) -> None:
+        super().__init__(limit)
+        if max_active_steps < limit:
+            raise ValueError("max active steps must not be below the base limit")
+        if reference_window <= 0:
+            raise ValueError("reference window must be positive")
+        if queue_policy not in {"fifo", "largest_fit", "balanced_fit"}:
+            raise ValueError("unknown peak-token queue policy")
+        if coalesce_seconds < 0:
+            raise ValueError("coalesce seconds must not be negative")
+        self.max_active_steps = int(max_active_steps)
+        self.queue_policy = queue_policy
+        self.coalesce_seconds = float(coalesce_seconds)
+        self.token_budget: int | None = None
+        self.active_tokens = 0
+        self.peak_active_tokens = 0
+        self._claims: dict[str, int] = {}
+        self._waiters: dict[str, tuple[int, float, int]] = {}
+        self._next_waiter_sequence = 0
+        self._prefer_largest_waiter = True
+        self._reference_tokens: deque[int] = deque(maxlen=reference_window)
+        self.transitions = 0
+        self.transition_failures = 0
+
+    def _selected_waiter(self, now: float) -> str | None:
+        if not self._waiters or self._active >= self.max_active_steps:
+            return None
+        if self._active == 0 and self.coalesce_seconds:
+            first_arrival = min(waiter[1] for waiter in self._waiters.values())
+            if now < first_arrival + self.coalesce_seconds:
+                return None
+        if self.queue_policy == "fifo":
+            claim_id, (tokens, _, _) = min(
+                self._waiters.items(), key=lambda item: item[1][2]
+            )
+            if self.active_tokens + tokens <= self.token_budget:
+                return claim_id
+            return None
+        fitting = (
+            (claim_id, waiter)
+            for claim_id, waiter in self._waiters.items()
+            if self.active_tokens + waiter[0] <= self.token_budget
+        )
+        if self.queue_policy == "largest_fit" or self._prefer_largest_waiter:
+            selected = max(
+                fitting,
+                key=lambda item: (item[1][0], -item[1][2]),
+                default=None,
+            )
+        else:
+            selected = min(
+                fitting,
+                key=lambda item: (item[1][0], item[1][2]),
+                default=None,
+            )
+        return None if selected is None else selected[0]
+
+    def acquire(
+        self,
+        *,
+        claim_id: str | None = None,
+        estimated_tokens: int | None = None,
+        reference_sample: bool = False,
+    ) -> float:
+        if not claim_id or estimated_tokens is None or estimated_tokens <= 0:
+            raise ValueError("peak-token admission requires a positive named claim")
+        started = perf_counter()
+        with self._condition:
+            if claim_id in self._claims or claim_id in self._waiters:
+                raise RuntimeError("duplicate peak-token admission claim")
+            if reference_sample:
+                self._reference_tokens.append(estimated_tokens)
+                self.token_budget = round(
+                    self.limit
+                    * sum(self._reference_tokens)
+                    / len(self._reference_tokens)
+                )
+            elif self.token_budget is None:
+                self.token_budget = self.limit * estimated_tokens
+            self._waiters[claim_id] = (
+                estimated_tokens,
+                started,
+                self._next_waiter_sequence,
+            )
+            self._next_waiter_sequence += 1
+            while self._selected_waiter(perf_counter()) != claim_id:
+                timeout = None
+                if self._active == 0 and self.coalesce_seconds:
+                    first_arrival = min(
+                        waiter[1] for waiter in self._waiters.values()
+                    )
+                    timeout = max(
+                        0.0,
+                        first_arrival + self.coalesce_seconds - perf_counter(),
+                    )
+                self._condition.wait(timeout=timeout)
+            del self._waiters[claim_id]
+            if self.queue_policy == "balanced_fit":
+                self._prefer_largest_waiter = not self._prefer_largest_waiter
+            self._claims[claim_id] = estimated_tokens
+            self._active += 1
+            self.active_tokens += estimated_tokens
+            self.peak_active_tokens = max(
+                self.peak_active_tokens, self.active_tokens
+            )
+            self._condition.notify_all()
         return perf_counter() - started
+
+    def resize(self, claim_id: str, estimated_tokens: int) -> None:
+        if estimated_tokens <= 0:
+            raise ValueError("peak-token admission resize must remain positive")
+        with self._condition:
+            previous = self._claims.get(claim_id)
+            if previous is None:
+                return
+            if estimated_tokens > previous:
+                raise RuntimeError("peak-token admission cannot exceed its reservation")
+            self._claims[claim_id] = estimated_tokens
+            self.active_tokens -= previous - estimated_tokens
+            self._condition.notify_all()
+
+    def release(self, claim_id: str | None = None) -> None:
+        if not claim_id:
+            raise ValueError("peak-token admission release requires a claim id")
+        with self._condition:
+            estimated_tokens = self._claims.pop(claim_id, None)
+            if estimated_tokens is None:
+                raise RuntimeError("unknown peak-token admission claim")
+            self._active -= 1
+            self.active_tokens -= estimated_tokens
+            self._condition.notify_all()
+
+    def transition(
+        self,
+        claim_id: str,
+        next_claim_id: str,
+        estimated_tokens: int,
+    ) -> bool:
+        if estimated_tokens <= 0:
+            raise ValueError("peak-token transition must remain positive")
+        with self._condition:
+            previous = self._claims.get(claim_id)
+            if previous is None or next_claim_id in self._claims:
+                self.transition_failures += 1
+                return False
+            next_total = self.active_tokens - previous + estimated_tokens
+            if estimated_tokens > previous and next_total > self.token_budget:
+                self.transition_failures += 1
+                return False
+            del self._claims[claim_id]
+            self._claims[next_claim_id] = estimated_tokens
+            self.active_tokens = next_total
+            self.transitions += 1
+            self._condition.notify_all()
+            return True
 
 
 @lru_cache(maxsize=1)
@@ -340,6 +536,7 @@ def _sample_candidates(
     request_namespace: str = "conditional-is",
     stage_observer: StageObserver | None = None,
     fork_expected_children: int = 0,
+    expected_rollout_tokens: int = 0,
 ) -> list[SequenceSample]:
     requests = _candidate_requests(
         prefix=prefix,
@@ -351,6 +548,7 @@ def _sample_candidates(
         confidence_top_k=confidence_top_k,
         request_namespace=request_namespace,
         fork_expected_children=fork_expected_children,
+        expected_rollout_tokens=expected_rollout_tokens,
     )
     started = perf_counter()
     with _profile_range("candidate"):
@@ -379,6 +577,7 @@ def _candidate_requests(
     confidence_top_k: int | None,
     request_namespace: str,
     fork_expected_children: int = 0,
+    expected_rollout_tokens: int = 0,
     fork_group_id: str | None = None,
     fork_group_size: int | None = None,
     fork_release_remaining: int | None = None,
@@ -410,6 +609,8 @@ def _candidate_requests(
                 candidate_index=candidate_index,
                 candidate_count=count,
                 expected_rollouts=fork_expected_children,
+                candidate_max_tokens=block_length,
+                rollout_max_tokens=expected_rollout_tokens,
             ),
         )
         for candidate_index in range(count)
@@ -536,6 +737,8 @@ def _rollout_requests_for_candidate(
                     candidate_count=candidate_count,
                     rollout_index=global_rollout_index,
                     expected_rollouts=rollout_count,
+                    candidate_max_tokens=len(candidate.token_ids),
+                    rollout_max_tokens=rollout_length,
                 ),
             )
         )
@@ -636,6 +839,7 @@ def _sample_candidates_with_streamed_rollouts(
         confidence_top_k=confidence_top_k,
         request_namespace=request_namespace,
         fork_expected_children=rollout_count,
+        expected_rollout_tokens=max(0, remaining_length - candidate_length),
     )
     completed_candidates: list[SequenceSample | None] = [None] * candidate_count
     pending: list[tuple[int, SequenceSample]] = []
@@ -835,6 +1039,7 @@ def _sample_engine_fork_candidate_rollouts(
         confidence_top_k=confidence_top_k,
         request_namespace=request_namespace,
         fork_expected_children=rollout_count,
+        expected_rollout_tokens=rollout_length,
         fork_group_id=fork_group_id,
         fork_group_size=candidate_count,
         fork_release_remaining=release_remaining,
@@ -883,6 +1088,8 @@ def _sample_engine_fork_candidate_rollouts(
                         candidate_count=candidate_count,
                         rollout_index=rollout_index,
                         expected_rollouts=rollout_count,
+                        candidate_max_tokens=candidate_length,
+                        rollout_max_tokens=rollout_length,
                     ),
                 )
             )
@@ -999,6 +1206,8 @@ def _sample_fused_candidate_rollout_paths(
                         candidate_count=candidate_count,
                         rollout_index=rollout_index,
                         expected_rollouts=rollout_count,
+                        candidate_max_tokens=candidate_length,
+                        rollout_max_tokens=total_path_length - candidate_length,
                     ),
                 )
             )
@@ -1606,6 +1815,7 @@ class AutoregressiveStepwiseAdapter:
         self.stage_observer = stage_observer
         self._step_started: dict[int, float] = {}
         self._admitted_steps: set[int] = set()
+        self._continued_steps: set[int] = set()
         self._streamed_rollouts: dict[int, _StreamedRollouts] = {}
         self._evaluated_candidates: dict[int, tuple[ConditionalCandidate, ...]] = {}
         self._statistics_by_state: dict[TokenSequence, GeneratedSequenceStatistics] = {
@@ -1622,6 +1832,31 @@ class AutoregressiveStepwiseAdapter:
             eos is not None and eos in state
         )
 
+    def _step_claim_id(self, step_index: int) -> str:
+        return f"{self.request_namespace}:step:{step_index}"
+
+    def _step_peak_tokens(
+        self,
+        state: TokenSequence,
+        *,
+        rollout_requests: int | None = None,
+    ) -> int:
+        remaining = self.config.total_length - len(state)
+        candidate_length = min(self.config.block_size, remaining)
+        rollout_length = max(0, remaining - candidate_length)
+        if rollout_requests is None:
+            rollout_requests = (
+                self.config.candidate_count * self.config.rollout_count
+                if rollout_length
+                else 0
+            )
+        return (
+            len(self.prompt)
+            + len(state)
+            + self.config.candidate_count * candidate_length
+            + rollout_requests * rollout_length
+        )
+
     def propose(
         self,
         state: TokenSequence,
@@ -1630,8 +1865,17 @@ class AutoregressiveStepwiseAdapter:
     ) -> Sequence[SequenceSample]:
         admission_started = perf_counter()
         if self.step_admission_controller is not None:
-            wait_seconds = self.step_admission_controller.acquire()
-            self._admitted_steps.add(step_index)
+            continued = step_index in self._continued_steps
+            if continued:
+                self._continued_steps.remove(step_index)
+                wait_seconds = 0.0
+            else:
+                wait_seconds = self.step_admission_controller.acquire(
+                    claim_id=self._step_claim_id(step_index),
+                    estimated_tokens=self._step_peak_tokens(state),
+                    reference_sample=step_index == 0,
+                )
+                self._admitted_steps.add(step_index)
             _observe_stage(
                 self.stage_observer,
                 "step_admission_wait",
@@ -1644,6 +1888,16 @@ class AutoregressiveStepwiseAdapter:
                 ),
                 borrowed_admissions=getattr(
                     self.step_admission_controller, "borrowed_admissions", 0
+                ),
+                active_step_tokens=getattr(
+                    self.step_admission_controller, "active_tokens", None
+                ),
+                active_step_token_budget=getattr(
+                    self.step_admission_controller, "token_budget", None
+                ),
+                continued_admission=continued,
+                admission_transitions=getattr(
+                    self.step_admission_controller, "transitions", 0
                 ),
             )
         self._step_started[step_index] = perf_counter()
@@ -1756,6 +2010,9 @@ class AutoregressiveStepwiseAdapter:
                     if remaining > min(self.config.block_size, remaining)
                     else 0
                 ),
+                expected_rollout_tokens=max(
+                    0, remaining - min(self.config.block_size, remaining)
+                ),
             )
         except BaseException:
             self._release_step(step_index)
@@ -1765,7 +2022,9 @@ class AutoregressiveStepwiseAdapter:
         if step_index in self._admitted_steps:
             self._admitted_steps.remove(step_index)
             assert self.step_admission_controller is not None
-            self.step_admission_controller.release()
+            self.step_admission_controller.release(
+                claim_id=self._step_claim_id(step_index)
+            )
 
     def release_pending_steps(self) -> None:
         """Release admissions left behind when a step aborts outside the adapter."""
@@ -1782,6 +2041,22 @@ class AutoregressiveStepwiseAdapter:
     ) -> Sequence[StepwiseCandidate[ConditionalCandidate]]:
         remaining = self.config.total_length - len(state)
         candidate_length = len(proposals[0].token_ids)
+        rollout_length = max(0, remaining - candidate_length)
+        if self.step_admission_controller is not None:
+            eos = self.rollout_sampling.eos_token_id
+            rollout_requests = sum(
+                self.config.rollout_count
+                for proposal in proposals
+                if rollout_length > 0
+                and not (eos is not None and proposal.token_ids[-1] == eos)
+            )
+            self.step_admission_controller.resize(
+                self._step_claim_id(step_index),
+                self._step_peak_tokens(
+                    state,
+                    rollout_requests=rollout_requests,
+                ),
+            )
         try:
             evaluated = estimate_conditional_weights(
                 base_backend=self.base_backend,
@@ -1789,7 +2064,7 @@ class AutoregressiveStepwiseAdapter:
                 prompt=self.prompt,
                 generated_prefix=state,
                 candidates=proposals,
-                rollout_length=max(0, remaining - candidate_length),
+                rollout_length=rollout_length,
                 rollout_count=self.config.rollout_count,
                 base_sampling=self.base_sampling,
                 rollout_sampling=self.rollout_sampling,
@@ -1899,7 +2174,24 @@ class AutoregressiveStepwiseAdapter:
                 generated_tokens_before=len(state),
                 generated_tokens_after=len(generated),
             )
-        self._release_step(step_index)
+        continued = False
+        if (
+            self.step_admission_controller is not None
+            and step_index in self._admitted_steps
+            and not self.is_terminal(generated)
+        ):
+            next_step_index = step_index + 1
+            continued = self.step_admission_controller.transition(
+                self._step_claim_id(step_index),
+                self._step_claim_id(next_step_index),
+                self._step_peak_tokens(generated),
+            )
+            if continued:
+                self._admitted_steps.remove(step_index)
+                self._admitted_steps.add(next_step_index)
+                self._continued_steps.add(next_step_index)
+        if not continued:
+            self._release_step(step_index)
         return generated
 
 
@@ -1948,6 +2240,7 @@ def _bounded_conditional_is_step(
         fork_expected_children=(
             config.rollout_count if remaining_length > candidate_length else 0
         ),
+        expected_rollout_tokens=max(0, remaining_length - candidate_length),
     )
     rollout_length = max(0, remaining_length - len(proposals[0].token_ids))
     eos = rollout_sampling.eos_token_id

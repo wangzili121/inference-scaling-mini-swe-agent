@@ -32,6 +32,11 @@ rollout_stream_max_batches = 2
 rollout_frontier_capacity = 0
 rollout_frontier_batch_size = 15
 active_step_limit = 0
+active_step_admission = "fixed"
+active_step_max_limit = 0
+active_step_reference_window = 32
+active_step_queue_policy = "fifo"
+active_step_coalesce_seconds = 0.0
 active_step_borrow_limit = 0
 active_step_borrow_below_requests = 0
 

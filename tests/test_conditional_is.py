@@ -8,6 +8,7 @@ import pytest
 
 from inference_scaling.arllm.algorithms.conditional_is import (
     OccupancyAwareStepAdmissionController,
+    PeakTokenStepAdmissionController,
     RolloutAdmissionController,
     StepAdmissionController,
     conditional_is_step,
@@ -90,6 +91,61 @@ def test_occupancy_aware_step_admission_borrows_only_while_underfilled() -> None
         future.result(timeout=1)
     controller.release()
     controller.release()
+
+
+def test_peak_token_step_admission_lends_only_refined_capacity() -> None:
+    controller = PeakTokenStepAdmissionController(2, max_active_steps=3)
+    controller.acquire(claim_id="a", estimated_tokens=100)
+    controller.acquire(claim_id="b", estimated_tokens=100)
+    entered = Event()
+
+    def acquire_third() -> None:
+        controller.acquire(claim_id="c", estimated_tokens=80)
+        entered.set()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(acquire_third)
+        sleep(0.02)
+        assert not entered.is_set()
+        controller.resize("a", 20)
+        assert entered.wait(timeout=1)
+        future.result(timeout=1)
+
+    assert controller.active_tokens == 200
+    assert controller.peak_active_tokens == 200
+    assert controller.transition("a", "a-next", 10)
+    assert controller.active_tokens == 190
+    controller.release("a-next")
+    controller.release("b")
+    controller.release("c")
+    assert controller.active_tokens == 0
+
+
+def test_peak_token_step_admission_recalibrates_and_keeps_smaller_continuation() -> None:
+    controller = PeakTokenStepAdmissionController(
+        2,
+        max_active_steps=4,
+        reference_window=4,
+    )
+    controller.acquire(
+        claim_id="a",
+        estimated_tokens=100,
+        reference_sample=True,
+    )
+    assert controller.token_budget == 200
+    controller.acquire(
+        claim_id="b",
+        estimated_tokens=200,
+        reference_sample=True,
+    )
+    assert controller.token_budget == 300
+
+    assert controller.transition("b", "b-next", 150)
+    assert controller.active_tokens == 250
+
+    controller.release("a")
+    controller.release("b-next")
+
 
 def _exact_first_token_target() -> dict[int, float]:
     base_first = (0.7, 0.3)

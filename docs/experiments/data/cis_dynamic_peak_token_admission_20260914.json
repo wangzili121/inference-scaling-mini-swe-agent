@@ -1,0 +1,175 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "experiment": "cis_dynamic_peak_token_admission",
+  "branch": "cis-predictive-scheduler",
+  "environment": {
+    "host": "159.138.5.111",
+    "physical_npus": [0, 5],
+    "model": "Qwen3-Coder-30B-A3B-Instruct",
+    "dtype": "bfloat16",
+    "runtime": "vllm-ascend-v0.18-mrv1",
+    "tensor_parallel_size": 2,
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 32768,
+    "gpu_memory_utilization": 0.9,
+    "partial_prefill": [1, 1],
+    "jobs": 32,
+    "workers": 32
+  },
+  "controller": {
+    "name": "PeakTokenStepAdmissionController",
+    "default_queue_policy": "fifo",
+    "reference_window": 32,
+    "initial_reference_step_limit": 16,
+    "max_active_steps": 32,
+    "features": [
+      "predicted physical token footprint",
+      "post-candidate reservation resize",
+      "atomic same-job next-step transition",
+      "rolling first-step budget calibration",
+      "structured telemetry"
+    ]
+  },
+  "p1_fixed_work": {
+    "algorithm": {
+      "candidate_count": 8,
+      "rollout_count": 3,
+      "block_size": 128,
+      "total_length": 512,
+      "ignore_eos": true
+    },
+    "common_work": {
+      "engine_requests": 3328,
+      "generated_tokens": 720896,
+      "forward_token_slots": 1344808,
+      "prefill_tokens": 627240
+    },
+    "runs": {
+      "static_cap16": {
+        "wall_seconds": 598.69814,
+        "jobs_per_second": 0.0534493058,
+        "job_mean_seconds": 400.014648,
+        "job_p95_seconds": 596.498129,
+        "job_p99_seconds": 598.661711,
+        "forward_token_slots_per_second": 2246.22044,
+        "max_in_flight": 288,
+        "preemptions": 0,
+        "path": "/data/disk/wangzili/cis-peak-budget-20260914/fixed-work/p1-static-cap16-05",
+        "benchmark_sha256": "602bbbe969171bab70c4020f78b6ae55bb562873eec440bf059fbcf8f349baea"
+      },
+      "dynamic_fifo": {
+        "wall_seconds": 598.068201,
+        "jobs_per_second": 0.0535056034,
+        "job_mean_seconds": 412.046165,
+        "job_p95_seconds": 597.866629,
+        "job_p99_seconds": 598.008211,
+        "forward_token_slots_per_second": 2248.58636,
+        "max_in_flight": 416,
+        "preemptions": 0,
+        "path": "/data/disk/wangzili/cis-peak-budget-20260914/fixed-work/p1-outer-rolling-05",
+        "benchmark_sha256": "66940c6a9bac997af84175e4a059cf84481a470c1fc505cb5af9c811c0411fb9"
+      },
+      "largest_fit_coalesce_1s": {
+        "wall_seconds": 593.313945,
+        "jobs_per_second": 0.0539343466,
+        "job_mean_seconds": 494.259683,
+        "job_p95_seconds": 593.175217,
+        "job_p99_seconds": 593.288443,
+        "forward_token_slots_per_second": 2269.408987,
+        "prefill_tokens": 628904,
+        "max_in_flight": 384,
+        "preemptions": 0,
+        "path": "/data/disk/wangzili/cis-peak-budget-20260914/fixed-work/p1-outer-lpt1-05",
+        "benchmark_sha256": "d550491fd7121b607360a2bdbddd93190062e40bb788b54305f08eded7a8d387"
+      },
+      "balanced_fit_coalesce_1s": {
+        "wall_seconds": 602.51003,
+        "jobs_per_second": 0.053111149,
+        "job_mean_seconds": 467.552786,
+        "job_p95_seconds": 598.772,
+        "forward_token_slots_per_second": 2232.009,
+        "max_in_flight": 288,
+        "preemptions": 0,
+        "path": "/data/disk/wangzili/cis-peak-budget-20260914/fixed-work/p1-outer-balanced-05",
+        "benchmark_sha256": "6dd347e1b9ccb7247083ce7648f1969764eb4532c7e11037bf96b900ff765055"
+      }
+    }
+  },
+  "p0_real_eos": {
+    "algorithm": {
+      "candidate_count": 15,
+      "rollout_count": 3,
+      "block_size": 128,
+      "total_length": 512,
+      "ignore_eos": false
+    },
+    "static_cap16": {
+      "wall_seconds": 375.896437,
+      "jobs_per_second": 0.170259661,
+      "job_mean_seconds": 139.629769,
+      "job_p95_seconds": 240.353895,
+      "job_p99_seconds": 300.995898,
+      "generated_tokens_per_second": 606.7522,
+      "forward_token_slots_per_second": 3025.5993,
+      "generated_tokens": 228076,
+      "prefill_tokens": 911336,
+      "forward_token_slots": 1137312,
+      "engine_requests": 2100,
+      "max_in_flight": 203,
+      "preemptions": 0,
+      "path": "/data/disk/wangzili/cis-peak-budget-20260914/real-eos/p0-static-confirm-05",
+      "benchmark_sha256": "947be328b2a4b3a5229dddf25b28b1cabb2d55e103be1a3aec78987f2bbede82"
+    },
+    "dynamic_fifo": {
+      "wall_seconds": 356.539123,
+      "jobs_per_second": 0.179503443,
+      "job_mean_seconds": 137.115578,
+      "job_p95_seconds": 242.806671,
+      "job_p99_seconds": 264.497037,
+      "generated_tokens_per_second": 631.0808,
+      "forward_token_slots_per_second": 3178.7563,
+      "generated_tokens": 225005,
+      "prefill_tokens": 910347,
+      "forward_token_slots": 1133351,
+      "engine_requests": 2001,
+      "max_in_flight": 214,
+      "preemptions": 0,
+      "admission_transitions": 7,
+      "transition_failures": 0,
+      "initial_token_budget": 418401,
+      "final_token_budget": 542852,
+      "peak_active_tokens": 536601,
+      "path": "/data/disk/wangzili/cis-peak-budget-20260914/real-eos/p0-outer-confirm-05",
+      "benchmark_sha256": "81bb36f3b15868952d86fd43dd935fd7b3d5c032a082e0e4b74c7cac6250db7e"
+    },
+    "dynamic_vs_static_percent": {
+      "jobs_per_second": 5.43,
+      "wall_seconds": -5.15,
+      "job_mean_seconds": -1.8,
+      "job_p95_seconds": 1.02,
+      "job_p99_seconds": -12.13,
+      "generated_tokens_per_second": 4.01,
+      "forward_token_slots_per_second": 5.06
+    },
+    "determinism_check": {
+      "shared_request_ids": 64,
+      "same_top_level_seed": 64,
+      "same_final_output": 25,
+      "same_completion_token_count": 20,
+      "interpretation": "Native sampling remains schedule-order sensitive; use work-normalized throughput and fix per-request determinism before exact semantic A/B."
+    }
+  },
+  "decision": {
+    "default_dynamic_policy": "fifo",
+    "largest_fit": "rejected_online_default_due_to_mean_latency_regression",
+    "balanced_fit": "rejected_due_to_throughput_and_mean_latency_regression",
+    "status": "research_variant_ready_for_further_closed_loop_calibration",
+    "next": [
+      "derive token budget from runtime KV capacity and MNS",
+      "add slow feedback from preemption, KV waterline and decode batch telemetry",
+      "fix request-local sampler determinism",
+      "only then consider EngineCore structured tree scheduling"
+    ]
+  }
+}

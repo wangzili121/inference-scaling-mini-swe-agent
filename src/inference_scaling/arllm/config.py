@@ -112,6 +112,11 @@ class ConditionalISConfig:
     rollout_frontier_capacity: int | None = None
     rollout_frontier_batch_size: int = 15
     active_step_limit: int | None = None
+    active_step_admission: str = "fixed"
+    active_step_max_limit: int | None = None
+    active_step_reference_window: int = 32
+    active_step_queue_policy: str = "fifo"
+    active_step_coalesce_seconds: float = 0.0
     active_step_borrow_limit: int | None = None
     active_step_borrow_below_requests: int | None = None
 
@@ -172,6 +177,29 @@ class ConditionalISConfig:
         )
         if self.active_step_limit is not None:
             require_positive("active_step_limit", self.active_step_limit)
+        if self.active_step_admission not in {"fixed", "peak_token_budget"}:
+            raise ValueError("unknown active_step_admission")
+        if self.active_step_admission != "fixed" and self.active_step_limit is None:
+            raise ValueError("dynamic active_step_admission requires active_step_limit")
+        if self.active_step_max_limit is not None:
+            require_positive("active_step_max_limit", self.active_step_max_limit)
+            if self.active_step_limit is None:
+                raise ValueError("active_step_max_limit requires active_step_limit")
+            if self.active_step_max_limit < self.active_step_limit:
+                raise ValueError(
+                    "active_step_max_limit must not be below active_step_limit"
+                )
+        require_positive(
+            "active_step_reference_window", self.active_step_reference_window
+        )
+        if self.active_step_queue_policy not in {
+            "fifo",
+            "largest_fit",
+            "balanced_fit",
+        }:
+            raise ValueError("unknown active_step_queue_policy")
+        if self.active_step_coalesce_seconds < 0:
+            raise ValueError("active_step_coalesce_seconds must not be negative")
         if self.active_step_borrow_limit is not None:
             require_positive("active_step_borrow_limit", self.active_step_borrow_limit)
             if self.active_step_limit is None:

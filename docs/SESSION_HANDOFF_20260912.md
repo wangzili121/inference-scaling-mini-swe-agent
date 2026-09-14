@@ -1147,3 +1147,50 @@ docs/experiments/data/cis_predictive_continuation_20260914.json
 ```
 
 本轮只使用服务器 `159.138.5.111` 启动前空闲的物理 NPU 1/4；实验结束后已释放。
+
+## 21. 2026-09-14 Dynamic Peak-Token Admission 已完成
+
+在 `cis-predictive-scheduler` 分支继续实现并验证了算法外层的动态 admission。新
+`PeakTokenStepAdmissionController` 不再假设每个 step 等成本，而按 shared prefix、
+`C * candidate tokens` 和实际/预计 rollout tail 计算 token/KV 峰值；candidate 完成后
+缩小 reservation，同一 job 下一 step 使用原子 transition 保存跨 step 局部性。预算由最近
+32 个 step0 滚动校准，并有独立 max-active 安全上限。
+
+P1 `C8/R3/B128/L512` 的严格 fixed-work A/B 中，各方案均为 3328 engine request、
+720896 generated token、1344808 FTS。动态 FIFO 相对静态 `step_fifo + cap16`：jobs/s
+`+0.11%`、FTS/s `+0.11%`、Job P95 `+0.23%`、0 preemption，说明它已经匹配静态最优，
+但没有明显超越。
+
+P0 `C15/R3/B128/L512` 的同卡真实 EOS A/B 中，动态 FIFO 相对静态 cap16：jobs/s
+`+5.43%`、FTS/s `+5.06%`、Job mean `-1.80%`、Job P99 `-12.13%`、Job P95
+`+1.02%`，0 preemption。7/7 个跨 step transition 全部成功。它修复了上一版固定 5 秒
+continuation 在 P0 上 FTS/s `-12.24%` 的迁移失败。
+
+另做了队列消融。`largest_fit + 1s coalesce` 虽使 P1 makespan 缩短 0.9%，却使 Job mean
+恶化 23.6%；`balanced_fit` 使吞吐下降 0.63%、Job mean 恶化 16.9%。这说明长短 context
+主动混排会破坏 attention batch shape，下一步不再堆 LPT/交替等通用启发式，默认保留
+FIFO/locality。
+
+准确边界：该方案是新增的 CIS-aware 外层 token-budget admission，不是 vLLM 自带开关，
+也还不是完整 EngineCore tree scheduler。它仍以 `active_step_limit=16` 作为初始预算倍率、
+以32作为 safety bound。下一步应从 runtime KV capacity/MNS 直接推导预算，再用
+preemption/KV/batch telemetry 做慢速闭环，以逐步取消固定 cap 标尺。
+
+P0 同 namespace 的64个顶层请求 seed 完全相同，但只有25个最终输出一致，证明当前 native
+sampler 仍受 batch/admission 顺序影响。P0 动态 FTS 总量只少0.35%，FTS/s仍提高5.06%，
+正向性能结论不依赖 jobs/s；不过正式 exact A/B 前仍需解决 sampler 确定性。
+
+详细报告与机器数据：
+
+```text
+docs/experiments/CIS_DYNAMIC_PEAK_TOKEN_ADMISSION_20260914.zh-CN.md
+docs/experiments/data/cis_dynamic_peak_token_admission_20260914.json
+```
+
+原始数据：
+
+```text
+/data/disk/wangzili/cis-peak-budget-20260914
+```
+
+本轮只使用服务器 `159.138.5.111` 启动前空闲的物理 NPU 0/5；所有本轮容器均已退出。

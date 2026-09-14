@@ -134,17 +134,22 @@ def _verify_npu_runtime(devices: Sequence[str]) -> dict[str, Any]:
     executable = shutil.which("npu-smi")
     if executable is None:
         raise RuntimeError("profiling preflight requires npu-smi on PATH")
-    completed = subprocess.run(
-        (executable, "info"),
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
-    if completed.returncode != 0 or "910" not in completed.stdout:
-        raise RuntimeError(
-            "npu-smi preflight failed: "
-            + (completed.stderr.strip() or completed.stdout.strip())
+    host_verified = os.environ.get("CIS_HOST_NPU_PREFLIGHT_VERIFIED") == "1"
+    npu_smi_warning = None
+    if host_verified:
+        # DCMI enumerates every physical card and can fail when an unrelated card
+        # is busy. The launcher already checked the selected physical devices.
+        npu_smi_warning = "container npu-smi skipped after host device verification"
+    else:
+        completed = subprocess.run(
+            (executable, "info"),
+            text=True,
+            capture_output=True,
+            timeout=30,
         )
+        if completed.returncode != 0 or "910" not in completed.stdout:
+            npu_smi_error = completed.stderr.strip() or completed.stdout.strip()
+            raise RuntimeError("npu-smi preflight failed: " + npu_smi_error)
     atb_probe = subprocess.run(
         (
             sys.executable,
@@ -163,6 +168,7 @@ def _verify_npu_runtime(devices: Sequence[str]) -> dict[str, Any]:
     return {
         "device_ids": device_ids,
         "npu_smi": executable,
+        "npu_smi_warning": npu_smi_warning,
         "driver_mounted": True,
         "atb_runtime": True,
     }

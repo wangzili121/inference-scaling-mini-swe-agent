@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from inference_scaling.arllm.algorithms import (
     OccupancyAwareStepAdmissionController,
+    PeakTokenStepAdmissionController,
     RolloutAdmissionController,
     StepAdmissionController,
     run_conditional_is,
@@ -318,6 +319,23 @@ class ConditionalISRunner:
                 if conditional.get("active_step_limit") in (None, 0)
                 else int(conditional["active_step_limit"])
             ),
+            active_step_admission=str(
+                conditional.get("active_step_admission", "fixed")
+            ),
+            active_step_max_limit=(
+                None
+                if conditional.get("active_step_max_limit") in (None, 0)
+                else int(conditional["active_step_max_limit"])
+            ),
+            active_step_reference_window=int(
+                conditional.get("active_step_reference_window", 32)
+            ),
+            active_step_queue_policy=str(
+                conditional.get("active_step_queue_policy", "fifo")
+            ),
+            active_step_coalesce_seconds=float(
+                conditional.get("active_step_coalesce_seconds", 0.0)
+            ),
             active_step_borrow_limit=(
                 None
                 if conditional.get("active_step_borrow_limit") in (None, 0)
@@ -339,6 +357,21 @@ class ConditionalISRunner:
         )
         if self.conditional.active_step_limit is None:
             self.step_admission_controller = None
+        elif self.conditional.active_step_admission == "peak_token_budget":
+            if self.conditional.active_step_borrow_limit is not None:
+                raise ValueError(
+                    "peak-token and occupancy-borrow admission are mutually exclusive"
+                )
+            self.step_admission_controller = PeakTokenStepAdmissionController(
+                self.conditional.active_step_limit,
+                max_active_steps=(
+                    self.conditional.active_step_max_limit
+                    or self.conditional.active_step_limit * 2
+                ),
+                reference_window=self.conditional.active_step_reference_window,
+                queue_policy=self.conditional.active_step_queue_policy,
+                coalesce_seconds=self.conditional.active_step_coalesce_seconds,
+            )
         elif self.conditional.active_step_borrow_limit is None:
             self.step_admission_controller = StepAdmissionController(
                 self.conditional.active_step_limit

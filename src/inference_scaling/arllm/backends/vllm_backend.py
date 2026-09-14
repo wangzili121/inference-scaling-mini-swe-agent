@@ -1844,6 +1844,8 @@ class AsyncVLLMBackend(VLLMBackend):
                 "rollout_index": metadata.rollout_index,
                 "expected_rollouts": metadata.expected_rollouts,
                 "step_rollout_count": metadata.step_rollout_count,
+                "candidate_max_tokens": metadata.candidate_max_tokens,
+                "rollout_max_tokens": metadata.rollout_max_tokens,
             }
             params.extra_args = extra_args
         if request.rng_switch_after_tokens is not None:

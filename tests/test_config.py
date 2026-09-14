@@ -35,6 +35,11 @@ def test_policy_id_preserves_distinct_float_values() -> None:
         lambda: SamplingConfig(top_p=float("inf")),
         lambda: ConditionalISConfig(reward_temperature=float("inf")),
         lambda: ConditionalISConfig(active_step_limit=0),
+        lambda: ConditionalISConfig(active_step_admission="unknown"),
+        lambda: ConditionalISConfig(active_step_admission="peak_token_budget"),
+        lambda: ConditionalISConfig(active_step_limit=4, active_step_max_limit=3),
+        lambda: ConditionalISConfig(active_step_queue_policy="unknown"),
+        lambda: ConditionalISConfig(active_step_coalesce_seconds=-0.1),
         lambda: ConditionalISConfig(rollout_design="unknown"),
         lambda: ConditionalISConfig(exact_rollout_early_stop=True),
         lambda: ConditionalISConfig(

@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
   echo "usage: $0 VARIANT DEVICES OUTPUT PORT CONTAINER" >&2
-  echo "VARIANT: baseline | step-cap-only | step-priority-only | job-gang | step-cohort-auto | step-cohort-N | step-tree-adaptive | step-tree-fractional | step-tree-tail-borrow | step-tree-continuation | step-tree-work-conserving | step-gang | step-gang-6 | step-gang-piecewise | step-gang-dual-graph | step-forest-attention | step-forest-attention-piecewise | step-forest-attention-dual-graph | step-forest-window-N | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
+  echo "VARIANT: baseline | step-cap-only | step-priority-only | job-gang | step-cohort-auto | step-cohort-N | step-tree-adaptive | step-tree-fractional | step-tree-tail-borrow | step-tree-peak-budget | step-tree-continuation | step-tree-work-conserving | step-peak-budget | step-peak-budget-lpt | step-peak-budget-balanced | step-gang | step-gang-6 | step-gang-piecewise | step-gang-dual-graph | step-forest-attention | step-forest-attention-piecewise | step-forest-attention-dual-graph | step-forest-window-N | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
   exit 2
 fi
 
@@ -27,6 +27,7 @@ candidate_count=${CIS_CANDIDATE_COUNT:-15}
 rollout_count=${CIS_ROLLOUT_COUNT:-3}
 block_size=${CIS_BLOCK_SIZE:-128}
 active_step_limit=${CIS_ACTIVE_STEP_LIMIT:-6}
+active_step_max_limit=${CIS_ACTIVE_STEP_MAX_LIMIT:-32}
 fork_lease_max_fraction=${CIS_FORK_LEASE_MAX_FRACTION:-0.20}
 active_step_borrow_limit=${CIS_ACTIVE_STEP_BORROW_LIMIT:-12}
 active_step_borrow_below=${CIS_ACTIVE_STEP_BORROW_BELOW:-64}
@@ -40,12 +41,14 @@ tree_initial_window=${CIS_TREE_INITIAL_WINDOW:-$active_step_limit}
 tree_max_window=${CIS_TREE_MAX_WINDOW:-}
 tree_tail_borrow_limit=${CIS_TREE_TAIL_BORROW_LIMIT:-2}
 tree_continuation_grace_ms=${CIS_TREE_CONTINUATION_GRACE_MS:-1500}
+tree_peak_token_budget=${CIS_TREE_PEAK_TOKEN_BUDGET:-}
 fixed_length=${CIS_FIXED_LENGTH:-0}
+step_coalesce_seconds=${CIS_STEP_COALESCE_SECONDS:-1.0}
 native_runtime_setup=:
 variant_docker_env=()
 fixed_length_arg=
 
-for value in "$limit" "$workers" "$candidate_count" "$rollout_count" "$block_size" "$active_step_limit"; do
+for value in "$limit" "$workers" "$candidate_count" "$rollout_count" "$block_size" "$active_step_limit" "$active_step_max_limit"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
     echo "workload and scheduling values must be positive integers" >&2
     exit 2
@@ -57,6 +60,10 @@ done
 }
 if [[ -n "$tree_max_window" && ! "$tree_max_window" =~ ^[1-9][0-9]*$ ]]; then
   echo "tree max window must be empty or a positive integer" >&2
+  exit 2
+fi
+if [[ -n "$tree_peak_token_budget" && ! "$tree_peak_token_budget" =~ ^[1-9][0-9]*$ ]]; then
+  echo "tree peak token budget must be empty or a positive integer" >&2
   exit 2
 fi
 [[ "$tree_continuation_grace_ms" =~ ^[0-9]+$ ]] || {
@@ -166,6 +173,18 @@ case "$variant" in
       -e VLLM_CIS_SCHEDULER_TRACE=/artifacts/cis-scheduler-trace.jsonl
     )
     ;;
+  step-tree-peak-budget)
+    variant_args=(
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set 'vllm.scheduler_cls=\"inference_scaling.arllm.backends.cis_scheduler.CISTreeScheduler\"'
+    )
+    variant_docker_env=(
+      -e VLLM_CIS_ADMISSION_MODE=peak_token_budget
+      -e VLLM_CIS_INITIAL_WINDOW="$tree_initial_window"
+      -e VLLM_CIS_CANDIDATE_IDLE_GRACE="$tree_candidate_idle_grace"
+      -e VLLM_CIS_SCHEDULER_TRACE=/artifacts/cis-scheduler-trace.jsonl
+    )
+    ;;
   step-tree-continuation)
     variant_args=(
       --set 'vllm.request_priority_policy=\"step_fifo\"'
@@ -195,6 +214,43 @@ case "$variant" in
   step-gang|step-gang-6)
     variant_args=(
       --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+    )
+    ;;
+  step-peak-budget)
+    variant_args=(
+      --set conditional_is.candidate_count="$candidate_count"
+      --set conditional_is.rollout_count="$rollout_count"
+      --set conditional_is.block_size="$block_size"
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'conditional_is.active_step_admission=\"peak_token_budget\"'
+      --set conditional_is.active_step_max_limit="$active_step_max_limit"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+    )
+    ;;
+  step-peak-budget-lpt)
+    variant_args=(
+      --set conditional_is.candidate_count="$candidate_count"
+      --set conditional_is.rollout_count="$rollout_count"
+      --set conditional_is.block_size="$block_size"
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'conditional_is.active_step_admission=\"peak_token_budget\"'
+      --set conditional_is.active_step_max_limit="$active_step_max_limit"
+      --set 'conditional_is.active_step_queue_policy=\"largest_fit\"'
+      --set conditional_is.active_step_coalesce_seconds="$step_coalesce_seconds"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+    )
+    ;;
+  step-peak-budget-balanced)
+    variant_args=(
+      --set conditional_is.candidate_count="$candidate_count"
+      --set conditional_is.rollout_count="$rollout_count"
+      --set conditional_is.block_size="$block_size"
+      --set conditional_is.active_step_limit="$active_step_limit"
+      --set 'conditional_is.active_step_admission=\"peak_token_budget\"'
+      --set conditional_is.active_step_max_limit="$active_step_max_limit"
+      --set 'conditional_is.active_step_queue_policy=\"balanced_fit\"'
+      --set conditional_is.active_step_coalesce_seconds="$step_coalesce_seconds"
       --set 'vllm.request_priority_policy=\"step_fifo\"'
     )
     ;;
@@ -529,6 +585,11 @@ if [[ -n "$tree_max_window" && "$variant" == step-tree-* ]]; then
     -e VLLM_CIS_MAX_WINDOW="$tree_max_window"
   )
 fi
+if [[ -n "$tree_peak_token_budget" && "$variant" == step-tree-peak-budget ]]; then
+  variant_docker_env+=(
+    -e VLLM_CIS_PEAK_TOKEN_BUDGET="$tree_peak_token_budget"
+  )
+fi
 
 IFS=, read -r -a device_ids <<<"$devices"
 device_args=()
@@ -551,7 +612,16 @@ if [[ -e "$output" ]] && ! rm -rf "$output" 2>/dev/null; then
 fi
 mkdir -p "$output" "$cache"
 docker rm -f "$container" >/dev/null 2>&1 || true
-/usr/local/bin/npu-smi info >"$output/npu-before.txt"
+npu_snapshot=$(/usr/local/bin/npu-smi info)
+printf '%s\n' "$npu_snapshot" >"$output/npu-before.txt"
+process_snapshot=$(printf '%s\n' "$npu_snapshot" | sed -n '/Process id/,$p')
+for id in "${device_ids[@]}"; do
+  if printf '%s\n' "$process_snapshot" \
+    | grep -Eq "^\\|[[:space:]]*$id[[:space:]]+\\|"; then
+    echo "selected NPU $id already has a process" >&2
+    exit 1
+  fi
+done
 
 printf '%q ' "$0" "$@" >"$output/launch-command.txt"
 printf '\n' >>"$output/launch-command.txt"
@@ -570,6 +640,7 @@ CIS_CANDIDATE_COUNT=$candidate_count
 CIS_ROLLOUT_COUNT=$rollout_count
 CIS_BLOCK_SIZE=$block_size
 CIS_ACTIVE_STEP_LIMIT=$active_step_limit
+CIS_ACTIVE_STEP_MAX_LIMIT=$active_step_max_limit
 CIS_ACTIVE_STEP_BORROW_LIMIT=$active_step_borrow_limit
 CIS_ACTIVE_STEP_BORROW_BELOW=$active_step_borrow_below
 CIS_ENGINE_FORK_RUNNABLE_FRACTION=$engine_fork_runnable_fraction
@@ -582,7 +653,9 @@ CIS_TREE_CANDIDATE_IDLE_GRACE=$tree_candidate_idle_grace
 CIS_TREE_MAX_WINDOW=$tree_max_window
 CIS_TREE_TAIL_BORROW_LIMIT=$tree_tail_borrow_limit
 CIS_TREE_CONTINUATION_GRACE_MS=$tree_continuation_grace_ms
+CIS_TREE_PEAK_TOKEN_BUDGET=$tree_peak_token_budget
 CIS_FIXED_LENGTH=$fixed_length
+CIS_STEP_COALESCE_SECONDS=$step_coalesce_seconds
 EOF
 
 docker run -d \
@@ -590,6 +663,7 @@ docker run -d \
   --network host \
   --entrypoint /bin/bash \
   -e CIS_MODEL_PATH=/models/conditional-is \
+  -e CIS_HOST_NPU_PREFLIGHT_VERIFIED=1 \
   -e ASCEND_RT_VISIBLE_DEVICES="$logical_devices" \
   "${variant_docker_env[@]}" \
   "${device_args[@]}" \

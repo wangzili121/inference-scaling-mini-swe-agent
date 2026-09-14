@@ -1207,6 +1207,8 @@ def test_async_vllm_priority_prefers_structured_cis_metadata() -> None:
                 "rollout_index": None,
                 "expected_rollouts": 3,
                 "step_rollout_count": None,
+                "candidate_max_tokens": None,
+                "rollout_max_tokens": None,
             }
         }
     finally:

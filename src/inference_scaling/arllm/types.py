@@ -27,6 +27,8 @@ class CISRequestMetadata:
     rollout_index: int | None = None
     expected_rollouts: int = 0
     step_rollout_count: int | None = None
+    candidate_max_tokens: int | None = None
+    rollout_max_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if not self.job_id:
@@ -45,6 +47,10 @@ class CISRequestMetadata:
             raise ValueError("CIS expected_rollouts must be non-negative")
         if self.step_rollout_count is not None and self.step_rollout_count < 0:
             raise ValueError("CIS step_rollout_count must be non-negative")
+        if self.candidate_max_tokens is not None and self.candidate_max_tokens <= 0:
+            raise ValueError("CIS candidate_max_tokens must be positive")
+        if self.rollout_max_tokens is not None and self.rollout_max_tokens < 0:
+            raise ValueError("CIS rollout_max_tokens must be non-negative")
         if self.node_type == "candidate" and self.rollout_index is not None:
             raise ValueError("a CIS candidate cannot have a rollout_index")
         if self.node_type == "rollout" and (
