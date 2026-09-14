@@ -150,23 +150,42 @@ d550491fd7121b607360a2bdbddd93190062e40bb788b54305f08eded7a8d387  fixed-work/p1-
 - 单个 step 的保守估算超过预算时允许独占前进，避免永久等待；
 - terminal candidate resize、FIFO locality 和同 job 原子 continuation 继续保留。
 
-已从同一公开 workload 确定性抽取三个32请求分层，未复制 prompt：
+完整公开轨迹包含499个任务、13884次带 `prompt_tokens` 的 assistant 调用。原始 API usage
+的长度分布为：中位9457、最大112393；`<8K` 5973条、`8K-16K` 4896条、`16K-32K`
+2481条、`32K-64K` 483条、`64K-128K` 51条，未观察到 `>=128K` 请求。由此可见真实
+Agent workload 并非统一超长，而是同一任务内由中等上下文逐步增长，并保留少量64K以上
+长尾。
 
-| 分层 | 范围 | prompt 中位数 | prompt 最小/最大 | 0.9 runtime budget 预计初始 step 数 |
-|---|---:|---:|---:|---:|
-| short | `<4K` | 2813.5 | 1518 / 4086 | 32 |
-| medium | `8K-16K` | 11530.5 | 8703 / 16055 | 20 |
-| long | `16K-32K` | 20376.5 | 16500 / 31934 | 13 |
+正式跨上下文验证不再包含 `<4K`，短请求只保留为 capability smoke。矩阵使用四个真实
+长度分层，不截断、不 padding、不复制 prompt：
 
-以上 step 数按既有 TP2 日志中的 508928-token KV capacity、0.9安全系数和 P1
-`C8/R3/B128/L512` 计算。它显示新模式会随整体上下文变长自动从32降到20、13，而滚动
-reference 模式基本仍保持16。
+| 分层 | 范围 | 请求数 | prompt 中位数 | prompt 最小/最大 | `max_model_len` |
+|---|---:|---:|---:|---:|---:|
+| medium | `8K-16K` | 32 | 11530.5 | 8703 / 16055 | 65536 |
+| long | `16K-32K` | 32 | 20376.5 | 16500 / 31934 | 65536 |
+| very-long | `32K-64K` | 32 | 44634 | 33134 / 63198 | 65536 |
+| extended | `64K-128K` | 32 | 73131 | 65827 / 110103 | 131072 |
 
-正式 NPU 验证矩阵为三种分层分别比较 static cap16、rolling peak-token 和
-runtime-KV 0.9；再在相同 P0 条件补跑 candidate-subtree bundle。当前两台服务器都只有
-单张空闲卡，没有可用 TP2 组合。单卡4B capability 尝试在模型启动前被 Ascend DCMI/
-categorical 的全机设备枚举失败拦截，并非 admission 代码错误。代码、workload 和运行入口
-均已准备，不能在没有同条件 NPU 数据前把上述预计并发写成性能收益。
+32K以上两个分层使用准确 Qwen tokenizer 从完整轨迹重新展开。文件及校验值：
+
+```text
+/data/disk/wangzili/cis-context-strata-source/32k-64k/public-32.jsonl
+sha256 83ad43ed7cc4b624808298ce92173daf88b789bbc8c4c89ef92858cb6928011e
+/data/disk/wangzili/cis-context-strata-source/64k-128k/public-32.jsonl
+sha256 4ab63f7925505b654fc2d3d1f4a3c4a498ae7e9f9ef80969cf130d9e5119505d
+```
+
+为了尽快回答“动态策略能否跨 context shift”，每个分层只比较已调优静态 Step cap 与
+`runtime_kv_budget`，不再重复已经暴露设计缺陷的 rolling reference。共8组 NPU 运行。
+`>=128K` 暂不通过合成输入测试；只有取得真实 Agent 轨迹后再加入。当前没有经过容器预留
+和 NPU 进程双重检查的空闲 TP2，代码、workload 和运行入口已准备，不能用容量模型替代
+真实性能结论。
+
+完整分布和 workload 校验值另存为：
+
+```text
+docs/experiments/data/cis_context_distribution_20260914.json
+```
 
 ## 10. 设备预留审计与可恢复矩阵
 
@@ -189,8 +208,9 @@ categorical 的全机设备枚举失败拦截，并非 admission 代码错误。
 experiments/swebench/run_cis_context_transfer_remote.sh
 ```
 
-`context` 模式运行 `short/medium/long × static/rolling/runtime-KV` 共9组；`subtree`
-模式在同一 P0 workload 上运行 static、runtime-KV 与 `step-subtree-8` 三组。已有完整
+`context` 模式运行 `8K-16K/16K-32K/32K-64K/64K-128K × static/runtime-KV`
+共8组；`subtree` 模式在同一 P0 workload 上运行 static、runtime-KV 与
+`step-subtree-8` 三组。已有完整
 `benchmark.json` 的运行会跳过，所有运行结束后由现有 summarizer 生成统一 JSON。
 
 ## 11. Worst-case reservation 的真实松弛

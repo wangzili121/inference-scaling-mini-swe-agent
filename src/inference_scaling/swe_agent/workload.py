@@ -135,7 +135,18 @@ def build_public_workload(
     max_new_tokens: int = 512,
     context_margin: int = 256,
     maximum_context: int = 65536,
+    minimum_prompt_tokens: int = 0,
+    maximum_prompt_tokens: int | None = None,
 ) -> dict[str, Any]:
+    if minimum_prompt_tokens < 0:
+        raise ValueError("minimum_prompt_tokens must not be negative")
+    if (
+        maximum_prompt_tokens is not None
+        and maximum_prompt_tokens <= minimum_prompt_tokens
+    ):
+        raise ValueError(
+            "maximum_prompt_tokens must be greater than minimum_prompt_tokens"
+        )
     source = Path(source_directory)
     paths = sorted(source.rglob("*.traj.json"))
     if not paths:
@@ -156,10 +167,20 @@ def build_public_workload(
     selected: list[dict[str, Any]] = []
     lengths = []
     oversized_calls_skipped = 0
+    below_range_skipped = 0
+    above_range_skipped = 0
+    examined_calls = 0
     for item in snapshots:
         length = counter(item["messages"])
+        examined_calls += 1
         if length + max_new_tokens + context_margin > maximum_context:
             oversized_calls_skipped += 1
+            continue
+        if length < minimum_prompt_tokens:
+            below_range_skipped += 1
+            continue
+        if maximum_prompt_tokens is not None and length >= maximum_prompt_tokens:
+            above_range_skipped += 1
             continue
         item["diagnostics"]["prompt_tokens"] = length
         selected.append(item)
@@ -174,7 +195,7 @@ def build_public_workload(
     max_model_len = next(
         (
             value
-            for value in (16384, 32768, 65536)
+            for value in (16384, 32768, 65536, 131072, 262144)
             if required <= value <= maximum_context
         ),
         None,
@@ -204,6 +225,13 @@ def build_public_workload(
         "max_new_tokens": max_new_tokens,
         "context_margin": context_margin,
         "maximum_context": maximum_context,
+        "prompt_range": {
+            "minimum": minimum_prompt_tokens,
+            "maximum_exclusive": maximum_prompt_tokens,
+        },
+        "examined_calls": examined_calls,
+        "below_range_skipped": below_range_skipped,
+        "above_range_skipped": above_range_skipped,
         "oversized_calls_skipped": oversized_calls_skipped,
         "required_context": required,
         "selected_max_model_len": max_model_len,
@@ -290,6 +318,8 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--context-margin", type=int, default=256)
     parser.add_argument("--maximum-context", type=int, default=65536)
+    parser.add_argument("--minimum-prompt-tokens", type=int, default=0)
+    parser.add_argument("--maximum-prompt-tokens", type=int)
     args = parser.parse_args()
     if bool(args.trace) == bool(args.public_trajectories):
         parser.error("provide exactly one of --trace or --public-trajectories")
@@ -305,6 +335,8 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
             context_margin=args.context_margin,
             maximum_context=args.maximum_context,
+            minimum_prompt_tokens=args.minimum_prompt_tokens,
+            maximum_prompt_tokens=args.maximum_prompt_tokens,
         )
     else:
         result = freeze_workload(

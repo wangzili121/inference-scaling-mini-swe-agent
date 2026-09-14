@@ -1218,7 +1218,8 @@ experiments/swebench/stratify_cis_workload.py
 按现有 TP2 的508928-token KV capacity和P1配置，0.9 runtime budget预计首次分别放行
 32/20/13个 step；rolling reference 仍接近16。这只是容量模型结果，尚不是性能结论。
 
-待卡矩阵：三个分层分别跑 static cap16、rolling peak-token、runtime-KV 0.9；另以同一
+这一版待卡矩阵已被第25节的真实长上下文矩阵取代。旧方案原计划三个分层分别跑 static
+cap16、rolling peak-token、runtime-KV 0.9；另以同一
 P0设置补跑 `step-subtree-K`，直接回答 runtime dynamic 与“每 candidate 的 sibling
 rollout bundle”谁更好。旧数据中 subtree K8 相对当时 Step control 的 jobs/s 下降约
 17.8%，而新动态在另一组严格同卡 P0 中相对静态 cap16 的 FTS/s提高5.06%；由于不是同一
@@ -1240,7 +1241,8 @@ DCMI/categorical 枚举问题拦截。
 检查运行容器的 `.HostConfig.Devices`。默认遇到预留即失败；只有所有者明确确认后才允许用
 `CIS_ALLOW_DOCKER_RESERVED_DEVICES=1` 覆盖。
 
-新增 `run_cis_context_transfer_remote.sh`，支持断点续跑：
+新增 `run_cis_context_transfer_remote.sh`，支持断点续跑。以下是第一版矩阵，已被第25节
+更新：
 
 - `context`：P1 的 short/medium/long 分层分别运行 static cap16、rolling peak-token、
   runtime-KV 0.9；
@@ -1263,3 +1265,52 @@ preemption/KV waterline 做保守回退。绝不能使用跨数据集固定折�
 ```text
 docs/experiments/data/cis_kv_reservation_analysis_20260914.json
 ```
+
+## 25. 真实长上下文矩阵与当前执行边界
+
+为避免只在当前数据集的中等 context 上得到结论，已扫描完整公开 MiniAgent 轨迹目录：
+
+```text
+/data/disk/wangzili/datasets/qwen3-30b-mini-swe-agent-58389eb/trajectories
+```
+
+499个任务共有13884次模型调用，原始 API usage 显示 prompt 中位9457、最大112393；
+`8K-16K` 4896条、`16K-32K` 2481条、`32K-64K` 483条、`64K-128K` 51条，
+没有 `>=128K` 请求。模型配置支持262144位置长度，但这不能替代真实 workload 证据。
+
+因此正式 context-transfer 矩阵更新为：
+
+```text
+8K-16K   : static vs runtime-KV
+16K-32K  : static vs runtime-KV
+32K-64K  : static vs runtime-KV
+64K-128K : static vs runtime-KV
+```
+
+不再正式测试 `<4K`，也不再重复 rolling peak-token，共8组。短上下文仅用于 capability
+smoke。32K以上两个分层各由32条真实调用组成，准确 tokenizer 展开后分别为：
+
+- `32K-64K`：最小33134、中位44634、最大63198，`max_model_len=65536`；
+- `64K-128K`：最小65827、中位73131、P95 97468、最大110103，
+  `max_model_len=131072`。
+
+对应文件：
+
+```text
+/data/disk/wangzili/cis-context-strata-source/32k-64k/public-32.jsonl
+/data/disk/wangzili/cis-context-strata-source/64k-128k/public-32.jsonl
+```
+
+`workload.py` 已支持按 prompt token 范围筛选真实调用，并可自动选择16K/32K/64K/128K/
+262K context bucket；远程 runner 已支持逐组选择 workload 文件和 `max_model_len`。不截断、
+不 padding、不复制 prompt。由于当前没有安全空闲 TP2，长上下文性能 A/B 尚未启动。
+
+机器可读长度分布和 workload 校验值位于：
+
+```text
+docs/experiments/data/cis_context_distribution_20260914.json
+```
+
+这组实验的判断目标不是证明“所有实际调用都很长”，而是证明动态 admission 能在真实 Agent
+任务由8K增长到110K时自动收缩并发，同时保持设备饱和、无 OOM/KV preemption，并尽量接近
+每个分层单独调出的静态最佳。若它只能在某个分层有效，就不能称为通用动态策略。

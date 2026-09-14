@@ -643,6 +643,52 @@ def test_public_workload_skips_real_calls_outside_context_without_truncation(
     assert result["truncated"] is False
 
 
+def test_public_workload_filters_real_calls_by_prompt_length(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "trajectories"
+    source.mkdir()
+    for index, content in enumerate(("short", "medium", "long")):
+        (source / f"task-{index}.traj.json").write_text(
+            json.dumps(
+                {
+                    "instance_id": f"task-{index}",
+                    "messages": [
+                        {"role": "user", "content": content},
+                        {"role": "assistant", "content": "done"},
+                    ],
+                }
+            )
+        )
+    lengths = {"short": 4000, "medium": 12000, "long": 70000}
+    monkeypatch.setattr(
+        "inference_scaling.swe_agent.workload.random.Random.shuffle",
+        lambda self, values: None,
+    )
+    monkeypatch.setattr(
+        "inference_scaling.swe_agent.workload._token_counter",
+        lambda _model: lambda messages: lengths[messages[-1]["content"]],
+    )
+
+    result = build_public_workload(
+        source,
+        tmp_path / "output",
+        model="model",
+        total=1,
+        maximum_context=131072,
+        minimum_prompt_tokens=65536,
+        maximum_prompt_tokens=131072,
+    )
+
+    assert result["prompt_tokens"]["minimum"] == 70000
+    assert result["selected_max_model_len"] == 131072
+    assert result["prompt_range"] == {
+        "minimum": 65536,
+        "maximum_exclusive": 131072,
+    }
+    assert result["below_range_skipped"] == 2
+
+
 def test_swebench_launcher_selects_canonical_or_explicit_order() -> None:
     instances = [{"instance_id": f"task-{index}"} for index in range(5)]
 

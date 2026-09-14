@@ -1,0 +1,78 @@
+{
+  "source": {
+    "description": "Qwen3-30B mini-SWE-agent public trajectories",
+    "path": "/data/disk/wangzili/datasets/qwen3-30b-mini-swe-agent-58389eb/trajectories",
+    "trajectory_files": 499,
+    "length_source": "original API usage.prompt_tokens"
+  },
+  "calls": {
+    "total": 13884,
+    "missing_prompt_tokens": 0,
+    "minimum_prompt_tokens": 1184,
+    "median_prompt_tokens": 9457,
+    "maximum_prompt_tokens": 112393,
+    "buckets": [
+      {
+        "range": "[0, 8192)",
+        "count": 5973
+      },
+      {
+        "range": "[8192, 16384)",
+        "count": 4896
+      },
+      {
+        "range": "[16384, 32768)",
+        "count": 2481
+      },
+      {
+        "range": "[32768, 65536)",
+        "count": 483
+      },
+      {
+        "range": "[65536, 131072)",
+        "count": 51
+      },
+      {
+        "range": "[131072, null)",
+        "count": 0
+      }
+    ]
+  },
+  "exact_tokenizer_workloads": [
+    {
+      "range": "[32768, 65536)",
+      "path": "/data/disk/wangzili/cis-context-strata-source/32k-64k/public-32.jsonl",
+      "sha256": "83ad43ed7cc4b624808298ce92173daf88b789bbc8c4c89ef92858cb6928011e",
+      "requests": 32,
+      "minimum_prompt_tokens": 33134,
+      "median_prompt_tokens": 44634,
+      "p95_prompt_tokens": 60489,
+      "maximum_prompt_tokens": 63198,
+      "max_model_len": 65536
+    },
+    {
+      "range": "[65536, 131072)",
+      "path": "/data/disk/wangzili/cis-context-strata-source/64k-128k/public-32.jsonl",
+      "sha256": "4ab63f7925505b654fc2d3d1f4a3c4a498ae7e9f9ef80969cf130d9e5119505d",
+      "requests": 32,
+      "minimum_prompt_tokens": 65827,
+      "median_prompt_tokens": 73131,
+      "p95_prompt_tokens": 97468,
+      "maximum_prompt_tokens": 110103,
+      "max_model_len": 131072
+    }
+  ],
+  "policy": {
+    "formal_ranges": [
+      "[8192, 16384)",
+      "[16384, 32768)",
+      "[32768, 65536)",
+      "[65536, 131072)"
+    ],
+    "short_context_usage": "capability smoke only",
+    "truncate": false,
+    "pad": false,
+    "duplicate_prompts": false,
+    "synthetic_128k_plus": false
+  }
+}

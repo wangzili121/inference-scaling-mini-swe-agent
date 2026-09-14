@@ -17,6 +17,7 @@ image=${CIS_IMAGE:-wangzili/vllm-ascend:v0.18.0-msprof1.2.2-tzdata2025.3-pandas2
 workspace=${CIS_WORKSPACE:-/data/disk/wangzili/inference-scaling-mini-swe-agent-cis-forest}
 model=${CIS_MODEL_DIR:-/data/disk/models/Qwen3-Coder-30B-A3B-Instruct}
 public_workload=${CIS_PUBLIC_WORKLOAD_DIR:-/data/disk/wangzili/cis-artifacts-fc11386/workloads/public-256}
+public_workload_file=${CIS_PUBLIC_WORKLOAD_FILE:-public-256.jsonl}
 self_workload=${CIS_SELF_WORKLOAD_DIR:-/data/disk/wangzili/cis-artifacts-629451f/workloads/self-128}
 categorical=${CIS_CATEGORICAL_DIR:-/data/disk/wangzili/vllm-categorical-runtime}
 cache=${CIS_VLLM_CACHE:-/data/disk/wangzili/vllm-cache-v018-cis-forest}
@@ -30,6 +31,7 @@ active_step_limit=${CIS_ACTIVE_STEP_LIMIT:-6}
 active_step_max_limit=${CIS_ACTIVE_STEP_MAX_LIMIT:-32}
 active_step_token_budget=${CIS_ACTIVE_STEP_TOKEN_BUDGET:-}
 active_step_kv_capacity_fraction=${CIS_ACTIVE_STEP_KV_CAPACITY_FRACTION:-0.90}
+max_model_len=${CIS_MAX_MODEL_LEN:-65536}
 fork_lease_max_fraction=${CIS_FORK_LEASE_MAX_FRACTION:-0.20}
 active_step_borrow_limit=${CIS_ACTIVE_STEP_BORROW_LIMIT:-12}
 active_step_borrow_below=${CIS_ACTIVE_STEP_BORROW_BELOW:-64}
@@ -51,12 +53,16 @@ native_runtime_setup=:
 variant_docker_env=()
 fixed_length_arg=
 
-for value in "$limit" "$workers" "$candidate_count" "$rollout_count" "$block_size" "$active_step_limit" "$active_step_max_limit"; do
+for value in "$limit" "$workers" "$candidate_count" "$rollout_count" "$block_size" "$active_step_limit" "$active_step_max_limit" "$max_model_len"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || {
     echo "workload and scheduling values must be positive integers" >&2
     exit 2
   }
 done
+[[ "$public_workload_file" != */* && -n "$public_workload_file" ]] || {
+  echo "CIS_PUBLIC_WORKLOAD_FILE must be a file name" >&2
+  exit 2
+}
 [[ "$tree_initial_window" =~ ^[1-9][0-9]*$ ]] || {
   echo "tree initial window must be a positive integer" >&2
   exit 2
@@ -104,6 +110,10 @@ fi
 for path in "$workspace" "$model" "$public_workload" "$self_workload" "$categorical"; do
   [[ -e "$path" ]] || { echo "missing dependency: $path" >&2; exit 1; }
 done
+[[ -f "$public_workload/$public_workload_file" ]] || {
+  echo "missing workload file: $public_workload/$public_workload_file" >&2
+  exit 1
+}
 [[ -x /usr/local/bin/npu-smi ]] || { echo "npu-smi is unavailable" >&2; exit 1; }
 if ss -H -ltn "sport = :$port" | grep -q .; then
   echo "port is already in use: $port" >&2
@@ -685,6 +695,7 @@ CIS_IMAGE=$image
 CIS_WORKSPACE=$workspace
 CIS_MODEL_DIR=$model
 CIS_PUBLIC_WORKLOAD_DIR=$public_workload
+CIS_PUBLIC_WORKLOAD_FILE=$public_workload_file
 CIS_SELF_WORKLOAD_DIR=$self_workload
 CIS_CATEGORICAL_DIR=$categorical
 CIS_VLLM_CACHE=$cache
@@ -698,6 +709,7 @@ CIS_ACTIVE_STEP_LIMIT=$active_step_limit
 CIS_ACTIVE_STEP_MAX_LIMIT=$active_step_max_limit
 CIS_ACTIVE_STEP_TOKEN_BUDGET=$active_step_token_budget
 CIS_ACTIVE_STEP_KV_CAPACITY_FRACTION=$active_step_kv_capacity_fraction
+CIS_MAX_MODEL_LEN=$max_model_len
 CIS_ACTIVE_STEP_BORROW_LIMIT=$active_step_borrow_limit
 CIS_ACTIVE_STEP_BORROW_BELOW=$active_step_borrow_below
 CIS_ENGINE_FORK_RUNNABLE_FRACTION=$engine_fork_runnable_fraction
@@ -752,7 +764,7 @@ docker run -d \
     /usr/local/python3.11.14/bin/python -c 'import inference_scaling.swe_agent.profile as p; print(p.__file__)'
     exec /usr/local/python3.11.14/bin/python -m inference_scaling.swe_agent.profile \
       --config /workspace/configs/swebench/conditional_is_smoke.toml \
-      --workload /workloads/public/public-256.jsonl \
+      --workload /workloads/public/$public_workload_file \
       --warmup-workload /workloads/self/warmup-4.jsonl \
       --tensor-parallel-size ${#device_ids[@]} \
       --pipeline-parallel-size 1 \
@@ -762,7 +774,7 @@ docker run -d \
       --categorical-root /categorical \
       --set generation.max_new_tokens=512 \
       $fixed_length_arg \
-      --set vllm.max_model_len=65536 \
+      --set vllm.max_model_len=$max_model_len \
       --set vllm.max_num_seqs=256 \
       --set vllm.max_num_batched_tokens=32768 \
       --set vllm.gpu_memory_utilization=0.90 \
