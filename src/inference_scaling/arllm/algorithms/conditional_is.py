@@ -222,6 +222,8 @@ class PeakTokenStepAdmissionController(StepAdmissionController):
         limit: int,
         *,
         max_active_steps: int,
+        token_budget: int | None = None,
+        token_block_size: int = 1,
         reference_window: int = 32,
         queue_policy: str = "fifo",
         coalesce_seconds: float = 0.0,
@@ -235,10 +237,16 @@ class PeakTokenStepAdmissionController(StepAdmissionController):
             raise ValueError("unknown peak-token queue policy")
         if coalesce_seconds < 0:
             raise ValueError("coalesce seconds must not be negative")
+        if token_budget is not None and token_budget <= 0:
+            raise ValueError("peak-token budget must be positive")
+        if token_block_size <= 0:
+            raise ValueError("peak-token block size must be positive")
         self.max_active_steps = int(max_active_steps)
         self.queue_policy = queue_policy
         self.coalesce_seconds = float(coalesce_seconds)
-        self.token_budget: int | None = None
+        self.token_budget = None if token_budget is None else int(token_budget)
+        self.fixed_token_budget = token_budget is not None
+        self.token_block_size = int(token_block_size)
         self.active_tokens = 0
         self.peak_active_tokens = 0
         self._claims: dict[str, int] = {}
@@ -260,7 +268,10 @@ class PeakTokenStepAdmissionController(StepAdmissionController):
             claim_id, (tokens, _, _) = min(
                 self._waiters.items(), key=lambda item: item[1][2]
             )
-            if self.active_tokens + tokens <= self.token_budget:
+            if (
+                self.active_tokens + tokens <= self.token_budget
+                or self._active == 0
+            ):
                 return claim_id
             return None
         fitting = (
@@ -280,7 +291,16 @@ class PeakTokenStepAdmissionController(StepAdmissionController):
                 key=lambda item: (item[1][0], item[1][2]),
                 default=None,
             )
-        return None if selected is None else selected[0]
+        if selected is not None:
+            return selected[0]
+        if self._active == 0:
+            # A single oversized step must make progress. The estimate is a
+            # conservative peak reservation; vLLM remains the final KV guard.
+            selected = min(
+                self._waiters.items(), key=lambda item: item[1][2]
+            )
+            return selected[0]
+        return None
 
     def acquire(
         self,
@@ -295,7 +315,7 @@ class PeakTokenStepAdmissionController(StepAdmissionController):
         with self._condition:
             if claim_id in self._claims or claim_id in self._waiters:
                 raise RuntimeError("duplicate peak-token admission claim")
-            if reference_sample:
+            if reference_sample and not self.fixed_token_budget:
                 self._reference_tokens.append(estimated_tokens)
                 self.token_budget = round(
                     self.limit
@@ -371,7 +391,11 @@ class PeakTokenStepAdmissionController(StepAdmissionController):
                 self.transition_failures += 1
                 return False
             next_total = self.active_tokens - previous + estimated_tokens
-            if estimated_tokens > previous and next_total > self.token_budget:
+            if (
+                estimated_tokens > previous
+                and next_total > self.token_budget
+                and self._active > 1
+            ):
                 self.transition_failures += 1
                 return False
             del self._claims[claim_id]
@@ -1850,11 +1874,21 @@ class AutoregressiveStepwiseAdapter:
                 if rollout_length
                 else 0
             )
+        allocation_block = getattr(
+            self.step_admission_controller, "token_block_size", 1
+        )
+
+        def allocated(tokens: int) -> int:
+            if tokens <= 0:
+                return 0
+            return (
+                (tokens + allocation_block - 1) // allocation_block
+            ) * allocation_block
+
         return (
-            len(self.prompt)
-            + len(state)
-            + self.config.candidate_count * candidate_length
-            + rollout_requests * rollout_length
+            allocated(len(self.prompt) + len(state))
+            + self.config.candidate_count * allocated(candidate_length)
+            + rollout_requests * allocated(rollout_length)
         )
 
     def propose(
@@ -1894,6 +1928,9 @@ class AutoregressiveStepwiseAdapter:
                 ),
                 active_step_token_budget=getattr(
                     self.step_admission_controller, "token_budget", None
+                ),
+                active_step_token_block_size=getattr(
+                    self.step_admission_controller, "token_block_size", None
                 ),
                 continued_admission=continued,
                 admission_transitions=getattr(

@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
   echo "usage: $0 VARIANT DEVICES OUTPUT PORT CONTAINER" >&2
-  echo "VARIANT: baseline | step-cap-only | step-priority-only | job-gang | step-cohort-auto | step-cohort-N | step-tree-adaptive | step-tree-fractional | step-tree-tail-borrow | step-tree-peak-budget | step-tree-continuation | step-tree-work-conserving | step-peak-budget | step-peak-budget-lpt | step-peak-budget-balanced | step-gang | step-gang-6 | step-gang-piecewise | step-gang-dual-graph | step-forest-attention | step-forest-attention-piecewise | step-forest-attention-dual-graph | step-forest-window-N | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
+  echo "VARIANT: baseline | step-cap-only | step-priority-only | job-gang | step-cohort-auto | step-cohort-N | step-tree-adaptive | step-tree-fractional | step-tree-tail-borrow | step-tree-peak-budget | step-tree-continuation | step-tree-work-conserving | step-peak-budget | step-runtime-kv-budget | step-peak-budget-lpt | step-peak-budget-balanced | step-gang | step-gang-6 | step-gang-piecewise | step-gang-dual-graph | step-forest-attention | step-forest-attention-piecewise | step-forest-attention-dual-graph | step-forest-window-N | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
   exit 2
 fi
 
@@ -28,6 +28,8 @@ rollout_count=${CIS_ROLLOUT_COUNT:-3}
 block_size=${CIS_BLOCK_SIZE:-128}
 active_step_limit=${CIS_ACTIVE_STEP_LIMIT:-6}
 active_step_max_limit=${CIS_ACTIVE_STEP_MAX_LIMIT:-32}
+active_step_token_budget=${CIS_ACTIVE_STEP_TOKEN_BUDGET:-}
+active_step_kv_capacity_fraction=${CIS_ACTIVE_STEP_KV_CAPACITY_FRACTION:-0.90}
 fork_lease_max_fraction=${CIS_FORK_LEASE_MAX_FRACTION:-0.20}
 active_step_borrow_limit=${CIS_ACTIVE_STEP_BORROW_LIMIT:-12}
 active_step_borrow_below=${CIS_ACTIVE_STEP_BORROW_BELOW:-64}
@@ -64,6 +66,14 @@ if [[ -n "$tree_max_window" && ! "$tree_max_window" =~ ^[1-9][0-9]*$ ]]; then
 fi
 if [[ -n "$tree_peak_token_budget" && ! "$tree_peak_token_budget" =~ ^[1-9][0-9]*$ ]]; then
   echo "tree peak token budget must be empty or a positive integer" >&2
+  exit 2
+fi
+if [[ -n "$active_step_token_budget" && ! "$active_step_token_budget" =~ ^[1-9][0-9]*$ ]]; then
+  echo "active step token budget must be empty or a positive integer" >&2
+  exit 2
+fi
+if [[ ! "$active_step_kv_capacity_fraction" =~ ^(0\.[0-9]*[1-9][0-9]*|1(\.0+)?)$ ]]; then
+  echo "active step KV capacity fraction must be in (0, 1]" >&2
   exit 2
 fi
 [[ "$tree_continuation_grace_ms" =~ ^[0-9]+$ ]] || {
@@ -227,6 +237,23 @@ case "$variant" in
       --set conditional_is.active_step_max_limit="$active_step_max_limit"
       --set 'vllm.request_priority_policy=\"step_fifo\"'
     )
+    ;;
+  step-runtime-kv-budget)
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --check /workspace/infra/vllm_ascend/cis_scheduler/vllm-0.18-kv-capacity.patch && git apply /workspace/infra/vllm_ascend/cis_scheduler/vllm-0.18-kv-capacity.patch'
+    variant_args=(
+      --set conditional_is.candidate_count="$candidate_count"
+      --set conditional_is.rollout_count="$rollout_count"
+      --set conditional_is.block_size="$block_size"
+      --set 'conditional_is.active_step_admission=\"runtime_kv_budget\"'
+      --set conditional_is.active_step_max_limit="$active_step_max_limit"
+      --set conditional_is.active_step_kv_capacity_fraction="$active_step_kv_capacity_fraction"
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+    )
+    if [[ -n "$active_step_token_budget" ]]; then
+      variant_args+=(
+        --set conditional_is.active_step_token_budget="$active_step_token_budget"
+      )
+    fi
     ;;
   step-peak-budget-lpt)
     variant_args=(
@@ -641,6 +668,8 @@ CIS_ROLLOUT_COUNT=$rollout_count
 CIS_BLOCK_SIZE=$block_size
 CIS_ACTIVE_STEP_LIMIT=$active_step_limit
 CIS_ACTIVE_STEP_MAX_LIMIT=$active_step_max_limit
+CIS_ACTIVE_STEP_TOKEN_BUDGET=$active_step_token_budget
+CIS_ACTIVE_STEP_KV_CAPACITY_FRACTION=$active_step_kv_capacity_fraction
 CIS_ACTIVE_STEP_BORROW_LIMIT=$active_step_borrow_limit
 CIS_ACTIVE_STEP_BORROW_BELOW=$active_step_borrow_below
 CIS_ENGINE_FORK_RUNNABLE_FRACTION=$engine_fork_runnable_fraction
@@ -696,7 +725,7 @@ docker run -d \
       --config /workspace/configs/swebench/conditional_is_smoke.toml \
       --workload /workloads/public/public-256.jsonl \
       --warmup-workload /workloads/self/warmup-4.jsonl \
-      --tensor-parallel-size 2 \
+      --tensor-parallel-size ${#device_ids[@]} \
       --pipeline-parallel-size 1 \
       --profiler none \
       --limit $limit \

@@ -133,3 +133,37 @@ d550491fd7121b607360a2bdbddd93190062e40bb788b54305f08eded7a8d387  fixed-work/p1-
 947be328b2a4b3a5229dddf25b28b1cabb2d55e103be1a3aec78987f2bbede82  real-eos/p0-static-confirm-05/benchmark.json
 81bb36f3b15868952d86fd43dd935fd7b3d5c032a082e0e4b74c7cac6250db7e  real-eos/p0-outer-confirm-05/benchmark.json
 ```
+
+## 9. Runtime-KV 跨上下文扩展
+
+后续检查发现，滚动方案的预算是 `cap16 * 最近 step0 平均 reservation`。当整个数据集
+从短上下文切换为长上下文时，分子与预算会同步变大，活跃 step 数仍接近16。因此它只能
+处理同一 workload 内部的长短异构，不能真正适应整体 context shift。
+
+当前分支已增加 `runtime_kv_budget` 模式：
+
+- 通过一个只读 EngineCore utility 获取每 rank 的 `num_gpu_blocks`、KV `block_size` 和
+  `token_capacity`；
+- 使用 `token_capacity * active_step_kv_capacity_fraction` 作为固定硬件预算，默认安全
+  系数为0.9；
+- shared trunk、candidate suffix 和每条 rollout tail 分别按真实 KV block 向上取整；
+- 单个 step 的保守估算超过预算时允许独占前进，避免永久等待；
+- terminal candidate resize、FIFO locality 和同 job 原子 continuation 继续保留。
+
+已从同一公开 workload 确定性抽取三个32请求分层，未复制 prompt：
+
+| 分层 | 范围 | prompt 中位数 | prompt 最小/最大 | 0.9 runtime budget 预计初始 step 数 |
+|---|---:|---:|---:|---:|
+| short | `<4K` | 2813.5 | 1518 / 4086 | 32 |
+| medium | `8K-16K` | 11530.5 | 8703 / 16055 | 20 |
+| long | `16K-32K` | 20376.5 | 16500 / 31934 | 13 |
+
+以上 step 数按既有 TP2 日志中的 508928-token KV capacity、0.9安全系数和 P1
+`C8/R3/B128/L512` 计算。它显示新模式会随整体上下文变长自动从32降到20、13，而滚动
+reference 模式基本仍保持16。
+
+正式 NPU 验证矩阵为三种分层分别比较 static cap16、rolling peak-token 和
+runtime-KV 0.9；再在相同 P0 条件补跑 candidate-subtree bundle。当前两台服务器都只有
+单张空闲卡，没有可用 TP2 组合。单卡4B capability 尝试在模型启动前被 Ascend DCMI/
+categorical 的全机设备枚举失败拦截，并非 admission 代码错误。代码、workload 和运行入口
+均已准备，不能在没有同条件 NPU 数据前把上述预计并发写成性能收益。

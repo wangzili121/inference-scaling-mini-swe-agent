@@ -327,6 +327,14 @@ class ConditionalISRunner:
                 if conditional.get("active_step_max_limit") in (None, 0)
                 else int(conditional["active_step_max_limit"])
             ),
+            active_step_token_budget=(
+                None
+                if conditional.get("active_step_token_budget") in (None, 0)
+                else int(conditional["active_step_token_budget"])
+            ),
+            active_step_kv_capacity_fraction=float(
+                conditional.get("active_step_kv_capacity_fraction", 0.9)
+            ),
             active_step_reference_window=int(
                 conditional.get("active_step_reference_window", 32)
             ),
@@ -355,7 +363,47 @@ class ConditionalISRunner:
                 batch_size=self.conditional.rollout_frontier_batch_size,
             )
         )
-        if self.conditional.active_step_limit is None:
+        if self.conditional.active_step_admission == "runtime_kv_budget":
+            if self.conditional.active_step_borrow_limit is not None:
+                raise ValueError(
+                    "runtime-KV and occupancy-borrow admission are mutually exclusive"
+                )
+            geometry = getattr(backend, "kv_cache_geometry", None)
+            if callable(geometry):
+                geometry = geometry()
+            capacity = (
+                geometry.get("token_capacity")
+                if isinstance(geometry, Mapping)
+                else getattr(backend, "kv_token_capacity", None)
+            )
+            if callable(capacity):
+                capacity = capacity()
+            configured_budget = self.conditional.active_step_token_budget
+            if configured_budget is None:
+                if not isinstance(capacity, int) or capacity <= 0:
+                    raise ValueError(
+                        "runtime-KV admission requires vLLM KV capacity or an "
+                        "explicit active_step_token_budget"
+                    )
+                configured_budget = int(
+                    capacity * self.conditional.active_step_kv_capacity_fraction
+                )
+            max_active_steps = self.conditional.active_step_max_limit
+            assert max_active_steps is not None
+            self.step_admission_controller = PeakTokenStepAdmissionController(
+                self.conditional.active_step_limit or max_active_steps,
+                max_active_steps=max_active_steps,
+                token_budget=configured_budget,
+                token_block_size=(
+                    int(geometry.get("block_size", 1))
+                    if isinstance(geometry, Mapping)
+                    else 1
+                ),
+                reference_window=self.conditional.active_step_reference_window,
+                queue_policy=self.conditional.active_step_queue_policy,
+                coalesce_seconds=self.conditional.active_step_coalesce_seconds,
+            )
+        elif self.conditional.active_step_limit is None:
             self.step_admission_controller = None
         elif self.conditional.active_step_admission == "peak_token_budget":
             if self.conditional.active_step_borrow_limit is not None:
@@ -723,6 +771,16 @@ class ConditionalISRunner:
                 "candidate_count": conditional.candidate_count,
                 "rollout_count": conditional.rollout_count,
                 "block_size": conditional.block_size,
+                "active_step_admission": conditional.active_step_admission,
+                "active_step_token_budget": getattr(
+                    self.step_admission_controller, "token_budget", None
+                ),
+                "runtime_kv_token_capacity": getattr(
+                    self.backend, "kv_token_capacity", None
+                ),
+                "runtime_kv_cache_geometry": getattr(
+                    self.backend, "kv_cache_geometry", None
+                ),
                 "engine_fork_candidate_rollouts": (
                     conditional.engine_fork_candidate_rollouts
                 ),

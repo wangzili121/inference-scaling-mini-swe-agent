@@ -167,6 +167,31 @@ def test_runner_can_disable_eos_for_fixed_work_performance_runs(
     assert runner.sampling.eos_token_id is None
 
 
+def test_runner_derives_dynamic_step_budget_from_runtime_kv_capacity(
+    tmp_path: Path,
+) -> None:
+    backend = _AgentBackend()
+    backend.kv_token_capacity = 1000
+    backend.kv_cache_geometry = {
+        "num_gpu_blocks": 10,
+        "block_size": 100,
+        "token_capacity": 1000,
+    }
+    config = _runner_config(tmp_path / "trace.jsonl")
+    config["conditional_is"].update(
+        active_step_admission="runtime_kv_budget",
+        active_step_max_limit=8,
+        active_step_kv_capacity_fraction=0.8,
+    )
+
+    runner = ConditionalISRunner(backend, config)
+
+    assert runner.step_admission_controller is not None
+    assert runner.step_admission_controller.token_budget == 800
+    assert runner.step_admission_controller.token_block_size == 100
+    assert runner.step_admission_controller.fixed_token_budget
+
+
 def test_runner_coalesces_retry_equivalent_request_ids(tmp_path: Path) -> None:
     trace = tmp_path / "calls.jsonl"
     backend = _AgentBackend()

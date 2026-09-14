@@ -1462,6 +1462,7 @@ class AsyncVLLMBackend(VLLMBackend):
             )
         self._request_priority_policy = request_priority_policy
         self._request_priority_cohort_size = int(request_priority_cohort_size)
+        self._kv_cache_geometry_cache: dict[str, int] | None = None
         self._native_parallel_sampling = bool(native_parallel_sampling)
         self._native_packed_forest_attention = bool(
             native_packed_forest_attention
@@ -1525,6 +1526,58 @@ class AsyncVLLMBackend(VLLMBackend):
         """Observe request-level lifecycle events without changing scheduling."""
 
         self._request_trace_observer = observer
+
+    @property
+    def kv_cache_geometry(self) -> Mapping[str, int] | None:
+        """Return per-rank KV capacity and allocation block size."""
+
+        if self._kv_cache_geometry_cache is not None:
+            return dict(self._kv_cache_geometry_cache)
+        config = getattr(self._engine, "vllm_config", None)
+        cache = getattr(config, "cache_config", None)
+        num_blocks = getattr(cache, "num_gpu_blocks", None)
+        block_size = getattr(cache, "block_size", None)
+        if (
+            isinstance(num_blocks, int)
+            and num_blocks > 0
+            and isinstance(block_size, int)
+            and block_size > 0
+        ):
+            self._kv_cache_geometry_cache = {
+                "num_gpu_blocks": num_blocks,
+                "block_size": block_size,
+                "token_capacity": num_blocks * block_size,
+            }
+            return dict(self._kv_cache_geometry_cache)
+
+        async def read_engine_core_geometry() -> Mapping[str, int] | None:
+            engine_core = getattr(self._engine, "engine_core", None)
+            callback = getattr(engine_core, "call_utility_async", None)
+            if callback is None:
+                return None
+            try:
+                value = await callback("cis_kv_cache_geometry")
+            except (AttributeError, RuntimeError):
+                return None
+            if not isinstance(value, Mapping):
+                return None
+            if not all(
+                isinstance(value.get(name), int) and value[name] > 0
+                for name in ("num_gpu_blocks", "block_size", "token_capacity")
+            ):
+                return None
+            return value
+
+        geometry = self._runner.run(read_engine_core_geometry())
+        if geometry is None:
+            return None
+        self._kv_cache_geometry_cache = dict(geometry)
+        return dict(self._kv_cache_geometry_cache)
+
+    @property
+    def kv_token_capacity(self) -> int | None:
+        geometry = self.kv_cache_geometry
+        return None if geometry is None else geometry["token_capacity"]
 
     def _observe_request(self, event: Mapping[str, Any]) -> None:
         observer = self._request_trace_observer

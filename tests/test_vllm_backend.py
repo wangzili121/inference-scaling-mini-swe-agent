@@ -574,6 +574,12 @@ class _UtilityCore:
 
     async def call_utility_async(self, method, *args):
         self.calls.append((method, args))
+        if method == "cis_kv_cache_geometry":
+            return {
+                "num_gpu_blocks": 123,
+                "block_size": 128,
+                "token_capacity": 15744,
+            }
         return {"evicted_blocks": 7}
 
 
@@ -607,6 +613,48 @@ def test_async_vllm_overlaps_requests_from_independent_callers() -> None:
     assert engine.profile_events == [("start", "async"), ("stop", None)]
     backend.close()
     assert engine.closed
+
+
+def test_async_vllm_exposes_initialized_kv_token_capacity() -> None:
+    engine = _AsyncEngine()
+    engine.vllm_config = types.SimpleNamespace(
+        cache_config=types.SimpleNamespace(
+            num_gpu_blocks=123,
+            block_size=128,
+        )
+    )
+    backend = AsyncVLLMBackend(
+        engine,
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+    )
+
+    assert backend.kv_token_capacity == 123 * 128
+    assert backend.kv_cache_geometry == {
+        "num_gpu_blocks": 123,
+        "block_size": 128,
+        "token_capacity": 123 * 128,
+    }
+    backend.close()
+
+
+def test_async_vllm_reads_kv_capacity_from_engine_core() -> None:
+    engine = _AsyncEngine()
+    engine.engine_core = _UtilityCore()
+    backend = AsyncVLLMBackend(
+        engine,
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+    )
+
+    assert backend.kv_token_capacity == 15744
+    assert backend.kv_token_capacity == 15744
+    assert engine.engine_core.calls == [("cis_kv_cache_geometry", ())]
+    backend.close()
 
 
 def test_async_vllm_streams_completion_callbacks_and_draft_observations() -> None:

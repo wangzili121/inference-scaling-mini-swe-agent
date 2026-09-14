@@ -1,0 +1,25 @@
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index ea2c2a6..95a078e 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1881,1 +1881,11 @@ class Scheduler(SchedulerInterface):
++    def cis_kv_cache_geometry(self) -> dict[str, int]:
++        """Return per-rank KV geometry without exposing block-pool internals."""
++        num_gpu_blocks = self.cache_config.num_gpu_blocks
++        assert num_gpu_blocks is not None and num_gpu_blocks > 0
++        return {
++            "num_gpu_blocks": num_gpu_blocks,
++            "block_size": self.block_size,
++            "token_capacity": num_gpu_blocks * self.block_size,
++        }
++
+     def reset_connector_cache(self) -> bool:
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 2f2acdd..1121501 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -579,1 +579,4 @@ class EngineCore:
++    def cis_kv_cache_geometry(self) -> dict[str, int]:
++        return self.scheduler.cis_kv_cache_geometry()
++
+     def reset_encoder_cache(self) -> None:

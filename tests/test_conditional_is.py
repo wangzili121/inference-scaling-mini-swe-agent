@@ -147,6 +147,34 @@ def test_peak_token_step_admission_recalibrates_and_keeps_smaller_continuation()
     controller.release("b-next")
 
 
+def test_peak_token_step_admission_keeps_runtime_budget_across_workloads() -> None:
+    controller = PeakTokenStepAdmissionController(
+        4,
+        max_active_steps=8,
+        token_budget=500,
+        token_block_size=100,
+    )
+
+    controller.acquire(
+        claim_id="short",
+        estimated_tokens=100,
+        reference_sample=True,
+    )
+    assert controller.token_budget == 500
+    assert controller.token_block_size == 100
+    controller.release("short")
+
+    controller.acquire(
+        claim_id="long",
+        estimated_tokens=600,
+        reference_sample=True,
+    )
+    assert controller.token_budget == 500
+    assert controller.active_tokens == 600
+    assert controller.transition("long", "long-next", 700)
+    controller.release("long-next")
+
+
 def _exact_first_token_target() -> dict[int, float]:
     base_first = (0.7, 0.3)
     completion = ((0.9, 0.1), (0.2, 0.8))

@@ -114,6 +114,8 @@ class ConditionalISConfig:
     active_step_limit: int | None = None
     active_step_admission: str = "fixed"
     active_step_max_limit: int | None = None
+    active_step_token_budget: int | None = None
+    active_step_kv_capacity_fraction: float = 0.9
     active_step_reference_window: int = 32
     active_step_queue_policy: str = "fifo"
     active_step_coalesce_seconds: float = 0.0
@@ -177,18 +179,40 @@ class ConditionalISConfig:
         )
         if self.active_step_limit is not None:
             require_positive("active_step_limit", self.active_step_limit)
-        if self.active_step_admission not in {"fixed", "peak_token_budget"}:
+        if self.active_step_admission not in {
+            "fixed",
+            "peak_token_budget",
+            "runtime_kv_budget",
+        }:
             raise ValueError("unknown active_step_admission")
-        if self.active_step_admission != "fixed" and self.active_step_limit is None:
-            raise ValueError("dynamic active_step_admission requires active_step_limit")
+        if (
+            self.active_step_admission == "peak_token_budget"
+            and self.active_step_limit is None
+        ):
+            raise ValueError("rolling peak-token admission requires active_step_limit")
+        if self.active_step_token_budget is not None:
+            require_positive("active_step_token_budget", self.active_step_token_budget)
+        if not 0 < self.active_step_kv_capacity_fraction <= 1:
+            raise ValueError("active_step_kv_capacity_fraction must be in (0, 1]")
         if self.active_step_max_limit is not None:
             require_positive("active_step_max_limit", self.active_step_max_limit)
-            if self.active_step_limit is None:
+            if (
+                self.active_step_limit is None
+                and self.active_step_admission != "runtime_kv_budget"
+            ):
                 raise ValueError("active_step_max_limit requires active_step_limit")
-            if self.active_step_max_limit < self.active_step_limit:
+            if (
+                self.active_step_limit is not None
+                and self.active_step_max_limit < self.active_step_limit
+            ):
                 raise ValueError(
                     "active_step_max_limit must not be below active_step_limit"
                 )
+        if (
+            self.active_step_admission == "runtime_kv_budget"
+            and self.active_step_max_limit is None
+        ):
+            raise ValueError("runtime KV admission requires active_step_max_limit")
         require_positive(
             "active_step_reference_window", self.active_step_reference_window
         )

@@ -1194,3 +1194,37 @@ docs/experiments/data/cis_dynamic_peak_token_admission_20260914.json
 ```
 
 本轮只使用服务器 `159.138.5.111` 启动前空闲的物理 NPU 0/5；所有本轮容器均已退出。
+
+## 22. Runtime-KV Context Transfer 扩展已实现，待双卡验证
+
+继续审计发现第21节 rolling peak-token 仍以 `cap16 * workload 平均 step 成本` 为预算，
+所以数据集整体变长时并发不会自动下降。当前工作区已新增 `runtime_kv_budget`：用最小
+vLLM v0.18 EngineCore 只读补丁返回每 rank KV block 数、block size 和 token capacity，
+外层 controller 以容量的0.9为硬件预算，并按真实 KV block 粒度估算 CIS step。
+
+新增固定 workload 工具：
+
+```text
+experiments/swebench/stratify_cis_workload.py
+```
+
+它从原 public-256 无放回抽取32条 short `<4K`、medium `8K-16K`、long
+`16K-32K` 请求，中位 prompt 分别为2813.5、11530.5、20376.5。分层文件已放在服务器：
+
+```text
+/data/disk/wangzili/cis-context-strata/{short,medium,long}
+```
+
+按现有 TP2 的508928-token KV capacity和P1配置，0.9 runtime budget预计首次分别放行
+32/20/13个 step；rolling reference 仍接近16。这只是容量模型结果，尚不是性能结论。
+
+待卡矩阵：三个分层分别跑 static cap16、rolling peak-token、runtime-KV 0.9；另以同一
+P0设置补跑 `step-subtree-K`，直接回答 runtime dynamic 与“每 candidate 的 sibling
+rollout bundle”谁更好。旧数据中 subtree K8 相对当时 Step control 的 jobs/s 下降约
+17.8%，而新动态在另一组严格同卡 P0 中相对静态 cap16 的 FTS/s提高5.06%；由于不是同一
+轮 A/B，当前只能说新方案更有希望，不能把两组百分比直接相减。
+
+本地验证：相关 pytest `140 passed, 1 deselected`；被排除的 Sobol 用例只因本机没有
+torch。vLLM v0.18 capacity patch 已在官方镜像源码上通过 `git apply --check`。两台服务器
+检查时都只剩一张空闲卡，未抢占他人设备；单卡4B smoke 在模型加载前被 Ascend 的全机
+DCMI/categorical 枚举问题拦截。
