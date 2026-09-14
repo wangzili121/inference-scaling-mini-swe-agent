@@ -4,7 +4,8 @@ set -euo pipefail
 if [[ $# -ne 5 ]]; then
   echo "usage: $0 DEVICES OUTPUT_ROOT PORT CONTAINER_PREFIX PHASE" >&2
   echo "PHASE: smoke | full | tune | all" >&2
-  echo "tune uses CIS_PLUGIN_RUNTIME_VARIANT=outer|engine (default: outer)" >&2
+  echo "full/tune use CIS_PLUGIN_RUNTIME_VARIANT=outer|engine|both" >&2
+  echo "full defaults to both; tune defaults to outer and rejects both" >&2
   exit 2
 fi
 
@@ -46,7 +47,7 @@ run_matrix() {
         runner_variant=step-tree-runtime-kv
         ;;
       *)
-        echo "CIS_PLUGIN_RUNTIME_VARIANT must be outer or engine" >&2
+        echo "tune requires CIS_PLUGIN_RUNTIME_VARIANT=outer or engine" >&2
         exit 2
         ;;
     esac
@@ -59,17 +60,34 @@ run_matrix() {
       "p1-$runtime_variant-f95|$runner_variant|8|3|1|32|16|0.95"
     )
   else
+    local runtime_variant=${CIS_PLUGIN_RUNTIME_VARIANT:-both}
+    case "$runtime_variant" in
+      outer|engine|both)
+        ;;
+      *)
+        echo "full requires CIS_PLUGIN_RUNTIME_VARIANT=outer, engine, or both" >&2
+        exit 2
+        ;;
+    esac
     specs=(
       "p0-static-cap6|step-gang|15|3|0|64|6|0.90"
       "p0-static-cap16|step-gang|15|3|0|64|16|0.90"
       "p0-rolling|step-peak-budget|15|3|0|64|16|0.90"
-      "p0-outer-runtime|step-runtime-kv-budget|15|3|0|64|16|0.90"
-      "p0-engine-runtime|step-tree-runtime-kv|15|3|0|64|16|0.90"
       "p1-static-cap16|step-gang|8|3|1|32|16|0.90"
       "p1-rolling|step-peak-budget|8|3|1|32|16|0.90"
-      "p1-outer-runtime|step-runtime-kv-budget|8|3|1|32|16|0.90"
-      "p1-engine-runtime|step-tree-runtime-kv|8|3|1|32|16|0.90"
     )
+    if [[ "$runtime_variant" == outer || "$runtime_variant" == both ]]; then
+      specs+=(
+        "p0-outer-runtime|step-runtime-kv-budget|15|3|0|64|16|0.90"
+        "p1-outer-runtime|step-runtime-kv-budget|8|3|1|32|16|0.90"
+      )
+    fi
+    if [[ "$runtime_variant" == engine || "$runtime_variant" == both ]]; then
+      specs+=(
+        "p0-engine-runtime|step-tree-runtime-kv|15|3|0|64|16|0.90"
+        "p1-engine-runtime|step-tree-runtime-kv|8|3|1|32|16|0.90"
+      )
+    fi
   fi
 
   for spec in "${specs[@]}"; do

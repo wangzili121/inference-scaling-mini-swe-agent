@@ -75,9 +75,11 @@ FTS/s提升5.06%的结果属于 rolling peak-token，不是尚未运行 NPU A/B 
 静态 cap16 的结果，硬件容量推导的 runtime-KV 尚无 NPU 结论。
 
 smoke 只运行两个尚未验证的新 runtime-KV 架构，不重复静态与 rolling。只有 EngineCore
-版本成功率100%、无 OOM，且 jobs/s/FTS/s 不比算法层版本低10%，才运行 full。正式结果
-同时比较 jobs/s、FTS/s、generated tokens/s、Job/Barrier P95、prefill、APC 和
-preemption，不能只用 jobs/s。
+版本成功率100%、无 OOM，且 jobs/s/FTS/s 不比算法层版本低10%，才保留为 full 候选；
+否则直接选择算法层版本。full 通过 `CIS_PLUGIN_RUNTIME_VARIANT=outer|engine` 只运行胜出的
+runtime-KV 架构以及静态、rolling 基线，避免重新运行已经淘汰的架构。保留 `both` 仅用于
+结果冲突时复验。正式结果同时比较 jobs/s、FTS/s、generated tokens/s、Job/Barrier P95、
+prefill、APC 和 preemption，不能只用 jobs/s。
 
 完整矩阵先决定 outer 与 EngineCore 架构。只有胜出且无回退的架构进入 `tune`，再扫描
 runtime KV 安全系数 `{0.80,0.90,0.95}`；若最优点位于0.95且没有 preemption，才补0.97，
@@ -156,3 +158,35 @@ vLLM-Ascend v0.18 容器中以 `--no-deps` 安装后导入
   batch shape，符合我们 candidate-subtree 小批量路径的负结果。
 - vLLM priority 与 scheduler_cls 是底层通用原语，不提供 CIS claim、barrier 或原子跨 step
   transition。通用 scheduler plugin RFC 若落地，可成为标准装载接口，而非替代策略本身。
+
+## 9. Muyuan 提交形态
+
+Muyuan 当前要求插件能独立构建、测试和使用，Benchmark 只通过稳定 CLI/API 调用插件。
+因此最终不应把整个 inference-scaling 仓库复制到 `plugins/`，而应拆成一个轻量 wheel：
+
+```text
+plugins/cis-scheduler/
+├── pyproject.toml
+├── README.md
+├── src/muyuan_cis_scheduler/
+│   ├── metadata.py       # 版本化 job/step/candidate/rollout 元数据
+│   ├── lifecycle.py      # acquire/resize/transition/release 协议
+│   ├── policy.py         # runtime-KV admission 与可选动态反馈
+│   ├── vllm.py           # scheduler_cls 适配器
+│   └── telemetry.py      # queue/KV/barrier/preemption 事件
+├── adapters/
+│   └── conditional_is.py # 常博实现所需的薄 adapter/参考补丁
+└── tests/
+```
+
+默认采用“两层插件”而不是强求零侵入：
+
+1. Conditional IS adapter 在 candidate 开始、candidate 结束、resample 和异常退出处分别
+   发出 acquire、resize、transition、release。它不改变 C/R/B、采样顺序、reward 或输出；
+2. 独立 runtime wheel 实现容量控制、priority 和 telemetry，通过 vLLM `scheduler_cls`
+   装载；非 CIS 请求保持原生行为；
+3. 纯 EngineCore 推断模式保留为可选的零侵入兼容模式和消融，不因接口形式牺牲性能；
+4. SWE-bench workload、部署脚本和性能报告放到 `benchmarks/swebench/`，不进入插件核心。
+
+只有 runtime-KV NPU A/B 和跨上下文迁移完成后，才把当前实验代码拆成上述目录。默认策略、
+安全系数和 telemetry schema 都必须由实测结果冻结，避免提前产品化一个尚未胜出的策略。
