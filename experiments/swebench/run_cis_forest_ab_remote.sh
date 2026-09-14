@@ -210,6 +210,18 @@ case "$variant" in
       -e VLLM_CIS_SCHEDULER_TRACE=/artifacts/cis-scheduler-trace.jsonl
     )
     ;;
+  step-tree-runtime-kv)
+    variant_args=(
+      --set 'vllm.request_priority_policy=\"step_fifo\"'
+      --set 'vllm.scheduler_cls=\"inference_scaling.arllm.backends.cis_scheduler.CISTreeScheduler\"'
+    )
+    variant_docker_env=(
+      -e VLLM_CIS_ADMISSION_MODE=runtime_kv_budget
+      -e VLLM_CIS_KV_CAPACITY_FRACTION="$active_step_kv_capacity_fraction"
+      -e VLLM_CIS_CANDIDATE_IDLE_GRACE="$tree_candidate_idle_grace"
+      -e VLLM_CIS_SCHEDULER_TRACE=/artifacts/cis-scheduler-trace.jsonl
+    )
+    ;;
   step-tree-continuation)
     variant_args=(
       --set 'vllm.request_priority_policy=\"step_fifo\"'

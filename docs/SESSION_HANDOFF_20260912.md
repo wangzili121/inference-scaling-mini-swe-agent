@@ -1314,3 +1314,42 @@ docs/experiments/data/cis_context_distribution_20260914.json
 这组实验的判断目标不是证明“所有实际调用都很长”，而是证明动态 admission 能在真实 Agent
 任务由8K增长到110K时自动收缩并发，同时保持设备饱和、无 OOM/KV preemption，并尽量接近
 每个分层单独调出的静态最佳。若它只能在某个分层有效，就不能称为通用动态策略。
+
+## 26. Scheduler Plugin 收敛与 EngineCore Runtime-KV
+
+用户明确要求最终形成产品化插件，并要求重新判断 direct fork、完整
+`candidate x rollout` 分组是否真是合理执行单位。结合已有 NPU 数据，当前设计结论是：
+
+- 完整 CIS step tree 是 admission、KV accounting 和 barrier 单位；
+- 同 candidate sibling 是 prefix-locality 单位；
+- ready branch 仍是 vLLM continuous batching 的执行单位；
+- 不让整棵 tree 独占 batch，也不把 subtree 小批量提交设为默认。
+
+依据是 subtree K8 曾使 P0 jobs/s 相对 Step control 下降约17.8%；direct KV fork 在 APC
+约96%后只有约1%边际变化；无 explicit continuation 的 EngineCore scheduler 曾把 P1
+prefill 从627240增加到1688232。因而 fork 仅作为可选 fast path，不能代替结构化 admission。
+
+本轮新增 `step-tree-runtime-kv`：`CISTreeScheduler` 直接读取 vLLM EngineCore 的
+`num_gpu_blocks * block_size`，按安全系数得到预算并做 block-rounded tree reservation，
+不再依赖固定 cap 推导容量。`cis_request` metadata 增加 `schema_version=1`，未知版本直接
+拒绝。新增严格 A/B 入口：
+
+```text
+experiments/swebench/run_cis_scheduler_plugin_ab_remote.sh
+```
+
+它在 P0/P1 比较静态 Step、算法层 outer runtime-KV 和 EngineCore runtime-KV，共六组；
+先16-request smoke，full 仅在成功率100%、无 OOM且核心吞吐不比 outer 低10%后执行。
+若纯 EngineCore 因缺少跨进程 explicit transition 再次增加 prefill，则产品采用两层插件：
+算法 adapter 负责 acquire/resize/transition/release，vLLM scheduler 负责结构化 priority、
+capacity guard 和 telemetry。不能为了“纯 scheduler”形式牺牲实际性能。
+
+无 NPU 构造测试在真实 vLLM-Ascend v0.18 镜像中读到3976个 block、block size 128，
+正确得到508928-token capacity和0.9下的458035-token budget。新增 plugin/backend 测试
+`37 passed`。截至本节记录时，两台服务器所有卡仍被运行中容器映射，没有启动 NPU A/B。
+
+详细产品设计：
+
+```text
+docs/experiments/CIS_SCHEDULER_PLUGIN_DESIGN_20260914.zh-CN.md
+```

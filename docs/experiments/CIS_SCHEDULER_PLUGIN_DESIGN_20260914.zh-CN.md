@@ -1,0 +1,104 @@
+# CIS Scheduler Plugin 产品设计
+
+日期：2026-09-14
+
+## 1. 产品判断
+
+最终产品不应把整个 `candidate x rollout` 物理地合成一条 vLLM request，也不应强迫
+一棵 tree 独占一个 attention batch。采用四种不同粒度：
+
+- admission/accounting 单位：完整 CIS step tree；
+- prefix-locality 单位：同一 candidate 的 sibling rollouts；
+- 实际执行与 continuous-batching 单位：ready branch；
+- 用户可见完成单位：完整 CIS job。
+
+这样 scheduler 能理解 tree 的 KV 成本和 barrier，但仍允许不同 tree 的 ready branch
+共同填满 MNS/MBT。它避免两个已验证的问题：固定 step cap 随 context/C/R 变化失效，以及
+candidate-subtree 小批量提交导致设备欠填。
+
+## 2. 已有实验证据
+
+以下路径不作为产品默认值：
+
+- candidate completion streaming 会造成碎片化 fanout；
+- candidate-subtree K8 在代表性 P0 上相对 Step control 的 jobs/s 下降约17.8%；
+- direct KV fork 在 APC 已约96%时相对最佳 Step 调度只有约1%的边际变化；
+- Forest Attention Python/FIA 兼容层破坏原生 paged attention 与 full graph，端到端回退；
+- 无显式 continuation 的 EngineCore tree scheduler 在 P1 将 prefill 从627240增加到
+  1688232，wall time 增加约11.4%；
+- wall-clock continuation 在 P1略有收益，但迁移到 P0 后 FTS/s下降12.24%。
+
+因此 fork 只保留为可选 fast path。只有 profile 证明 request lifecycle 或未命中的 prefix
+tail 成为瓶颈时才开启；它不能代替 tree-aware admission，也不能独占 batching。
+
+## 3. 插件结构
+
+```text
+Conditional IS adapter
+  -> schema-versioned cis_request metadata
+  -> explicit step acquire / resize / transition / release
+  -> CISTreeScheduler via vLLM scheduler_cls
+  -> native vLLM priority, token scheduler, continuous batching and KV allocator
+```
+
+算法层拥有最准确信息，因此负责：
+
+- 在 candidate 提交前声明 prompt、C/R/B/L 和 worst-case reservation；
+- candidate 结束后用实际 terminal 数缩小 reservation；
+- reward/resample 后显式将当前 claim 原子转移到下一 step；
+- job 完成或异常时释放 claim。
+
+EngineCore 插件负责：
+
+- 解析带版本的 `cis_request` 元数据；
+- 从 `num_gpu_blocks * block_size` 获取真实每-rank KV capacity；
+- 对 step tree 做 block-rounded capacity guard；
+- 将已 admission 的 branch 留给 vLLM 原生 continuous batching；
+- 输出 tree、queue、KV、preemption 和 barrier trace。
+
+当前算法层 `runtime_kv_budget` 已具有显式 transition，且 P1匹配静态最优、P0的 FTS/s
+提升5.06%。新增 `step-tree-runtime-kv` 是纯 EngineCore 容量消融，它没有猜测固定 cap，
+但仍缺显式跨进程 transition，不能在 NPU A/B 前取代外层控制器。
+
+## 4. 严格 A/B
+
+`run_cis_scheduler_plugin_ab_remote.sh` 固定同一模型、workload、MNS/MBT、sampling 和 seed，
+分别在 P0 `C15/R3` 与 P1 `C8/R3 fixed-work` 比较：
+
+1. `step_fifo + static cap16`；
+2. 算法层 `runtime_kv_budget`；
+3. EngineCore `step-tree-runtime-kv`。
+
+先运行16-request smoke。只有 EngineCore 版本成功率100%、无 OOM，且 jobs/s/FTS/s 不比
+外层版本低10%，才运行 full。正式结果同时比较 jobs/s、FTS/s、generated tokens/s、
+Job/Barrier P95、prefill、APC 和 preemption，不能只用 jobs/s。
+
+若纯 EngineCore 版本因 continuation 重算再次失败，产品采用两层插件，不再为形式上的
+“纯 scheduler”牺牲性能：算法 adapter 持有显式 admission 生命周期，vLLM scheduler
+只负责结构化 priority 与 telemetry。
+
+## 5. 产品化验收
+
+- 安装 wheel 后只需设置 `scheduler_cls` 和 policy 配置，不复制仓库源码；
+- 非 CIS request 完全回退到原生 vLLM 行为；
+- 未识别的 metadata schema fail closed，不静默误调度；
+- 不依赖 request ID 正则解析；
+- runtime capacity 来自实际 EngineCore，不把 cap16固化为默认；
+- `8K-128K` 四档均接近各档静态 oracle，且无 OOM/KV preemption；
+- P0/P1/P2、双卡和四卡均保留收益；
+- direct fork、Forest Attention 和算法剪枝均为独立可选模块，不污染默认 scheduler。
+
+## 6. 当前实现与验证状态
+
+已实现 `step-tree-runtime-kv`：`CISTreeScheduler` 直接读取 EngineCore 的
+`cache_config.num_gpu_blocks` 与 `block_size`，按 `VLLM_CIS_KV_CAPACITY_FRACTION`
+生成容量预算，并按真实 KV block 对 prompt、candidate suffix 和 rollout tail 向上取整。
+单棵树大于软预算时允许独占前进，避免 admission 死锁；vLLM 仍是最终 KV allocator。
+
+`cis_request` 增加 `schema_version=1`；插件拒绝未知版本，旧的无版本 payload 暂按 v1
+兼容。非 CIS 请求继续执行 `Scheduler.add_request()` 原始路径。
+
+在真实 vLLM-Ascend v0.18 镜像中完成了无计算卡构造验证：3976个 KV block、每 block
+128 token 得到508928-token capacity；0.9安全系数得到458035-token budget。相关
+`cis_scheduler` 与 backend 测试为 `37 passed`。两台服务器检查时仍无未被运行中容器
+映射的安全 TP2，因此尚无本模式的 NPU 性能结论。

@@ -1889,6 +1889,7 @@ class AsyncVLLMBackend(VLLMBackend):
             metadata = request.cis
             extra_args = dict(getattr(params, "extra_args", None) or {})
             extra_args["cis_request"] = {
+                "schema_version": 1,
                 "job_id": metadata.job_id,
                 "step_index": metadata.step_index,
                 "node_type": metadata.node_type,

@@ -81,10 +81,11 @@ class CISTreeScheduler(Scheduler):
             "fractional_work",
             "tail_borrow",
             "peak_token_budget",
+            "runtime_kv_budget",
         }:
             raise ValueError(
                 "VLLM_CIS_ADMISSION_MODE must be adaptive_window, fractional_work, "
-                "tail_borrow, or peak_token_budget"
+                "tail_borrow, peak_token_budget, or runtime_kv_budget"
             )
         configured_window = os.environ.get("VLLM_CIS_INITIAL_WINDOW")
         self._cis_configured_initial_window = (
@@ -161,6 +162,29 @@ class CISTreeScheduler(Scheduler):
         )
         if self._cis_peak_token_budget is not None and self._cis_peak_token_budget <= 0:
             raise ValueError("VLLM_CIS_PEAK_TOKEN_BUDGET must be positive")
+        self._cis_runtime_kv_capacity_tokens: int | None = None
+        self._cis_runtime_kv_capacity_fraction: float | None = None
+        if self._cis_admission_mode == "runtime_kv_budget":
+            if configured_token_budget is not None:
+                raise ValueError(
+                    "runtime KV admission derives its budget from EngineCore; "
+                    "VLLM_CIS_PEAK_TOKEN_BUDGET must not be set"
+                )
+            num_gpu_blocks = self.cache_config.num_gpu_blocks
+            if num_gpu_blocks is None or num_gpu_blocks <= 0:
+                raise ValueError(
+                    "runtime KV admission requires a positive KV block capacity"
+                )
+            self._cis_runtime_kv_capacity_fraction = _float_env(
+                "VLLM_CIS_KV_CAPACITY_FRACTION", 0.90
+            )
+            self._cis_runtime_kv_capacity_tokens = (
+                int(num_gpu_blocks) * int(self.block_size)
+            )
+            self._cis_peak_token_budget = int(
+                self._cis_runtime_kv_capacity_tokens
+                * self._cis_runtime_kv_capacity_fraction
+            )
         trace_path = os.environ.get("VLLM_CIS_SCHEDULER_TRACE")
         self._cis_trace_path = Path(trace_path) if trace_path else None
         if self._cis_trace_path is not None:
@@ -173,6 +197,11 @@ class CISTreeScheduler(Scheduler):
         value = None if extra_args is None else extra_args.get(_METADATA_KEY)
         if not isinstance(value, dict):
             return None
+        schema_version = int(value.get("schema_version", 1))
+        if schema_version != 1:
+            raise ValueError(
+                f"unsupported CIS request metadata schema: {schema_version}"
+            )
         if ":warmup:" in str(value.get("job_id", "")):
             return None
         return value
@@ -214,6 +243,8 @@ class CISTreeScheduler(Scheduler):
             "normalized_active_load": self._normalized_active_load(),
             "peak_token_load": self._peak_active_token_load(),
             "peak_token_budget": self._cis_peak_token_budget,
+            "runtime_kv_capacity_tokens": self._cis_runtime_kv_capacity_tokens,
+            "runtime_kv_capacity_fraction": self._cis_runtime_kv_capacity_fraction,
             **values,
         }
         with self._cis_trace_path.open("a", encoding="utf-8") as stream:
@@ -308,8 +339,7 @@ class CISTreeScheduler(Scheduler):
             if key in self._cis_steps
         )
 
-    @staticmethod
-    def _peak_step_token_load(state: _StepState) -> int:
+    def _peak_step_token_load(self, state: _StepState) -> int:
         """Conservative peak physical-token footprint for an admitted step.
 
         The selected prompt is counted once because APC shares full prompt
@@ -323,6 +353,21 @@ class CISTreeScheduler(Scheduler):
         rollout_requests = state.rollout_request_count
         if rollout_requests is None:
             rollout_requests = state.candidate_count * state.rollouts_per_candidate
+        if self._cis_admission_mode == "runtime_kv_budget":
+            block_size = int(self.block_size)
+
+            def allocated(tokens: int) -> int:
+                if tokens <= 0:
+                    return 0
+                return (
+                    (tokens + block_size - 1) // block_size
+                ) * block_size
+
+            return (
+                allocated(state.prompt_tokens)
+                + state.candidate_count * allocated(state.candidate_max_tokens)
+                + rollout_requests * allocated(state.rollout_max_tokens)
+            )
         return (
             state.prompt_tokens
             + state.candidate_count * state.candidate_max_tokens
@@ -343,6 +388,10 @@ class CISTreeScheduler(Scheduler):
             and len(self._cis_active_steps) >= self._cis_max_window
         ):
             return False
+        if not self._cis_active_steps:
+            # A single oversized tree must make progress. vLLM remains the
+            # final allocator and may reject a request that cannot fit at all.
+            return True
         return (
             self._peak_active_token_load() + self._peak_step_token_load(state)
             <= self._cis_peak_token_budget
@@ -397,7 +446,10 @@ class CISTreeScheduler(Scheduler):
             (state for state in self._cis_steps.values() if state.deferred),
             key=lambda state: state.order,
         )
-        if self._cis_admission_mode == "peak_token_budget":
+        if self._cis_admission_mode in {
+            "peak_token_budget",
+            "runtime_kv_budget",
+        }:
             for state in deferred_states:
                 if not self._peak_budget_can_fit(state):
                     break
@@ -425,7 +477,10 @@ class CISTreeScheduler(Scheduler):
 
     def _can_activate_step(self, state: _StepState) -> bool:
         assert self._cis_window is not None
-        if self._cis_admission_mode == "peak_token_budget":
+        if self._cis_admission_mode in {
+            "peak_token_budget",
+            "runtime_kv_budget",
+        }:
             return self._peak_budget_can_fit(state)
         if self._cis_admission_mode == "fractional_work":
             assert self._cis_initial_window is not None
@@ -568,7 +623,11 @@ class CISTreeScheduler(Scheduler):
             if not state.active:
                 self._activate(state, reason="rollout_ready")
             super().add_request(request)
-            if self._cis_admission_mode in {"tail_borrow", "peak_token_budget"}:
+            if self._cis_admission_mode in {
+                "tail_borrow",
+                "peak_token_budget",
+                "runtime_kv_budget",
+            }:
                 self._admit_deferred_steps(reason="rollout_tail")
             return
         if node_type != "candidate":
@@ -645,6 +704,7 @@ class CISTreeScheduler(Scheduler):
             "fractional_work",
             "tail_borrow",
             "peak_token_budget",
+            "runtime_kv_budget",
         }:
             self._admit_deferred_steps(reason="rollout_capacity_released")
         return result
@@ -680,6 +740,7 @@ class CISTreeScheduler(Scheduler):
             "fractional_work",
             "tail_borrow",
             "peak_token_budget",
+            "runtime_kv_budget",
         }:
             return
         now = time.monotonic()

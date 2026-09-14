@@ -1247,6 +1247,7 @@ def test_async_vllm_priority_prefers_structured_cis_metadata() -> None:
         assert backend._step_priorities == {"job-a:step:3": 0}
         assert backend._sampling_params(request).extra_args == {
             "cis_request": {
+                "schema_version": 1,
                 "job_id": "job-a",
                 "step_index": 3,
                 "node_type": "candidate",
