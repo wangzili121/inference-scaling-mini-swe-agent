@@ -56,22 +56,33 @@ EngineCore 插件负责：
 - 将已 admission 的 branch 留给 vLLM 原生 continuous batching；
 - 输出 tree、queue、KV、preemption 和 barrier trace。
 
-当前算法层 `runtime_kv_budget` 已具有显式 transition，且 P1匹配静态最优、P0的 FTS/s
-提升5.06%。新增 `step-tree-runtime-kv` 是纯 EngineCore 容量消融，它没有猜测固定 cap，
-但仍缺显式跨进程 transition，不能在 NPU A/B 前取代外层控制器。
+当前算法层 `runtime_kv_budget` 已具有显式 transition。此前 P1匹配静态最优、P0的
+FTS/s提升5.06%的结果属于 rolling peak-token，不是尚未运行 NPU A/B 的 runtime-KV。
+新增 `step-tree-runtime-kv` 是纯 EngineCore 容量消融，它没有猜测固定 cap，但仍缺显式
+跨进程 transition，不能在 NPU A/B 前取代外层控制器。
 
 ## 4. 严格 A/B
 
 `run_cis_scheduler_plugin_ab_remote.sh` 固定同一模型、workload、MNS/MBT、sampling 和 seed，
 分别在 P0 `C15/R3` 与 P1 `C8/R3 fixed-work` 比较：
 
-1. `step_fifo + static cap16`；
-2. 算法层 `runtime_kv_budget`；
-3. EngineCore `step-tree-runtime-kv`。
+1. P0 静态 cap6 尾延迟 oracle 与 cap16 吞吐 oracle，P1 静态 cap16；
+2. 已取得 P0 `+5.43%` jobs/s、P1 `+0.11%` jobs/s 的 rolling peak-token；
+3. 算法层 `runtime_kv_budget`；
+4. EngineCore `step-tree-runtime-kv`。
 
-先运行16-request smoke。只有 EngineCore 版本成功率100%、无 OOM，且 jobs/s/FTS/s 不比
-外层版本低10%，才运行 full。正式结果同时比较 jobs/s、FTS/s、generated tokens/s、
-Job/Barrier P95、prefill、APC 和 preemption，不能只用 jobs/s。
+这里必须区分 rolling 与 runtime-KV：已有 `+5.43%/+0.11%` 是 rolling peak-token 相对
+静态 cap16 的结果，硬件容量推导的 runtime-KV 尚无 NPU 结论。
+
+smoke 只运行两个尚未验证的新 runtime-KV 架构，不重复静态与 rolling。只有 EngineCore
+版本成功率100%、无 OOM，且 jobs/s/FTS/s 不比算法层版本低10%，才运行 full。正式结果
+同时比较 jobs/s、FTS/s、generated tokens/s、Job/Barrier P95、prefill、APC 和
+preemption，不能只用 jobs/s。
+
+完整矩阵先决定 outer 与 EngineCore 架构。只有胜出且无回退的架构进入 `tune`，再扫描
+runtime KV 安全系数 `{0.80,0.90,0.95}`；若最优点位于0.95且没有 preemption，才补0.97，
+若0.80仍有明显欠填则补0.70。不能同时穷举两种架构。胜出配置随后迁移到 P2 与
+8K-128K workload，必须接近各 workload 的静态 oracle 才能作为默认插件策略。
 
 若纯 EngineCore 版本因 continuation 重算再次失败，产品采用两层插件，不再为形式上的
 “纯 scheduler”牺牲性能：算法 adapter 持有显式 admission 生命周期，vLLM scheduler

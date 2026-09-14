@@ -1379,3 +1379,19 @@ runtime-KV 严格 A/B。只有 profile 显示保守 reservation 导致欠填，�
 `candidate_closed -> rollout_granted`，并加入 completion lane、expansion 优先、KV
 residency 监控和 full-reservation fallback。详细报告见
 `docs/experiments/CIS_TWO_PHASE_SAFE_ADMISSION_20260914.zh-CN.md`。
+
+## 28. 最佳插件策略验证矩阵修正（2026-09-15）
+
+复核历史数据后明确：P0 cap6 是 tail-latency oracle，后续同环境 cap16 是 throughput
+oracle；P1 cap16 是当前综合静态最佳。此前 P0 `jobs/s +5.43%`、`FTS/s +5.06%` 与 P1
+`jobs/s +0.11%` 属于 rolling peak-token 动态控制，不是尚未做 NPU A/B 的硬件容量
+runtime-KV。不能把这组收益错误归因给新插件。
+
+`run_cis_scheduler_plugin_ab_remote.sh` 已修正为：smoke 只验证新 outer/EngineCore
+runtime-KV 能力；full 在 P0 比较 static cap6、static cap16、rolling、outer runtime-KV、
+EngineCore runtime-KV，在 P1 比较 static cap16、rolling、outer runtime-KV、EngineCore
+runtime-KV。所有结果必须与各自静态 Pareto oracle 及已知动态冠军比较。
+
+截至2026-09-15 00:42，两台服务器仍没有未被运行中容器映射的安全 TP2，因此未覆盖容器
+预留启动实验。服务器 A 的卡0/1/4、2/3、6/7均有专用运行容器，卡5仍被全卡容器映射；
+服务器 B 的1/2、3/4、5/6、7均有专用运行容器，卡0被多个全卡容器映射。
