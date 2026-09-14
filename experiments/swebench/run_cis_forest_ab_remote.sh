@@ -46,6 +46,7 @@ tree_continuation_grace_ms=${CIS_TREE_CONTINUATION_GRACE_MS:-1500}
 tree_peak_token_budget=${CIS_TREE_PEAK_TOKEN_BUDGET:-}
 fixed_length=${CIS_FIXED_LENGTH:-0}
 step_coalesce_seconds=${CIS_STEP_COALESCE_SECONDS:-1.0}
+allow_reserved_devices=${CIS_ALLOW_DOCKER_RESERVED_DEVICES:-0}
 native_runtime_setup=:
 variant_docker_env=()
 fixed_length_arg=
@@ -90,6 +91,10 @@ fi
 }
 [[ "$fixed_length" == 0 || "$fixed_length" == 1 ]] || {
   echo "CIS_FIXED_LENGTH must be 0 or 1" >&2
+  exit 2
+}
+[[ "$allow_reserved_devices" == 0 || "$allow_reserved_devices" == 1 ]] || {
+  echo "CIS_ALLOW_DOCKER_RESERVED_DEVICES must be 0 or 1" >&2
   exit 2
 }
 if [[ "$fixed_length" == 1 ]]; then
@@ -639,6 +644,29 @@ if [[ -e "$output" ]] && ! rm -rf "$output" 2>/dev/null; then
 fi
 mkdir -p "$output" "$cache"
 docker rm -f "$container" >/dev/null 2>&1 || true
+reserved_devices=()
+for running_container in $(docker ps -q); do
+  running_name=$(docker inspect -f '{{.Name}}' "$running_container")
+  while IFS= read -r host_device; do
+    for id in "${device_ids[@]}"; do
+      if [[ "$host_device" == "/dev/davinci$id" ]]; then
+        reserved_devices+=("$id:${running_name#/}")
+      fi
+    done
+  done < <(
+    docker inspect -f '{{range .HostConfig.Devices}}{{println .PathOnHost}}{{end}}' \
+      "$running_container"
+  )
+done
+if (( ${#reserved_devices[@]} > 0 )); then
+  reserved_list=$(IFS=,; echo "${reserved_devices[*]}")
+  if [[ "$allow_reserved_devices" != 1 ]]; then
+    echo "selected NPU is reserved by a running container: $reserved_list" >&2
+    echo "set CIS_ALLOW_DOCKER_RESERVED_DEVICES=1 only after owner confirmation" >&2
+    exit 1
+  fi
+  echo "warning: overriding running-container reservations: $reserved_list" >&2
+fi
 npu_snapshot=$(/usr/local/bin/npu-smi info)
 printf '%s\n' "$npu_snapshot" >"$output/npu-before.txt"
 process_snapshot=$(printf '%s\n' "$npu_snapshot" | sed -n '/Process id/,$p')
@@ -685,6 +713,7 @@ CIS_TREE_CONTINUATION_GRACE_MS=$tree_continuation_grace_ms
 CIS_TREE_PEAK_TOKEN_BUDGET=$tree_peak_token_budget
 CIS_FIXED_LENGTH=$fixed_length
 CIS_STEP_COALESCE_SECONDS=$step_coalesce_seconds
+CIS_ALLOW_DOCKER_RESERVED_DEVICES=$allow_reserved_devices
 EOF
 
 docker run -d \

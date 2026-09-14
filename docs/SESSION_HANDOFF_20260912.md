@@ -1228,3 +1228,23 @@ rollout bundle”谁更好。旧数据中 subtree K8 相对当时 Step control �
 torch。vLLM v0.18 capacity patch 已在官方镜像源码上通过 `git apply --check`。两台服务器
 检查时都只剩一张空闲卡，未抢占他人设备；单卡4B smoke 在模型加载前被 Ascend 的全机
 DCMI/categorical 枚举问题拦截。
+
+## 23. 共享服务器设备预留检查与跨 context 矩阵
+
+服务器 A 的卡1/4一度被 `npu-smi` 显示为无进程，但运行中的
+`orthrus-torchprof-npu1`、`orthrus-v023-npu4` 已分别映射这两个设备节点；服务因此在
+`torch_npu` 初始化时得到0个设备。没有终止或复用这些容器。服务器 B 的各卡也均被运行中
+容器映射，目前没有经过双重检查的空闲 TP2。
+
+`run_cis_forest_ab_remote.sh` 已增加 Docker reservation preflight：除 NPU PID 外，还会
+检查运行容器的 `.HostConfig.Devices`。默认遇到预留即失败；只有所有者明确确认后才允许用
+`CIS_ALLOW_DOCKER_RESERVED_DEVICES=1` 覆盖。
+
+新增 `run_cis_context_transfer_remote.sh`，支持断点续跑：
+
+- `context`：P1 的 short/medium/long 分层分别运行 static cap16、rolling peak-token、
+  runtime-KV 0.9；
+- `subtree`：同一 P0 workload 分别运行 static cap16、runtime-KV 0.9、subtree-K8；
+- `all`：顺序完成以上12组并生成 summary JSON。
+
+真实 NPU 结果仍待完整空闲双卡出现，不能用容量模型预计值替代性能结论。

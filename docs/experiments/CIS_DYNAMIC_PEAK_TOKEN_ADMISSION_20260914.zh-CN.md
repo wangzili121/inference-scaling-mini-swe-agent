@@ -167,3 +167,28 @@ runtime-KV 0.9；再在相同 P0 条件补跑 candidate-subtree bundle。当前�
 单张空闲卡，没有可用 TP2 组合。单卡4B capability 尝试在模型启动前被 Ascend DCMI/
 categorical 的全机设备枚举失败拦截，并非 admission 代码错误。代码、workload 和运行入口
 均已准备，不能在没有同条件 NPU 数据前把上述预计并发写成性能收益。
+
+## 10. 设备预留审计与可恢复矩阵
+
+后续重查发现，服务器 A 的物理卡1/4虽然没有 `npu-smi` 计算进程，但分别被运行中的
+`orthrus-torchprof-npu1` 和 `orthrus-v023-npu4` 容器映射。实际服务与只读
+`torch_npu` 探针均无法枚举设备。因此“无 NPU PID”不足以证明共享服务器上的卡可用。
+
+远程 runner 现同时检查：
+
+1. `npu-smi` 中所选卡是否存在计算进程；
+2. 运行中 Docker 容器是否映射所选 `/dev/davinciN`。
+
+默认发现任一容器预留便拒绝启动，并报告卡号和容器名。只有得到容器所有者确认后才可
+显式设置 `CIS_ALLOW_DOCKER_RESERVED_DEVICES=1`；本轮没有使用该覆盖选项，也没有停止
+任何他人容器。
+
+新增可断点续跑入口：
+
+```text
+experiments/swebench/run_cis_context_transfer_remote.sh
+```
+
+`context` 模式运行 `short/medium/long × static/rolling/runtime-KV` 共9组；`subtree`
+模式在同一 P0 workload 上运行 static、runtime-KV 与 `step-subtree-8` 三组。已有完整
+`benchmark.json` 的运行会跳过，所有运行结束后由现有 summarizer 生成统一 JSON。
