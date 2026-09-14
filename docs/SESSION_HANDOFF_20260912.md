@@ -1395,3 +1395,29 @@ runtime-KV。所有结果必须与各自静态 Pareto oracle 及已知动态冠�
 截至2026-09-15 00:42，两台服务器仍没有未被运行中容器映射的安全 TP2，因此未覆盖容器
 预留启动实验。服务器 A 的卡0/1/4、2/3、6/7均有专用运行容器，卡5仍被全卡容器映射；
 服务器 B 的1/2、3/4、5/6、7均有专用运行容器，卡0被多个全卡容器映射。
+
+## 29. 插件边界与验证入口收敛（2026-09-15）
+
+最终架构候选明确为两种：
+
+- 算法层薄 adapter + outer runtime-KV controller：显式获得 acquire、candidate 后 resize、
+  跨 step transition 和异常 release，信息完整；
+- 纯 EngineCore `scheduler_cls`：零算法改造，但只能从 candidate/rollout 请求到达与完成推断
+  生命周期，保留作兼容模式和消融。
+
+产品不再追求形式上的完全零侵入。若 outer 版本性能更好，最终 Muyuan 形态为独立
+`plugins/cis-scheduler` wheel 加一个很薄的 Conditional IS adapter；adapter 不改变 C/R/B、
+sampling、reward 或输出，只上报结构化生命周期。SWE-bench workload、部署与报告归入
+`benchmarks/swebench`，不进入插件核心。
+
+`run_cis_scheduler_plugin_ab_remote.sh` 已收紧：smoke 仍只比较 outer/EngineCore 两种新架构；
+smoke 后 full 可通过 `CIS_PLUGIN_RUNTIME_VARIANT=outer|engine` 只运行胜者和静态、rolling
+基线，`both` 仅用于结果冲突复验。这样不会为已经淘汰的架构重复正式长运行。
+
+远端 vLLM-Ascend v0.18 一次性无 NPU 容器验证为 `78 passed`，shell 入口通过 `bash -n`
+与 `git diff --check`。本轮没有新增 NPU 性能数字。检查两台服务器时，第一台多张卡虽然
+没有 NPU 计算进程，但被长期交互容器映射；第二台5/6/7同样被长期全卡容器映射。未使用
+`CIS_ALLOW_DOCKER_RESERVED_DEVICES=1`，未停止任何容器；需要明确确认共享映射卡后才启动
+TP2 smoke。
+
+对应本地提交：`03f9f32 Focus CIS scheduler winner validation`。
