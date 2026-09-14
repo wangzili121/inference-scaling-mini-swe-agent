@@ -192,3 +192,30 @@ experiments/swebench/run_cis_context_transfer_remote.sh
 `context` 模式运行 `short/medium/long × static/rolling/runtime-KV` 共9组；`subtree`
 模式在同一 P0 workload 上运行 static、runtime-KV 与 `step-subtree-8` 三组。已有完整
 `benchmark.json` 的运行会跳过，所有运行结束后由现有 summarizer 生成统一 JSON。
+
+## 11. Worst-case reservation 的真实松弛
+
+新增 `analyze_cis_kv_reservations.py`，使用算法 trace 中逐 step 的 prefix、candidate 和
+rollout 实际输出长度，按128-token KV block 重建每个 step 的 realized branch footprint。
+这里的 realized peak 是基于树共享关系的容量模型，不是 EngineCore 的瞬时全局 KV usage。
+
+| workload | steps | 保守/realized 平均比 | P95 | terminal candidate 比例 |
+|---|---:|---:|---:|---:|
+| P0 real EOS，`C15/R3` | 71 | 2.41x | 4.86x | 70.7% |
+| P1 fixed work，`C8/R3` | 128 | 1.00x | 1.00x | 0% |
+
+P0 的松弛来自 candidate 提前 EOS：中位86.7%的 candidate 不再派生 rollout。P1 开启
+`ignore_eos` 后，每个 step 的剩余长度会随 `generated_tokens_before` 递减；按这一点正确
+计算后，worst-case 与 realized footprint 完全一致。因此不能设置一个跨 workload 的固定
+reservation discount。
+
+若 runtime-KV 基线证明过于保守，下一版只应增加风险受控的在线预测：按 context/C/R
+分桶估计 non-terminal candidate 数和 rollout 长度高分位数；发生 preemption 或 KV 高水位
+时立即回退到 worst-case，连续安全窗口内才缓慢增加折扣。该方向必须先与本节的 exact
+worst-case 基线做 NPU A/B，当前不默认启用。
+
+机器可读结果：
+
+```text
+docs/experiments/data/cis_kv_reservation_analysis_20260914.json
+```

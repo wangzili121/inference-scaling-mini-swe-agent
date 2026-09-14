@@ -1248,3 +1248,18 @@ DCMI/categorical 枚举问题拦截。
 - `all`：顺序完成以上12组并生成 summary JSON。
 
 真实 NPU 结果仍待完整空闲双卡出现，不能用容量模型预计值替代性能结论。
+
+## 24. KV reservation 松弛分析
+
+新增 `experiments/swebench/analyze_cis_kv_reservations.py`，从算法 trace 的逐分支实际长度
+重建 step footprint。P0 real EOS 共71个 step，worst-case reservation 相对 realized
+footprint 平均为2.41x、P95为4.86x，candidate terminal 比例70.7%；P1 fixed-work 共128个
+step，正确扣除每个后续 step 已生成长度后两者为1.00x。
+
+因此 runtime-KV 的 worst-case 预算是跨 workload 的安全基线，但 real-EOS P0 可能欠填；
+后续可以按 context/C/R 分桶在线预测 terminal candidate 数和 rollout 长度高分位数，并用
+preemption/KV waterline 做保守回退。绝不能使用跨数据集固定折扣。派生数据位于：
+
+```text
+docs/experiments/data/cis_kv_reservation_analysis_20260914.json
+```

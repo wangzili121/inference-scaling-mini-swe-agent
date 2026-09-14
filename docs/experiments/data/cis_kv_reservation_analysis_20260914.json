@@ -1,0 +1,134 @@
+{
+  "p0-outer-confirm-05": {
+    "schema_version": 1,
+    "trace": "/data/disk/wangzili/cis-peak-budget-20260914/real-eos/p0-outer-confirm-05/algorithm-traces/profile-0.jsonl",
+    "parameters": {
+      "total_length": 512,
+      "rollout_count": 3,
+      "kv_block_size": 128,
+      "include_warmup": false
+    },
+    "requests": 64,
+    "steps": 71,
+    "conservative_tokens": {
+      "count": 71,
+      "mean": 32544.450704225354,
+      "p50": 30848.0,
+      "p90": 45440.0,
+      "p95": 48768.0,
+      "p99": 62425.59999999994,
+      "max": 76672
+    },
+    "realized_peak_tokens": {
+      "count": 71,
+      "mean": 18790.76056338028,
+      "p50": 15616.0,
+      "p90": 36352.0,
+      "p95": 41856.0,
+      "p99": 55180.79999999993,
+      "max": 71936
+    },
+    "overreservation_ratio": {
+      "count": 71,
+      "mean": 2.4092275398221483,
+      "p50": 1.8639455782312926,
+      "p90": 4.068181818181818,
+      "p95": 4.857142857142857,
+      "p99": 5.874999999999999,
+      "max": 6.0
+    },
+    "terminal_candidate_fraction": {
+      "count": 71,
+      "mean": 0.7070422535211268,
+      "p50": 0.8666666666666667,
+      "p90": 1.0,
+      "p95": 1.0,
+      "p99": 1.0,
+      "max": 1.0
+    },
+    "candidate_output_tokens": {
+      "count": 1065,
+      "mean": 88.52018779342723,
+      "p50": 87.0,
+      "p90": 128.0,
+      "p95": 128.0,
+      "p99": 128.0,
+      "max": 128
+    },
+    "rollout_output_tokens": {
+      "count": 936,
+      "mean": 139.6698717948718,
+      "p50": 105.0,
+      "p90": 332.0,
+      "p95": 384.0,
+      "p99": 469.0,
+      "max": 469
+    }
+  },
+  "p1-outer-rolling-05": {
+    "schema_version": 1,
+    "trace": "/data/disk/wangzili/cis-peak-budget-20260914/fixed-work/p1-outer-rolling-05/algorithm-traces/profile-0.jsonl",
+    "parameters": {
+      "total_length": 512,
+      "rollout_count": 3,
+      "kv_block_size": 128,
+      "include_warmup": false
+    },
+    "requests": 32,
+    "steps": 128,
+    "conservative_tokens": {
+      "count": 128,
+      "mean": 19828.0,
+      "p50": 17024.0,
+      "p90": 33651.2,
+      "p95": 38387.2,
+      "p99": 63973.12000000002,
+      "max": 67712
+    },
+    "realized_peak_tokens": {
+      "count": 128,
+      "mean": 19828.0,
+      "p50": 17024.0,
+      "p90": 33651.2,
+      "p95": 38387.2,
+      "p99": 63973.12000000002,
+      "max": 67712
+    },
+    "overreservation_ratio": {
+      "count": 128,
+      "mean": 1.0,
+      "p50": 1.0,
+      "p90": 1.0,
+      "p95": 1.0,
+      "p99": 1.0,
+      "max": 1.0
+    },
+    "terminal_candidate_fraction": {
+      "count": 128,
+      "mean": 0.0,
+      "p50": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "max": 0.0
+    },
+    "candidate_output_tokens": {
+      "count": 1024,
+      "mean": 128.0,
+      "p50": 128.0,
+      "p90": 128.0,
+      "p95": 128.0,
+      "p99": 128.0,
+      "max": 128
+    },
+    "rollout_output_tokens": {
+      "count": 2560,
+      "mean": 230.4,
+      "p50": 256.0,
+      "p90": 384.0,
+      "p95": 384.0,
+      "p99": 384.0,
+      "max": 384
+    }
+  }
+}
