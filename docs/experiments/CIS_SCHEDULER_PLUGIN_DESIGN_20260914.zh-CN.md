@@ -190,3 +190,67 @@ plugins/cis-scheduler/
 
 只有 runtime-KV NPU A/B 和跨上下文迁移完成后，才把当前实验代码拆成上述目录。默认策略、
 安全系数和 telemetry schema 都必须由实测结果冻结，避免提前产品化一个尚未胜出的策略。
+
+## 10. 首轮真实 NPU A/B（2026-09-15）
+
+服务器 A 的物理 NPU 2/3 与 6/7 在启动前均无计算进程。本轮只覆盖长期交互容器的设备
+映射，没有停止或抢占其他容器；每次运行结束后均释放本项目容器。统一配置为 TP2、
+MNS 256、MBT 32768、memory 0.90、APC、chunked prefill、native categorical sampler 和
+`FULL_DECODE_ONLY + Npugraph_ex`。
+
+### 10.1 outer 与 EngineCore 架构选择
+
+P1 16-job fixed-work smoke 中，两种实现的 engine requests、generated tokens、prefill 和
+FTS 完全相同，均为100%成功、0 preemption：
+
+| 实现 | jobs/s | FTS/s | Job mean | Job P95 |
+|---|---:|---:|---:|---:|
+| outer runtime-KV | 0.04718 | 2121.52 | 322.02 s | 336.08 s |
+| EngineCore runtime-KV | 0.04537 | 2040.29 | 332.82 s | 348.16 s |
+
+EngineCore 相对 outer 的 jobs/s/FTS/s 均下降3.83%，mean 增加3.35%，P95 增加3.60%。P0
+非 fixed-work smoke 曾出现 EngineCore jobs/s 较高，但生成工作量不同，不能推翻 P1 的
+严格结果。因此产品默认选 outer 生命周期控制器；EngineCore 版本只保留作零侵入兼容和
+消融。
+
+### 10.2 P0 full
+
+| 实现 | jobs/s | FTS/s | Job mean | Job P95 | preemption |
+|---|---:|---:|---:|---:|---:|
+| static cap16 | 0.16474 | 2975.27 | 133.71 s | 246.19 s | 0 |
+| outer runtime-KV | 0.17165 | 3045.65 | 131.21 s | 229.29 s | 0 |
+
+outer 相对 static cap16：jobs/s +4.19%，FTS/s +2.37%，mean -1.88%，P95 -6.86%。两者
+均为100%成功。P0 使用真实 EOS，生成量不同，因此优先采用 FTS/s 与延迟共同判断。
+
+### 10.3 P1 full 静态安全边界
+
+P1 使用 fixed work，三组成功运行的 engine requests=3328、generated tokens=720896、
+prefill tokens=627240、FTS=1344808，因而可以直接比较：
+
+| 实现 | jobs/s | FTS/s | Job mean | P50 | P95 | max in-flight |
+|---|---:|---:|---:|---:|---:|---:|
+| static cap8 | 0.04804 | 2018.90 | 386.90 s | 379.85 s | 665.83 s | 96 |
+| static cap12 | 0.05113 | 2148.87 | 382.75 s | 424.26 s | 622.05 s | 192 |
+| outer runtime-KV | 0.05221 | 2194.14 | 447.05 s | 382.47 s | 612.84 s | 520 |
+
+static cap16 在同一32-job burst 首批 forward 中额外申请798 MiB时 OOM，不能再作为该
+workload 的安全静态配置。outer 相对最佳安全 static cap12：jobs/s/FTS/s +2.11%，P50
+-9.85%，P95 -1.48%，P99 -1.88%，但 mean +16.80%。动态策略已经略胜人工静态点的吞吐
+和中尾延迟，并自动避开 cap16 的 OOM；mean 回退说明其跨 job 公平性仍需继续优化，当前
+不能宣称已经完成产品化。
+
+### 10.4 环境结论与原始数据
+
+服务器 B 的5/6/7虽无计算进程，但容器内驱动预检报
+`Can't get ascend_hal device count`，因此没有把该次启动计入性能数据，也没有在 B 上
+盲目重试。
+
+原始结果位于服务器 A：
+
+```text
+/data/disk/wangzili/cis-scheduler-plugin-ab-20260915
+```
+
+下一步只调 outer runtime-KV 的安全系数和公平性；随后用 P2 与8K-128K上下文迁移验证。
+除非结果冲突，不再对 EngineCore 架构或大量固定 cap 做重复长跑。

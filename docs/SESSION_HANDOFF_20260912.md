@@ -1421,3 +1421,37 @@ smoke 后 full 可通过 `CIS_PLUGIN_RUNTIME_VARIANT=outer|engine` 只运行胜�
 TP2 smoke。
 
 对应本地提交：`03f9f32 Focus CIS scheduler winner validation`。
+
+## 30. runtime-KV 首轮真实 NPU 结果（2026-09-15）
+
+重新区分“容器映射设备”和“设备上有真实计算进程”后，服务器 A 的物理卡2/3、6/7可用。
+本轮在这两对卡并行完成关键 A/B，未停止其他容器；实验完成后四张卡均已释放。服务器 B
+的5/6/7虽然没有 NPU 计算进程，但新容器在 native categorical 预检时无法获取
+`ascend_hal` device count，因此 B 上的失败只记为环境问题，不进入性能比较。
+
+P1 16-job fixed-work smoke 中，outer runtime-KV 相对纯 EngineCore runtime-KV：jobs/s 与
+FTS/s +3.98%，Job mean -3.24%，P95 -3.47%。工作量逐项相同，均无 preemption，因此默认
+架构收敛为“独立插件 + Conditional IS 薄生命周期 adapter”；纯 EngineCore 保留为兼容
+模式，不进入 full 长跑。
+
+P0 64-job full 中，outer runtime-KV 相对 static cap16：jobs/s +4.19%、FTS/s +2.37%、
+Job mean -1.88%、P95 -6.86%，均100%成功、0 preemption。
+
+P1 32-job fixed-work full 中：static cap8 为0.04804 jobs/s，static cap12为0.05113，outer
+runtime-KV为0.05221；三者的3328个 engine request、720896 generated tokens、627240
+prefill tokens完全相同。outer 相对最佳安全 static cap12 的 jobs/s/FTS/s +2.11%、P50
+-9.85%、P95 -1.48%，但 mean +16.80%。static cap16 在首批 forward 中额外申请798 MiB
+时 OOM。结论是动态策略已经小幅超过人工静态安全最优并自动避免 OOM，但跨 job 公平性
+尚需优化，不能视为最终完成。
+
+原始数据：
+
+```text
+/data/disk/wangzili/cis-scheduler-plugin-ab-20260915
+```
+
+详细表格与产品结论见：
+
+```text
+docs/experiments/CIS_SCHEDULER_PLUGIN_DESIGN_20260914.zh-CN.md
+```
