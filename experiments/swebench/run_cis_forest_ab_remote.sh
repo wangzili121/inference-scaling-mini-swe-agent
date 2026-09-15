@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
   echo "usage: $0 VARIANT DEVICES OUTPUT PORT CONTAINER" >&2
-  echo "VARIANT: baseline | step-cap-only | step-priority-only | job-gang | step-cohort-auto | step-cohort-N | step-tree-adaptive | step-tree-fractional | step-tree-tail-borrow | step-tree-peak-budget | step-tree-continuation | step-tree-work-conserving | step-peak-budget | step-runtime-kv-budget | step-peak-budget-lpt | step-peak-budget-balanced | step-gang | step-gang-6 | step-gang-piecewise | step-gang-dual-graph | step-forest-attention | step-forest-attention-piecewise | step-forest-attention-dual-graph | step-forest-window-N | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
+  echo "VARIANT: baseline | mars-only | mars-cis | step-cap-only | step-priority-only | job-gang | step-cohort-auto | step-cohort-N | step-tree-adaptive | step-tree-fractional | step-tree-tail-borrow | step-tree-peak-budget | step-tree-continuation | step-tree-work-conserving | step-peak-budget | step-runtime-kv-budget | job-runtime-kv-budget | step-peak-budget-lpt | step-peak-budget-balanced | step-gang | step-gang-6 | step-gang-piecewise | step-gang-dual-graph | step-forest-attention | step-forest-attention-piecewise | step-forest-attention-dual-graph | step-forest-window-N | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
   exit 2
 fi
 
@@ -20,6 +20,10 @@ public_workload=${CIS_PUBLIC_WORKLOAD_DIR:-/data/disk/wangzili/cis-artifacts-fc1
 public_workload_file=${CIS_PUBLIC_WORKLOAD_FILE:-public-256.jsonl}
 self_workload=${CIS_SELF_WORKLOAD_DIR:-/data/disk/wangzili/cis-artifacts-629451f/workloads/self-128}
 categorical=${CIS_CATEGORICAL_DIR:-/data/disk/wangzili/vllm-categorical-runtime}
+mars_plugin=${CIS_MARS_PLUGIN_DIR:-/data/disk/wangzili/mars-offloading-plugin-mr6-9396647/mars_offloading_plugin}
+mars_active_window=${CIS_MARS_ACTIVE_WINDOW:-256}
+mars_order=${CIS_MARS_ORDER:-mars_first}
+mars_cis_priority_policy=${CIS_MARS_CIS_PRIORITY_POLICY:-job_fifo}
 cache=${CIS_VLLM_CACHE:-/data/disk/wangzili/vllm-cache-v018-cis-forest}
 limit=${CIS_LIMIT:-64}
 workers=${CIS_WORKERS:-32}
@@ -51,6 +55,9 @@ step_coalesce_seconds=${CIS_STEP_COALESCE_SECONDS:-1.0}
 allow_reserved_devices=${CIS_ALLOW_DOCKER_RESERVED_DEVICES:-0}
 native_runtime_setup=:
 variant_docker_env=()
+variant_docker_mounts=()
+runtime_pythonpath=/workspace/src
+uses_mars=0
 fixed_length_arg=
 
 for value in "$limit" "$workers" "$candidate_count" "$rollout_count" "$block_size" "$active_step_limit" "$active_step_max_limit" "$max_model_len"; do
@@ -123,6 +130,26 @@ fi
 case "$variant" in
   baseline)
     variant_args=()
+    ;;
+  mars-only)
+    uses_mars=1
+    variant_args=(
+      --set 'vllm.scheduler_cls=\"mars_offloading_plugin.scheduler.MarsScheduler\"'
+    )
+    ;;
+  mars-cis)
+    uses_mars=1
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --check /workspace/infra/vllm_ascend/cis_scheduler/vllm-0.18-kv-capacity.patch && git apply /workspace/infra/vllm_ascend/cis_scheduler/vllm-0.18-kv-capacity.patch'
+    variant_args=(
+      --set conditional_is.candidate_count="$candidate_count"
+      --set conditional_is.rollout_count="$rollout_count"
+      --set conditional_is.block_size="$block_size"
+      --set 'conditional_is.active_step_admission=\"runtime_kv_budget\"'
+      --set conditional_is.active_step_max_limit="$active_step_max_limit"
+      --set conditional_is.active_step_kv_capacity_fraction="$active_step_kv_capacity_fraction"
+      --set "vllm.request_priority_policy=\\\"$mars_cis_priority_policy\\\""
+      --set 'vllm.scheduler_cls=\"inference_scaling.arllm.backends.mars_bridge.MarsCISScheduler\"'
+    )
     ;;
   step-cap-only)
     variant_args=(
@@ -651,6 +678,33 @@ case "$variant" in
     ;;
 esac
 
+if [[ "$uses_mars" == 1 ]]; then
+  [[ -f "$mars_plugin/src/mars_offloading_plugin/scheduler.py" ]] || {
+    echo "missing MARS plugin source: $mars_plugin" >&2
+    exit 1
+  }
+  [[ "$mars_active_window" =~ ^[1-9][0-9]*$ ]] || {
+    echo "CIS_MARS_ACTIVE_WINDOW must be a positive integer" >&2
+    exit 2
+  }
+  [[ "$mars_order" == mars_first || "$mars_order" == cis_first ]] || {
+    echo "CIS_MARS_ORDER must be mars_first or cis_first" >&2
+    exit 2
+  }
+  [[ "$mars_cis_priority_policy" == step_fifo || "$mars_cis_priority_policy" == job_fifo ]] || {
+    echo "CIS_MARS_CIS_PRIORITY_POLICY must be step_fifo or job_fifo" >&2
+    exit 2
+  }
+  variant_docker_env+=(
+    -e MARS_OFFLOADING_PLUGIN_CONFIG="{\"active_window_size\":$mars_active_window}"
+    -e CIS_MARS_ORDER="$mars_order"
+  )
+  variant_docker_mounts+=(
+    -v "$mars_plugin":/mars-plugin:ro
+  )
+  runtime_pythonpath=/mars-plugin/src:/workspace/src
+fi
+
 if [[ -n "$tree_max_window" && "$variant" == step-tree-* ]]; then
   variant_docker_env+=(
     -e VLLM_CIS_MAX_WINDOW="$tree_max_window"
@@ -727,6 +781,10 @@ CIS_PUBLIC_WORKLOAD_DIR=$public_workload
 CIS_PUBLIC_WORKLOAD_FILE=$public_workload_file
 CIS_SELF_WORKLOAD_DIR=$self_workload
 CIS_CATEGORICAL_DIR=$categorical
+CIS_MARS_PLUGIN_DIR=$mars_plugin
+CIS_MARS_ACTIVE_WINDOW=$mars_active_window
+CIS_MARS_ORDER=$mars_order
+CIS_MARS_CIS_PRIORITY_POLICY=$mars_cis_priority_policy
 CIS_VLLM_CACHE=$cache
 CIS_LIMIT=$limit
 CIS_WORKERS=$workers
@@ -765,6 +823,7 @@ docker run -d \
   -e CIS_HOST_NPU_PREFLIGHT_VERIFIED=1 \
   -e ASCEND_RT_VISIBLE_DEVICES="$logical_devices" \
   "${variant_docker_env[@]}" \
+  "${variant_docker_mounts[@]}" \
   "${device_args[@]}" \
   --device /dev/davinci_manager \
   --device /dev/devmm_svm \
@@ -788,7 +847,7 @@ docker run -d \
   "$image" -lc "
     set -euo pipefail
     $native_runtime_setup
-    export PYTHONPATH=/workspace/src:\$PYTHONPATH
+    export PYTHONPATH=$runtime_pythonpath:\$PYTHONPATH
     cd /workspace
     /usr/local/python3.11.14/bin/python -c 'import inference_scaling.swe_agent.profile as p; print(p.__file__)'
     exec /usr/local/python3.11.14/bin/python -m inference_scaling.swe_agent.profile \
