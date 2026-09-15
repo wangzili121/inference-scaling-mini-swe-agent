@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [[ $# -lt 5 ]]; then
   echo "usage: $0 VARIANT DEVICES OUTPUT PORT CONTAINER" >&2
-  echo "VARIANT: baseline | mars-only | mars-cis | step-cap-only | step-priority-only | job-gang | step-cohort-auto | step-cohort-N | step-tree-adaptive | step-tree-fractional | step-tree-tail-borrow | step-tree-peak-budget | step-tree-continuation | step-tree-work-conserving | step-peak-budget | step-runtime-kv-budget | job-runtime-kv-budget | step-peak-budget-lpt | step-peak-budget-balanced | step-gang | step-gang-6 | step-gang-piecewise | step-gang-dual-graph | step-forest-attention | step-forest-attention-piecewise | step-forest-attention-dual-graph | step-forest-window-N | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
+  echo "VARIANT: baseline | tree-frontier | mars-only | mars-cis | step-cap-only | step-priority-only | job-gang | step-cohort-auto | step-cohort-N | step-tree-adaptive | step-tree-fractional | step-tree-tail-borrow | step-tree-peak-budget | step-tree-continuation | step-tree-work-conserving | step-peak-budget | step-runtime-kv-budget | job-runtime-kv-budget | step-peak-budget-lpt | step-peak-budget-balanced | step-gang | step-gang-6 | step-gang-piecewise | step-gang-dual-graph | step-forest-attention | step-forest-attention-piecewise | step-forest-attention-dual-graph | step-forest-window-N | step-fused-paths | step-engine-fork | step-engine-fork-barrier | step-engine-fork-tail-N | step-engine-fork-adaptive | step-engine-fork-compact | step-engine-fork-compact-barrier | step-engine-fork-compact-tail-N | step-elastic | step-window-rollout-first | step-subtree-K | step-subtree-fork-K | step-decode-guard-N | step-occupancy-aware | step-fork | step-fork-lease | step-fork-handoff | step-fork-handoff-bounded | step-streaming-fork-handoff | step-streaming-fork-handoff-bounded | step-resample-gc | step-fork-resample-gc | step-branch-evict | step-fork-branch-evict | step-fork-lease-branch-evict | step-window-rollout-first-fork | step-streaming | step-parent | step-parent-streaming | streaming | bounded | frontier-CAPACITY-BATCH" >&2
   exit 2
 fi
 
@@ -24,6 +24,9 @@ mars_plugin=${CIS_MARS_PLUGIN_DIR:-/data/disk/wangzili/mars-offloading-plugin-mr
 mars_active_window=${CIS_MARS_ACTIVE_WINDOW:-256}
 mars_order=${CIS_MARS_ORDER:-mars_first}
 mars_cis_priority_policy=${CIS_MARS_CIS_PRIORITY_POLICY:-job_fifo}
+tree_target_fraction=${CIS_TREE_TARGET_FRACTION:-0.80}
+tree_kv_high_watermark=${CIS_TREE_KV_HIGH_WATERMARK:-0.92}
+tree_max_bundles_per_tick=${CIS_TREE_MAX_BUNDLES_PER_TICK:-8}
 cache=${CIS_VLLM_CACHE:-/data/disk/wangzili/vllm-cache-v018-cis-forest}
 limit=${CIS_LIMIT:-64}
 workers=${CIS_WORKERS:-32}
@@ -130,6 +133,31 @@ fi
 case "$variant" in
   baseline)
     variant_args=()
+    ;;
+  tree-frontier)
+    variant_args=(
+      --set conditional_is.candidate_count="$candidate_count"
+      --set conditional_is.rollout_count="$rollout_count"
+      --set conditional_is.block_size="$block_size"
+      --set 'conditional_is.active_step_admission=\"runtime_kv_budget\"'
+      --set conditional_is.active_step_max_limit="$active_step_max_limit"
+      --set conditional_is.active_step_kv_capacity_fraction="$active_step_kv_capacity_fraction"
+      --set conditional_is.engine_fork_candidate_rollouts=true
+      --set 'vllm.request_priority_policy=\"job_fifo\"'
+      --set vllm.native_kv_fork=true
+      --set vllm.native_kv_fork_waiters=true
+      --set vllm.native_kv_fork_compact_waiters=true
+      --set vllm.native_kv_fork_lease=true
+      --set 'vllm.native_kv_fork_lease_scope=\"full_parent\"'
+      --set 'vllm.scheduler_cls=\"inference_scaling.arllm.backends.cis_tree_frontier_scheduler.CISTreeFrontierScheduler\"'
+    )
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-kv-fork.patch && git apply --recount --check /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-fork-waiters.patch && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-fork-waiters.patch && git apply --recount --check /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-fork-compact-waiters.patch && git apply --recount /workspace/infra/vllm_ascend/cis_native_tree/vllm-0.18-cis-fork-compact-waiters.patch && git apply --recount --check /workspace/infra/vllm_ascend/cis_scheduler/vllm-0.18-kv-capacity.patch && git apply --recount /workspace/infra/vllm_ascend/cis_scheduler/vllm-0.18-kv-capacity.patch'
+    variant_docker_env=(
+      -e VLLM_CIS_TREE_TARGET_FRACTION="$tree_target_fraction"
+      -e VLLM_CIS_TREE_KV_HIGH_WATERMARK="$tree_kv_high_watermark"
+      -e VLLM_CIS_TREE_MAX_BUNDLES_PER_TICK="$tree_max_bundles_per_tick"
+      -e VLLM_CIS_TREE_FRONTIER_TRACE=/artifacts/tree-frontier.jsonl
+    )
     ;;
   mars-only)
     uses_mars=1
@@ -785,6 +813,9 @@ CIS_MARS_PLUGIN_DIR=$mars_plugin
 CIS_MARS_ACTIVE_WINDOW=$mars_active_window
 CIS_MARS_ORDER=$mars_order
 CIS_MARS_CIS_PRIORITY_POLICY=$mars_cis_priority_policy
+CIS_TREE_TARGET_FRACTION=$tree_target_fraction
+CIS_TREE_KV_HIGH_WATERMARK=$tree_kv_high_watermark
+CIS_TREE_MAX_BUNDLES_PER_TICK=$tree_max_bundles_per_tick
 CIS_VLLM_CACHE=$cache
 CIS_LIMIT=$limit
 CIS_WORKERS=$workers
