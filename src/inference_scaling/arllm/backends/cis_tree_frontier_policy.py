@@ -48,7 +48,7 @@ class TreeFrontierPolicy:
         self,
         *,
         max_num_seqs: int,
-        target_fraction: float = 0.80,
+        target_fraction: float = 1.0,
         kv_high_watermark: float = 0.92,
         max_bundles_per_tick: int = 8,
     ) -> None:
@@ -146,6 +146,8 @@ class TreeFrontierPolicy:
         )
         admitted: list[ReadyBundle] = []
         for _ in range(tick_budget):
+            if runnable >= target:
+                break
             active_trees = max(1, len(self.trees))
             base_quota = max(1, ceil(target / active_trees))
             # Refill real idle capacity without imposing a fixed step cap.
@@ -156,8 +158,6 @@ class TreeFrontierPolicy:
                 if not state.ready:
                     continue
                 width = state.ready[0].child_count
-                if runnable + width > target:
-                    continue
                 progress_needed = (
                     state.candidate_phase_closed
                     and state.active_children == 0

@@ -34,7 +34,7 @@ class CISTreeFrontierScheduler(Scheduler):
         self._cis_frontier = TreeFrontierPolicy(
             max_num_seqs=self.max_num_running_reqs,
             target_fraction=float(
-                os.environ.get("VLLM_CIS_TREE_TARGET_FRACTION", "0.80")
+                os.environ.get("VLLM_CIS_TREE_TARGET_FRACTION", "1.0")
             ),
             kv_high_watermark=float(
                 os.environ.get("VLLM_CIS_TREE_KV_HIGH_WATERMARK", "0.92")

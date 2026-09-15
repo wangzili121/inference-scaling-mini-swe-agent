@@ -104,6 +104,21 @@ class TreeFrontierPolicyTest(unittest.TestCase):
         )
         self.assertEqual(len(admitted), 2)
 
+    def test_sibling_bundle_refills_near_target_without_queue_flood(self) -> None:
+        policy = TreeFrontierPolicy(max_num_seqs=256, target_fraction=0.80)
+        policy.register_tree("j", 2)
+        policy.parent_completed("j", "p0", child_count=3, terminal=False)
+        policy.parent_completed("j", "p1", child_count=3, terminal=False)
+        admitted = policy.choose_bundles(
+            running=204, waiting=0, kv_usage=0.63
+        )
+        self.assertEqual([bundle.parent_handle for bundle in admitted], ["p0"])
+        self.assertEqual(
+            policy.choose_bundles(running=207, waiting=0, kv_usage=0.63),
+            [],
+        )
+        self.assertEqual(len(policy.trees["j"].ready), 1)
+
     def test_rejects_extra_candidate_and_uncredited_child(self) -> None:
         policy = TreeFrontierPolicy(max_num_seqs=16)
         policy.register_tree("j", 2)

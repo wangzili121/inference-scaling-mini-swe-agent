@@ -24,7 +24,7 @@ mars_plugin=${CIS_MARS_PLUGIN_DIR:-/data/disk/wangzili/mars-offloading-plugin-mr
 mars_active_window=${CIS_MARS_ACTIVE_WINDOW:-256}
 mars_order=${CIS_MARS_ORDER:-mars_first}
 mars_cis_priority_policy=${CIS_MARS_CIS_PRIORITY_POLICY:-job_fifo}
-tree_target_fraction=${CIS_TREE_TARGET_FRACTION:-0.80}
+tree_target_fraction=${CIS_TREE_TARGET_FRACTION:-1.0}
 tree_kv_high_watermark=${CIS_TREE_KV_HIGH_WATERMARK:-0.92}
 tree_max_bundles_per_tick=${CIS_TREE_MAX_BUNDLES_PER_TICK:-8}
 cache=${CIS_VLLM_CACHE:-/data/disk/wangzili/vllm-cache-v018-cis-forest}
@@ -56,6 +56,7 @@ tree_peak_token_budget=${CIS_TREE_PEAK_TOKEN_BUDGET:-}
 fixed_length=${CIS_FIXED_LENGTH:-0}
 step_coalesce_seconds=${CIS_STEP_COALESCE_SECONDS:-1.0}
 allow_reserved_devices=${CIS_ALLOW_DOCKER_RESERVED_DEVICES:-0}
+idle_boom_mcp_pid=${CIS_ALLOW_IDLE_BOOM_MCP_PID:-}
 native_runtime_setup=:
 variant_docker_env=()
 variant_docker_mounts=()
@@ -111,6 +112,10 @@ fi
 }
 [[ "$allow_reserved_devices" == 0 || "$allow_reserved_devices" == 1 ]] || {
   echo "CIS_ALLOW_DOCKER_RESERVED_DEVICES must be 0 or 1" >&2
+  exit 2
+}
+[[ -z "$idle_boom_mcp_pid" || "$idle_boom_mcp_pid" =~ ^[0-9]+$ ]] || {
+  echo "CIS_ALLOW_IDLE_BOOM_MCP_PID must be a numeric PID" >&2
   exit 2
 }
 if [[ "$fixed_length" == 1 ]]; then
@@ -792,10 +797,25 @@ npu_snapshot=$(/usr/local/bin/npu-smi info)
 printf '%s\n' "$npu_snapshot" >"$output/npu-before.txt"
 process_snapshot=$(printf '%s\n' "$npu_snapshot" | sed -n '/Process id/,$p')
 for id in "${device_ids[@]}"; do
-  if printf '%s\n' "$process_snapshot" \
-    | grep -Eq "^\\|[[:space:]]*$id[[:space:]]+\\|"; then
-    echo "selected NPU $id already has a process" >&2
-    exit 1
+  device_processes=$(printf '%s\n' "$process_snapshot" | awk -F'|' -v wanted="$id" '
+    {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $3)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $5)
+      split($2, device_fields, /[[:space:]]+/)
+      if (device_fields[1] == wanted && $3 ~ /^[0-9]+$/)
+        print $3 ":" $5
+    }
+  ')
+  if [[ -n "$device_processes" ]]; then
+    idle_command=$(ps -p "$idle_boom_mcp_pid" -o args= 2>/dev/null || true)
+    if [[ -z "$idle_boom_mcp_pid" \
+      || "$device_processes" != "$idle_boom_mcp_pid:110" \
+      || "$idle_command" != *boom_core.lifecycle.interfaces.mcp* ]]; then
+      echo "selected NPU $id already has a process: $device_processes" >&2
+      exit 1
+    fi
+    echo "warning: accepting idle boom MCP context on NPU $id (PID $idle_boom_mcp_pid, 110 MB)" >&2
   fi
 done
 
@@ -844,6 +864,7 @@ CIS_TREE_PEAK_TOKEN_BUDGET=$tree_peak_token_budget
 CIS_FIXED_LENGTH=$fixed_length
 CIS_STEP_COALESCE_SECONDS=$step_coalesce_seconds
 CIS_ALLOW_DOCKER_RESERVED_DEVICES=$allow_reserved_devices
+CIS_ALLOW_IDLE_BOOM_MCP_PID=$idle_boom_mcp_pid
 EOF
 
 docker run -d \
