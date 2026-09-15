@@ -1455,3 +1455,42 @@ prefill tokens完全相同。outer 相对最佳安全 static cap12 的 jobs/s/FT
 ```text
 docs/experiments/CIS_SCHEDULER_PLUGIN_DESIGN_20260914.zh-CN.md
 ```
+
+## 31. runtime-KV 公平性与安全系数调优（2026-09-15）
+
+在 P1 的同一32-job fixed-work上，将请求优先级由 `step_fifo` 改为 `job_fifo`，同时保持
+outer runtime-KV生命周期控制。KV fraction=0.80时，`job_fifo` 相对 `step_fifo` 的
+jobs/s基本不变（+0.14%），Job mean/P50/P95分别下降5.80%/9.10%/0.49%。它相对最佳
+安全静态 `cap12` 的 jobs/s/FTS/s +4.88%/+5.44%，P50/P95/P99
+-21.67%/-4.84%/-4.71%，但 mean仍高5.63%。当前产品默认候选因此更新为
+`job_fifo + runtime-KV f0.80`。
+
+继续把 fraction 降到0.70后，jobs/s/FTS/s相对0.80下降4.50%/5.01%，mean/P50/P95/P99
+分别增加3.73%/19.30%/2.30%/3.99%，且两组均无 preemption。0.70已经越过吞吐与延迟
+拐点，不再继续向下扫描。静态 `cap12` 的 mean较低主要来自首批8个 job约131秒完成；
+动态策略则降低了中位数、尾部和总 makespan。若必须同时击败静态 mean，下一步应增加
+由运行时 `max_num_seqs` 推导、在 candidate/rollout 阶段动态 resize 的 branch 预算，
+而不是继续手调 KV fraction。
+
+新增远程运行变体 `job-runtime-kv-budget`，只将已有 runtime-KV admission 与已有
+`job_fifo` 组合，未复制或重写 vLLM scheduler。原始数据仍位于：
+
+```text
+/data/disk/wangzili/cis-scheduler-plugin-ab-20260915/tune
+```
+
+随后补做 P0/P2 迁移和严格消融。P0 真实 EOS 中，`job_fifo f0.80` 相对
+`step_fifo f0.80` 的 jobs/s/FTS/s +15.01%/+10.56%，但 engine requests减少12.62%；
+这不能作为纯调度因果证据。16-job fixed-length严格 A/B中，两边均为3120 requests、
+675840 generated tokens、0 preemption；`job_fifo` 的 jobs/s -0.18%、mean -7.60%，
+P50/P95 +2.14%/+3.74%，并增加11.27% prefill。它改善平均JCT，但没有提高固定工作量
+吞吐，且尾延迟略差。
+
+P2 在服务器 A 同机同卡重跑 baseline 后，`job_fifo f0.80` 的 jobs/s +5.80%、P50/P95
+-2.13%/-3.58%，mean/P99 +1.01%/+5.31%，preemption从8降为0。FTS/s下降11.41%源于
+baseline多做17.50% prefill，不能将重算视为有效吞吐。
+
+因此当前插件不能硬编码一个“全局最佳 priority”。产品应暴露 `throughput_tail`、
+`mean_jct` 与尚待验证的 `auto` 三种目标：前两种分别偏 step locality 与 job continuation；
+`auto` 应读取 runtime KV/preemption、活跃 step 服务时间膨胀和完成速率来决策，而不是按
+数据集或固定 C/R 表查值。

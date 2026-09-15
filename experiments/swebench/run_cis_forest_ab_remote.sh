@@ -282,6 +282,23 @@ case "$variant" in
       )
     fi
     ;;
+  job-runtime-kv-budget)
+    native_runtime_setup='cd /vllm-workspace/vllm && git apply --check /workspace/infra/vllm_ascend/cis_scheduler/vllm-0.18-kv-capacity.patch && git apply /workspace/infra/vllm_ascend/cis_scheduler/vllm-0.18-kv-capacity.patch'
+    variant_args=(
+      --set conditional_is.candidate_count="$candidate_count"
+      --set conditional_is.rollout_count="$rollout_count"
+      --set conditional_is.block_size="$block_size"
+      --set 'conditional_is.active_step_admission=\"runtime_kv_budget\"'
+      --set conditional_is.active_step_max_limit="$active_step_max_limit"
+      --set conditional_is.active_step_kv_capacity_fraction="$active_step_kv_capacity_fraction"
+      --set 'vllm.request_priority_policy=\"job_fifo\"'
+    )
+    if [[ -n "$active_step_token_budget" ]]; then
+      variant_args+=(
+        --set conditional_is.active_step_token_budget="$active_step_token_budget"
+      )
+    fi
+    ;;
   step-peak-budget-lpt)
     variant_args=(
       --set conditional_is.candidate_count="$candidate_count"

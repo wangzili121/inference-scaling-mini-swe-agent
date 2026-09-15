@@ -240,7 +240,79 @@ workload 的安全静态配置。outer 相对最佳安全 static cap12：jobs/s/
 和中尾延迟，并自动避开 cap16 的 OOM；mean 回退说明其跨 job 公平性仍需继续优化，当前
 不能宣称已经完成产品化。
 
-### 10.4 环境结论与原始数据
+### 10.4 runtime-KV 安全系数与公平性
+
+P1 继续固定同一份 32-job fixed-work，比较 `step_fifo`、`job_fifo` 和 KV 安全系数。
+除 `job_fifo f0.80` 的 prefill 增加7168 token（1.14%）外，generated tokens、engine
+requests 和算法参数完全一致；所有运行均100%成功、0 preemption。
+
+| 实现 | jobs/s | FTS/s | Job mean | P50 | P95 | max in-flight |
+|---|---:|---:|---:|---:|---:|---:|
+| static cap12 + step FIFO | 0.05113 | 2148.87 | 382.75 s | 424.26 s | 622.05 s | 192 |
+| runtime-KV f0.80 + step FIFO | 0.05355 | 2250.50 | 429.16 s | 365.56 s | 594.83 s | 392 |
+| runtime-KV f0.80 + job FIFO | **0.05363** | **2265.75** | **404.28 s** | **332.32 s** | **591.94 s** | 384 |
+| runtime-KV f0.70 + job FIFO | 0.05121 | 2152.30 | 419.35 s | 396.46 s | 605.58 s | 328 |
+
+`job_fifo f0.80` 相对 `step_fifo f0.80` 的 jobs/s基本不变（+0.14%），但 mean/P50/P95
+分别下降5.80%/9.10%/0.49%。这说明跨 step 保持 job 连续性可以改善公平性，而不需要
+牺牲吞吐。相对最佳安全静态 `cap12`，它的 jobs/s/FTS/s +4.88%/+5.44%，P50/P95/P99
+-21.67%/-4.84%/-4.71%，但 mean仍高5.63%。静态策略让最早一批 job 在约131秒完成，
+显著拉低 mean；动态策略改善了中位数、尾部和总 makespan，但仍有更多 job 同时竞争。
+
+将比例从0.80降到0.70后，jobs/s/FTS/s相对 f0.80下降4.50%/5.01%，mean/P50/P95/P99
+分别增加3.73%/19.30%/2.30%/3.99%。因此0.80是当前安全系数的明确局部最优，停止继续
+向下扫描。后续若继续改善 mean，应引入由 `max_num_seqs` 推导的第二种 sequence/branch
+资源约束，而不是继续手调 KV 比例。
+
+### 10.5 P0 priority 与随机工作量消融
+
+P0 的64-job真实 EOS 运行中，`job_fifo f0.80` 相对 `step_fifo f0.80` 的 jobs/s/FTS/s
++15.01%/+10.56%，mean/P50/P95/P99 -5.67%/-4.90%/-5.61%/-1.52%；相对静态 cap16 的
+jobs/s/FTS/s +16.03%/+12.08%，mean/P95/P99 -2.27%/-11.65%/-6.48%。但它同时少生成
+12.62%的 engine requests，说明调度改变了 native categorical 的实际随机路径，不能把
+全部收益归因于执行效率。
+
+因此又用16个 job、固定512输出做严格 A/B：
+
+| 实现 | jobs/s | FTS/s | Job mean | P50 | P95 | prefill | engine requests |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| runtime-KV f0.80 + step FIFO | **0.02606** | 1826.61 | 457.54 s | **434.04 s** | **586.36 s** | **448661** | 3120 |
+| runtime-KV f0.80 + job FIFO | 0.02602 | 1905.58 | **422.79 s** | 443.32 s | 608.31 s | 499221 | 3120 |
+
+两边 generated tokens均为675840、engine requests均为3120、0 preemption。`job_fifo` 的
+jobs/s -0.18%、mean -7.60%，但 P50/P95/P99 +2.14%/+3.74%/+0.87%，并增加11.27%
+prefill。更高 FTS/s来自额外 prefill，不是更高 jobs/s。因此 P0 中 `job_fifo` 是降低平均
+JCT的目标模式，`step_fifo` 是更好的吞吐/尾延迟模式；真实 EOS 的大幅结果只作为端到端
+现象，不作为固定工作量的 priority 因果结论。
+
+### 10.6 P2 同机 baseline
+
+P2 必须使用同机同卡 baseline；此前 Host B 的0.40595 jobs/s不能直接与 Host A 比较。
+服务器 A 的严格同机结果为：
+
+| 实现 | jobs/s | FTS/s | Job mean | P50 | P95 | P99 | preemption |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 原始 vLLM | 0.33876 | 5480.85 | **67.16 s** | 57.73 s | 146.64 s | **164.34 s** | 8 |
+| runtime-KV f0.80 + job FIFO | **0.35840** | 4855.56 | 67.83 s | **56.50 s** | **141.40 s** | 173.06 s | **0** |
+
+新策略的 jobs/s +5.80%、P50/P95 -2.13%/-3.58%，mean/P99 +1.01%/+5.31%，并消除8次
+preemption。FTS/s下降11.41%是因为 baseline 多执行了17.50%的 prefill，其中包含
+preemption重算；这里 jobs/s、延迟和重算量比“处理了多少冗余 FTS”更能反映效率。
+
+### 10.7 产品策略结论
+
+当前没有一个 priority 同时支配所有目标：P1 的 `job_fifo f0.80` 改善吞吐、中位数和
+尾延迟，P0 fixed-work 的 `job_fifo` 改善 mean但轻微损害吞吐与尾部，P2 则改善吞吐/P95
+但轻微损害 mean/P99。产品层应提供：
+
+- `throughput_tail`：以 step locality 为主；
+- `mean_jct`：以 job continuation 为主；
+- `auto`：根据 runtime KV、preemption、活跃 step 的服务时间膨胀和完成速率选择，而不是
+  固定按 C/R 或数据集写死。
+
+`auto` 尚未完成 NPU 验证；在此之前，不能把 `job_fifo f0.80` 宣称为所有场景的唯一默认。
+
+### 10.8 环境结论与原始数据
 
 服务器 B 的5/6/7虽无计算进程，但容器内驱动预检报
 `Can't get ascend_hal device count`，因此没有把该次启动计入性能数据，也没有在 B 上
@@ -252,5 +324,6 @@ workload 的安全静态配置。outer 相对最佳安全 static cap12：jobs/s/
 /data/disk/wangzili/cis-scheduler-plugin-ab-20260915
 ```
 
-下一步只调 outer runtime-KV 的安全系数和公平性；随后用 P2 与8K-128K上下文迁移验证。
-除非结果冲突，不再对 EngineCore 架构或大量固定 cap 做重复长跑。
+下一步实现 objective-aware `auto` 控制，并在8K-128K上下文迁移验证；若 P1 mean仍是
+产品目标，再加入 runtime sequence/branch budget。除非结果冲突，不再对 EngineCore
+架构、低于0.70的安全系数或大量固定 cap 做重复长跑。
