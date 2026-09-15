@@ -54,6 +54,7 @@ _VLLM_SETTINGS = {
     "scheduler_cls",
     "seed",
     "tensor_parallel_size",
+    "tokenizer_mode",
     "trust_remote_code",
 }
 _MODEL_ROLES = ("base", "proposal", "rl")
@@ -74,6 +75,7 @@ _EXPLICIT_ENGINE_SETTINGS = {
     "model",
     "pipeline_parallel_size",
     "quantization",
+    "tokenizer_mode",
     "revision",
     "seed",
     "tensor_parallel_size",
@@ -420,6 +422,7 @@ def load_backend_from_config(
             max_num_seqs=settings.pop("max_num_seqs", None),
             max_num_batched_tokens=settings.pop("max_num_batched_tokens", None),
             quantization=settings.pop("quantization", None),
+            tokenizer_mode=settings.pop("tokenizer_mode", None),
             enforce_eager=bool(settings.pop("enforce_eager", False)),
             trust_remote_code=bool(
                 settings.pop("trust_remote_code", runtime.get("trust_remote_code", False))

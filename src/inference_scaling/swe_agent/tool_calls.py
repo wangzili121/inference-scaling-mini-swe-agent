@@ -6,6 +6,7 @@ import json
 import re
 from dataclasses import dataclass
 from hashlib import blake2b
+from types import SimpleNamespace
 from typing import Any
 
 
@@ -131,8 +132,49 @@ def parse_assistant_text(text: str, *, request_id: str) -> ParsedAssistant:
     )
 
 
+def parse_deepseek_v4_text(
+    text: str, *, request_id: str, tokenizer: Any
+) -> ParsedAssistant:
+    """Use vLLM's DSML parser; normalize its calls for mini-SWE-agent."""
+    try:
+        from vllm.parser.deepseek_v4 import DeepSeekV4Parser
+    except ImportError as error:
+        raise ToolCallParseError("vLLM DeepSeek V4 parser is unavailable") from error
+
+    eos = getattr(tokenizer, "eos_token", None)
+    if isinstance(eos, str) and eos:
+        while text.endswith(eos):
+            text = text[: -len(eos)]
+    parser = DeepSeekV4Parser(tokenizer)
+    request = SimpleNamespace(tools=None, tool_choice="auto")
+    extracted = parser.extract_tool_calls(text, request)
+    if "<\uff5cDSML\uff5ctool_calls>" in text and not extracted.tool_calls:
+        raise ToolCallParseError("DeepSeek V4 DSML tool call could not be parsed")
+
+    tool_calls: list[dict[str, Any]] = []
+    actions: list[dict[str, str]] = []
+    for index, call in enumerate(extracted.tool_calls):
+        command = _command(
+            {"name": call.function.name, "arguments": call.function.arguments}
+        )
+        call_id = _tool_call_id(request_id, index)
+        tool_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": json.dumps({"command": command}, separators=(",", ":")),
+                },
+            }
+        )
+        actions.append({"command": command, "tool_call_id": call_id})
+    return ParsedAssistant(extracted.content, tuple(tool_calls), tuple(actions))
+
+
 __all__ = [
     "ParsedAssistant",
     "ToolCallParseError",
     "parse_assistant_text",
+    "parse_deepseek_v4_text",
 ]

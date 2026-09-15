@@ -1,0 +1,7 @@
+model:
+  model_name: conditional-is/DeepSeek-V4-Flash-0731-w8a8
+  model_class: inference_scaling.swe_agent.model.ConditionalISModel
+  endpoint: http://127.0.0.1:8123
+  timeout_seconds: 3600
+  retries: 2
+  seed: 20260908

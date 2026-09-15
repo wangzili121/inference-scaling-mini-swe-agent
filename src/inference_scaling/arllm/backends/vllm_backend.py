@@ -56,6 +56,7 @@ _PROTECTED_ENGINE_KWARGS = frozenset(
         "data_parallel_size",
         "gpu_memory_utilization",
         "quantization",
+        "tokenizer_mode",
         "enforce_eager",
         "trust_remote_code",
         "revision",
@@ -423,6 +424,7 @@ class VLLMBackend:
         max_num_seqs: int | None = None,
         max_num_batched_tokens: int | None = None,
         quantization: str | None = None,
+        tokenizer_mode: str | None = None,
         enforce_eager: bool = False,
         trust_remote_code: bool = False,
         revision: str | None = None,
@@ -457,6 +459,10 @@ class VLLMBackend:
             revision=revision,
             cache_dir=download_dir,
         )
+        if tokenizer_mode == "deepseek_v4":
+            from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
+
+            tokenizer = get_deepseek_v4_tokenizer(tokenizer)
         if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
@@ -488,6 +494,8 @@ class VLLMBackend:
             "enable_lora": adapter_name_or_path is not None,
             "max_lora_rank": int(max_lora_rank),
         }
+        if tokenizer_mode is not None:
+            kwargs["tokenizer_mode"] = tokenizer_mode
         if enable_mh_fused_logprobs:
             # The adapter targets vLLM's stable V1 runner in 0.26.  Sampling
             # remains synchronous inside the engine so the selected raw
@@ -1652,6 +1660,7 @@ class AsyncVLLMBackend(VLLMBackend):
         max_num_seqs: int | None = None,
         max_num_batched_tokens: int | None = None,
         quantization: str | None = None,
+        tokenizer_mode: str | None = None,
         enforce_eager: bool = False,
         trust_remote_code: bool = False,
         revision: str | None = None,
@@ -1684,16 +1693,14 @@ class AsyncVLLMBackend(VLLMBackend):
             from transformers import AutoTokenizer
             from vllm.engine.arg_utils import AsyncEngineArgs
             from vllm.v1.engine.async_llm import AsyncLLM
-            from vllm.v1.engine.parallel_sampling import ParentRequest
-            from vllm.v1.core.kv_cache_manager import KVCacheManager
-            from vllm.v1.core.sched.scheduler import Scheduler
-            from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
             SamplingParams, TokensPrompt, BeamSearchParams = _load_vllm_sampling_api()
         except ImportError as error:  # pragma: no cover - optional GPU installation
             raise ModuleNotFoundError(
                 "AsyncVLLMBackend.from_pretrained requires the project's vllm extra"
             ) from error
+        if native_parallel_sampling:
+            from vllm.v1.engine.parallel_sampling import ParentRequest
+
         if native_parallel_sampling and not bool(
             getattr(ParentRequest, "cis_child_final_streaming_supported", False)
         ):
@@ -1718,12 +1725,27 @@ class AsyncVLLMBackend(VLLMBackend):
                     "native_packed_forest_attention requires the CIS packed "
                     "forest-attention runtime patch"
                 )
+        if native_segmented_rng:
+            from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
         if native_segmented_rng and not bool(
             getattr(GPUModelRunner, "cis_segmented_rng_supported", False)
         ):
             raise RuntimeError(
                 "native_segmented_rng requires the CIS segmented RNG runtime patch"
             )
+        if (
+            native_kv_fork
+            or native_kv_fork_lease
+            or native_kv_branch_eviction
+            or native_kv_resample_gc
+            or native_kv_fork_lease_scope == "full_parent"
+            or native_kv_fork_lease_max_fraction is not None
+        ):
+            from vllm.v1.core.kv_cache_manager import KVCacheManager
+        if native_kv_fork_waiters or native_kv_fork_compact_waiters:
+            from vllm.v1.core.sched.scheduler import Scheduler
+
         if native_kv_fork and not bool(
             getattr(KVCacheManager, "cis_fork_supported", False)
         ):
@@ -1782,6 +1804,10 @@ class AsyncVLLMBackend(VLLMBackend):
             revision=revision,
             cache_dir=download_dir,
         )
+        if tokenizer_mode == "deepseek_v4":
+            from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
+
+            tokenizer = get_deepseek_v4_tokenizer(tokenizer)
         if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
@@ -1805,6 +1831,8 @@ class AsyncVLLMBackend(VLLMBackend):
             "enable_lora": adapter_name_or_path is not None,
             "max_lora_rank": int(max_lora_rank),
         }
+        if tokenizer_mode is not None:
+            kwargs["tokenizer_mode"] = tokenizer_mode
         optional = {
             "max_model_len": max_model_len,
             "max_num_seqs": max_num_seqs,

@@ -1,0 +1,78 @@
+[source]
+inference_scaling_sha = "04492fe1e227e7171f9f20c971240c2d5ac3c535"
+runtime = "vllm-ascend-v0.26.0rc"
+model = "Eco-Tech/DeepSeek-V4-Flash-0731-w8a8"
+
+[models]
+base = "${CIS_MODEL_PATH}"
+
+[generation]
+max_new_tokens = 512
+ignore_eos = false
+
+[sampling]
+temperature = 1.0
+top_p = 1.0
+
+[conditional_is]
+candidate_count = 4
+rollout_count = 2
+block_size = 128
+reward_temperature = 1.0
+active_step_limit = 0
+active_step_admission = "fixed"
+fused_candidate_rollout_paths = false
+engine_fork_candidate_rollouts = false
+stream_candidate_rollouts = false
+
+[reward]
+kind = "sequence_log_probability"
+scale = 1.0
+
+[runtime]
+backend = "vllm"
+device = "npu"
+dtype = "auto"
+trust_remote_code = true
+
+[vllm]
+asynchronous = true
+async_scheduling = false
+enforce_eager = false
+tensor_parallel_size = 8
+pipeline_parallel_size = 1
+data_parallel_size = 1
+quantization = "ascend"
+tokenizer_mode = "deepseek_v4"
+gpu_memory_utilization = 0.90
+max_model_len = 32768
+max_num_seqs = 32
+max_num_batched_tokens = 8192
+enable_prefix_caching = true
+request_priority_policy = "none"
+native_parallel_sampling = false
+native_packed_forest_attention = false
+native_segmented_rng = false
+native_kv_fork = false
+native_kv_fork_waiters = false
+native_kv_fork_compact_waiters = false
+native_kv_fork_lease = false
+native_kv_resample_gc = false
+native_kv_branch_eviction = false
+
+[vllm.engine_kwargs]
+enable_chunked_prefill = true
+enable_expert_parallel = true
+disable_hybrid_kv_cache_manager = false
+block_size = 128
+model_loader_extra_config = { enable_multithread_load = true, num_threads = 128 }
+compilation_config = { cudagraph_mode = "FULL_DECODE_ONLY" }
+additional_config = { enable_cpu_binding = true, ascend_compilation_config = { enable_npugraph_ex = true, enable_static_kernel = false } }
+
+[run]
+seed = 20260908
+
+[service]
+tool_parser = "deepseek_v4"
+trace_path = "artifacts/traces/dsv4_model_calls.jsonl"
+idempotency_cache_size = 256

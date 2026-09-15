@@ -34,6 +34,7 @@ from inference_scaling.swe_agent.tool_calls import (
     ParsedAssistant,
     ToolCallParseError,
     parse_assistant_text,
+    parse_deepseek_v4_text,
 )
 
 
@@ -247,6 +248,9 @@ class ConditionalISRunner:
     def __init__(self, backend: Any, config: Mapping[str, Any]) -> None:
         self.backend = backend
         self.config = dict(config)
+        self.tool_parser = str(config.get("service", {}).get("tool_parser", "qwen"))
+        if self.tool_parser not in {"qwen", "deepseek_v4"}:
+            raise ValueError(f"unsupported service.tool_parser: {self.tool_parser}")
         generation = dict(config["generation"])
         conditional = dict(config["conditional_is"])
         sampling = dict(config["sampling"])
@@ -552,7 +556,12 @@ class ConditionalISRunner:
         text = self.backend.decode(result.token_ids, skip_special_tokens=False)
         parse_error = None
         try:
-            parsed = parse_assistant_text(text, request_id=request_id)
+            if self.tool_parser == "deepseek_v4":
+                parsed = parse_deepseek_v4_text(
+                    text, request_id=request_id, tokenizer=self.backend.tokenizer
+                )
+            else:
+                parsed = parse_assistant_text(text, request_id=request_id)
         except ToolCallParseError as error:
             parse_error = str(error)
             parsed = ParsedAssistant(text or None, (), ())
