@@ -59,7 +59,6 @@ common=(--network host --privileged=true --shm-size "$SHM_SIZE"
   -v "$REPO:/workspace:ro"
   -v "$MODEL_DIR:/models/dsv4:ro"
   -v "$ARTIFACT_DIR:/workspace/artifacts"
-  -e PYTHONPATH=/workspace/src
   -e CIS_MODEL_PATH=/models/dsv4
   -e ASCEND_RT_VISIBLE_DEVICES="$DEVICES"
   -e VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE=0
@@ -77,7 +76,8 @@ check() {
   elif [[ -x /usr/local/bin/npu-smi ]]; then
     /usr/local/bin/npu-smi info
   fi
-  docker run --rm "${common[@]}" --entrypoint python "$IMAGE" \
+  docker run --rm "${common[@]}" --entrypoint bash "$IMAGE" \
+    /workspace/deploy/dsv4_flash/container_python.sh \
     -m inference_scaling.swe_agent.dsv4_preflight \
     --model-dir /models/dsv4 --runtime | tee "$ARTIFACT_DIR/runtime-preflight.json"
   printf 'Inspect NPU occupancy above before setting CONFIRM_DEVICES_FREE=yes.\n'
@@ -122,7 +122,8 @@ start() {
     printf 'unversioned-copy\n' > "$ARTIFACT_DIR/repo-commit.txt"
   fi
   docker run -d "${common[@]}" --name "$CONTAINER_NAME" \
-    --entrypoint python "$IMAGE" \
+    --entrypoint bash "$IMAGE" \
+    /workspace/deploy/dsv4_flash/container_python.sh \
     -m inference_scaling.swe_agent.server \
     --config /workspace/configs/dsv4_flash/conditional_is_0731.toml \
     --host "$HOST" --port "$PORT" "${overrides[@]}" \
@@ -141,7 +142,9 @@ start() {
       return
     fi
     if [[ "$(docker inspect "$CONTAINER_NAME" --format '{{.State.Running}}')" != true ]]; then
+      docker logs --timestamps "$CONTAINER_NAME" > "$ARTIFACT_DIR/container-startup.full.log" 2>&1
       docker logs --tail 100 "$CONTAINER_NAME" >&2
+      printf 'Full startup log: %s/container-startup.full.log\n' "$ARTIFACT_DIR" >&2
       printf 'Model container exited before healthz.\n' >&2
       exit 1
     fi
@@ -149,6 +152,8 @@ start() {
     elapsed=$((elapsed + 10))
   done
   docker logs --tail 100 "$CONTAINER_NAME" >&2
+  docker logs --timestamps "$CONTAINER_NAME" > "$ARTIFACT_DIR/container-startup.full.log" 2>&1
+  printf 'Full startup log: %s/container-startup.full.log\n' "$ARTIFACT_DIR" >&2
   printf 'Healthz did not become ready within %ss; container remains for inspection.\n' "$limit" >&2
   exit 1
 }

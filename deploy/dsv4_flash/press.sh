@@ -38,7 +38,8 @@ if too_long:
     raise SystemExit(f"{len(too_long)} requests exceed max_model_len; first: {too_long[0]}")
 print(f"Frozen CIS calls: {len(records)}; max_model_len: {context}")
 PY
-docker exec "$CONTAINER_NAME" python -m inference_scaling.swe_agent.benchmark \
+docker exec "$CONTAINER_NAME" bash /workspace/deploy/dsv4_flash/container_python.sh \
+  -m inference_scaling.swe_agent.benchmark \
   --workload "$INSIDE_WORKLOAD" \
   --endpoint "http://127.0.0.1:$PORT" \
   --workers "$WORKERS" \

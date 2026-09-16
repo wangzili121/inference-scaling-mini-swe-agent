@@ -53,6 +53,13 @@ def inspect_snapshot(model_dir: Path) -> dict[str, object]:
 
 
 def inspect_runtime(model_dir: Path) -> dict[str, object]:
+    try:
+        from acl.rt import memcpy  # noqa: F401
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "AscendCL Python module acl.rt is unavailable in the container; "
+            "check the image CANN installation and sourced set_env.sh"
+        ) from exc
     import vllm
     from transformers import AutoTokenizer
     from vllm.engine.arg_utils import AsyncEngineArgs
@@ -100,6 +107,7 @@ def inspect_runtime(model_dir: Path) -> dict[str, object]:
     if len(parsed.actions) != 1 or parsed.actions[0]["command"] != "echo ready":
         raise RuntimeError("DeepSeek V4 parser could not decode a bash tool call")
     return {
+        "acl_probe": "ok",
         "vllm_version": vllm.__version__,
         "vllm_ascend_version": ascend_version,
         "tokenizer_probe": "ok",

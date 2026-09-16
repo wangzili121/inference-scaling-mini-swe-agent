@@ -39,7 +39,8 @@ bash run.sh status
 python3 smoke.py --endpoint http://127.0.0.1:8123
 ```
 
-`check` verifies local image availability, selected device nodes, complete model
+`check` verifies local image availability, selected device nodes, the container's
+AscendCL Python module (`acl.rt`), complete model
 shard index, vLLM engine arguments, DeepSeek V4 prompt encoding and DSML bash
 parsing **before model loading**. The local image ID and preflight JSON are written
 under `ARTIFACT_DIR`. This is a metadata hash plus shard-existence/size check,
@@ -47,7 +48,9 @@ not a full SHA256 of every large weight file. If the runtime lacks an expected
 API, stop there and send the
 preflight error; don't silently switch the internal image or apply the v0.18 patch.
 `start` launches a container, waits up to 30 minutes for `/healthz`, and keeps a
-failed container for log inspection; `status` shows the last 80 log lines.
+failed container for log inspection. On startup failure it saves the full
+timestamped log to `ARTIFACT_DIR/container-startup.full.log`; `status` shows
+the last 80 log lines.
 The service `/healthz` becomes available only after AsyncLLM/model construction.
 
 The first smoke asks for `bash echo cis-ready`. A completed response without an
@@ -81,7 +84,8 @@ mini-agent has produced traces, freeze them with the existing CLI (inside the
 container or another Python 3.11+ environment with this package):
 
 ```bash
-docker exec cis-dsv4-0731 python -m inference_scaling.swe_agent.workload \
+docker exec cis-dsv4-0731 bash /workspace/deploy/dsv4_flash/container_python.sh \
+  -m inference_scaling.swe_agent.workload \
   --trace /workspace/artifacts/traces/dsv4_model_calls.jsonl \
   --output-directory /workspace/artifacts/workloads \
   --total 64 --seed 20260908
