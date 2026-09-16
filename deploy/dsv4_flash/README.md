@@ -31,7 +31,8 @@ the operator must confirm that the chosen devices are idle.
 ```bash
 cd /path/to/inference-scaling-mini-swe-agent/deploy/dsv4_flash
 cp .env.example .env
-# Set MODEL_DIR, ARTIFACT_DIR, IMAGE and DEVICES in .env.
+# Set MODEL_DIR, ARTIFACT_DIR, IMAGE and DEVICES in .env. On the current
+# internal host MODEL_DIR=/workspace/models/DeepSeek-V4-Flash-0731-w8a8.
 bash run.sh check
 # Review npu-smi; only then set CONFIRM_DEVICES_FREE=yes in .env.
 bash run.sh start
@@ -86,8 +87,8 @@ container or another Python 3.11+ environment with this package):
 ```bash
 docker exec cis-dsv4-0731 bash /workspace/deploy/dsv4_flash/container_python.sh \
   -m inference_scaling.swe_agent.workload \
-  --trace /workspace/artifacts/traces/dsv4_model_calls.jsonl \
-  --output-directory /workspace/artifacts/workloads \
+  --trace /artifacts/traces/dsv4_model_calls.jsonl \
+  --output-directory /artifacts/workloads \
   --total 64 --seed 20260908
 ```
 

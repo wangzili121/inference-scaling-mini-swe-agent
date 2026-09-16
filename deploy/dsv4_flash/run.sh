@@ -58,7 +58,7 @@ common=(--network host --privileged=true --shm-size "$SHM_SIZE"
   "${docker_devices[@]}" "${docker_mounts[@]}"
   -v "$REPO:/workspace:ro"
   -v "$MODEL_DIR:/models/dsv4:ro"
-  -v "$ARTIFACT_DIR:/workspace/artifacts"
+  -v "$ARTIFACT_DIR:/artifacts"
   -e CIS_MODEL_PATH=/models/dsv4
   -e ASCEND_RT_VISIBLE_DEVICES="$DEVICES"
   -e VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE=0

@@ -74,5 +74,5 @@ seed = 20260908
 
 [service]
 tool_parser = "deepseek_v4"
-trace_path = "artifacts/traces/dsv4_model_calls.jsonl"
+trace_path = "/artifacts/traces/dsv4_model_calls.jsonl"
 idempotency_cache_size = 256

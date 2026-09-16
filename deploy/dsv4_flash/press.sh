@@ -17,8 +17,8 @@ if [[ "$WORKLOAD" != "$ARTIFACT_DIR/"* ]]; then
   printf 'Workload must be under ARTIFACT_DIR so the container can read it.\n' >&2
   exit 2
 fi
-INSIDE_WORKLOAD="/workspace/artifacts/${WORKLOAD#"$ARTIFACT_DIR/"}"
-OUT="/workspace/artifacts/pressure/$(date -u +%Y%m%dT%H%M%SZ)-w${WORKERS}-$$.json"
+INSIDE_WORKLOAD="/artifacts/${WORKLOAD#"$ARTIFACT_DIR/"}"
+OUT="/artifacts/pressure/$(date -u +%Y%m%dT%H%M%SZ)-w${WORKERS}-$$.json"
 mkdir -p "$ARTIFACT_DIR/pressure"
 python3 - "$WORKLOAD" "${MAX_MODEL_LEN:-32768}" "${MAX_NEW_TOKENS:-512}" <<'PY'
 import json

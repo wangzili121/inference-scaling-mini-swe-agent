@@ -29,6 +29,10 @@ class DSV4BaselineTests(unittest.TestCase):
         self.assertEqual(config["models"]["base"], "/models/dsv4")
         self.assertEqual(config["vllm"]["tokenizer_mode"], "deepseek_v4")
         self.assertEqual(config["service"]["tool_parser"], "deepseek_v4")
+        self.assertEqual(
+            config["service"]["trace_path"],
+            "/artifacts/traces/dsv4_model_calls.jsonl",
+        )
         self.assertEqual(config["vllm"]["quantization"], "ascend")
         for name in (
             "native_kv_fork", "native_packed_forest_attention",
