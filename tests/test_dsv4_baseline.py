@@ -124,6 +124,32 @@ class DSV4BaselineTests(unittest.TestCase):
                     request_id="job-1", tokenizer=object(),
                 )
 
+    def test_plain_deepseek_text_falls_back_to_decoded_content(self) -> None:
+        parser_module = ModuleType("vllm.parser.deepseek_v4")
+
+        class FakeParser:
+            def __init__(self, tokenizer):
+                pass
+
+            def extract_tool_calls(self, text, request):
+                return SimpleNamespace(content=None, tool_calls=[])
+
+        parser_module.DeepSeekV4Parser = FakeParser
+        with patch.dict(
+            "sys.modules",
+            {
+                "vllm": ModuleType("vllm"),
+                "vllm.parser": ModuleType("vllm.parser"),
+                "vllm.parser.deepseek_v4": parser_module,
+            },
+        ):
+            result = parse_deepseek_v4_text(
+                "Complete Python solution.",
+                request_id="plain-1", tokenizer=object(),
+            )
+        self.assertEqual(result.content, "Complete Python solution.")
+        self.assertEqual(result.tool_calls, ())
+
 
 if __name__ == "__main__":
     unittest.main()

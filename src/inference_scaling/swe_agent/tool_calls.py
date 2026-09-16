@@ -151,6 +151,12 @@ def parse_deepseek_v4_text(
     if "<\uff5cDSML\uff5ctool_calls>" in text and not extracted.tool_calls:
         raise ToolCallParseError("DeepSeek V4 DSML tool call could not be parsed")
 
+    content = extracted.content
+    if content is None and not extracted.tool_calls:
+        # vLLM's DSML parser may omit content for an ordinary completion even
+        # though the decoded text contains a valid non-tool response.
+        content = text.strip() or None
+
     tool_calls: list[dict[str, Any]] = []
     actions: list[dict[str, str]] = []
     for index, call in enumerate(extracted.tool_calls):
@@ -169,7 +175,7 @@ def parse_deepseek_v4_text(
             }
         )
         actions.append({"command": command, "tool_call_id": call_id})
-    return ParsedAssistant(extracted.content, tuple(tool_calls), tuple(actions))
+    return ParsedAssistant(content, tuple(tool_calls), tuple(actions))
 
 
 __all__ = [
