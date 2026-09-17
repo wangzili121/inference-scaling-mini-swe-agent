@@ -43,8 +43,8 @@ docker exec "$CONTAINER_NAME" bash /workspace/deploy/dsv4_flash/container_python
   --workload "$INSIDE_WORKLOAD" \
   --endpoint "http://127.0.0.1:$PORT" \
   --workers "$WORKERS" \
-  --candidate-count "${PRESS_CANDIDATE_COUNT:-${CANDIDATE_COUNT:-4}}" \
-  --rollout-count "${PRESS_ROLLOUT_COUNT:-${ROLLOUT_COUNT:-2}}" \
+  --candidate-count "${PRESS_CANDIDATE_COUNT:-${CANDIDATE_COUNT:-8}}" \
+  --rollout-count "${PRESS_ROLLOUT_COUNT:-${ROLLOUT_COUNT:-3}}" \
   --block-size "${BLOCK_SIZE:-128}" \
   --output "$OUT"
 printf 'Raw benchmark: %s/pressure/%s\n' "$ARTIFACT_DIR" "$(basename "$OUT")"

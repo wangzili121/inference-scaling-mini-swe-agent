@@ -23,6 +23,10 @@ from inference_scaling.arllm.algorithms import (
 )
 from inference_scaling.arllm.backends import close_backend, load_backend_from_config
 from inference_scaling.arllm.config import ConditionalISConfig, SamplingConfig
+from inference_scaling.arllm.output import (
+    output_settings_from_config,
+    thinking_format_from_backend,
+)
 from inference_scaling.arllm.rewards import (
     ConsilienceReward,
     SequenceLogProbabilityReward,
@@ -145,6 +149,7 @@ class CISExecution:
     total_seconds: float
     backend_delta: dict[str, Any]
     stage_events: tuple[dict[str, Any], ...]
+    reward_diagnostics: dict[str, Any]
     conditional: dict[str, int | float | bool | None]
     started_at: float
     finished_at: float
@@ -248,6 +253,7 @@ class ConditionalISRunner:
     def __init__(self, backend: Any, config: Mapping[str, Any]) -> None:
         self.backend = backend
         self.config = dict(config)
+        self.default_seed = int(config.get("run", {}).get("seed", 20260908))
         self.tool_parser = str(config.get("service", {}).get("tool_parser", "qwen"))
         if self.tool_parser not in {"qwen", "deepseek_v4"}:
             raise ValueError(f"unsupported service.tool_parser: {self.tool_parser}")
@@ -259,6 +265,14 @@ class ConditionalISRunner:
             conditional.get("engine_fork_release_remaining_candidates", -1)
         )
         self.maximum = int(generation["max_new_tokens"])
+        self.request_maximum = int(
+            config.get("service", {}).get("max_completion_tokens", self.maximum)
+        )
+        if self.request_maximum < self.maximum:
+            raise ValueError(
+                "service.max_completion_tokens cannot be smaller than "
+                "generation.max_new_tokens"
+            )
         eos_token_id = getattr(backend.tokenizer, "eos_token_id", None)
         if bool(generation.get("ignore_eos", False)):
             eos_token_id = None
@@ -450,14 +464,31 @@ class ConditionalISRunner:
                 scale=float(reward.get("scale", 1.0)),
             )
         elif reward_kind == "consilience":
+            reward_sampling = SamplingConfig(
+                temperature=float(reward.get("score_temperature", 1.0))
+            )
+            scope = str(reward.get("scope", "thinking"))
             self.reward = ConsilienceReward(
                 backend,
-                self.sampling,
+                reward_sampling,
                 top_k=int(reward.get("top_k", 5)),
                 window_fraction=float(reward.get("window_fraction", 0.2)),
+                window_tokens=(
+                    None
+                    if reward.get("window_tokens") is None
+                    else int(reward["window_tokens"])
+                ),
                 skip_fraction=float(reward.get("skip_fraction", 0.05)),
                 initial_penalty=float(reward.get("initial_penalty", 3.0)),
                 scale=float(reward.get("scale", 1.0)),
+                thinking_format=(
+                    thinking_format_from_backend(
+                        backend, output_settings_from_config(config)
+                    )
+                    if scope == "thinking"
+                    else None
+                ),
+                scope=scope,
             )
         else:
             raise ValueError(f"unsupported agent reward {reward_kind!r}")
@@ -586,6 +617,9 @@ class ConditionalISRunner:
             "steps": len(result.steps),
             **execution.conditional,
             "candidate_ess": candidate_ess,
+            "reward": self.reward.describe(),
+            "reward_execution": execution.reward_diagnostics,
+            "reward_execution_scope": "process_window_not_concurrency_safe",
             "instance_id": self.instance_id,
             "stage_seconds": dict(stage_seconds),
             "backend_delta": execution.backend_delta,
@@ -729,20 +763,14 @@ class ConditionalISRunner:
                 }
             )
 
-        prompt = self._prompt_tokens(messages)
-        configured_max = self.config.get("vllm", {}).get("max_model_len")
-        if configured_max is not None and len(prompt) + self.maximum > int(
-            configured_max
-        ):
-            raise ValueError(
-                f"prompt ({len(prompt)}) plus generation ({self.maximum}) exceeds "
-                f"max_model_len={configured_max}"
-            )
-        before = _snapshot(self.backend)
-        algorithm_started = time.perf_counter()
         conditional = self.conditional
         if conditional_overrides:
-            allowed = {"candidate_count", "rollout_count", "block_size"}
+            allowed = {
+                "candidate_count",
+                "rollout_count",
+                "block_size",
+                "total_length",
+            }
             unknown = sorted(set(conditional_overrides) - allowed)
             if unknown:
                 raise ValueError(
@@ -752,6 +780,24 @@ class ConditionalISRunner:
                 conditional,
                 **{key: int(value) for key, value in conditional_overrides.items()},
             )
+        if conditional.total_length <= 0 or conditional.total_length > self.request_maximum:
+            raise ValueError(
+                f"requested generation length {conditional.total_length} must lie in "
+                f"[1, {self.request_maximum}]"
+            )
+        prompt = self._prompt_tokens(messages)
+        configured_max = self.config.get("vllm", {}).get("max_model_len")
+        if configured_max is not None and len(prompt) + conditional.total_length > int(
+            configured_max
+        ):
+            raise ValueError(
+                f"prompt ({len(prompt)}) plus generation "
+                f"({conditional.total_length}) exceeds max_model_len={configured_max}"
+            )
+        before = _snapshot(self.backend)
+        reward_scope = getattr(self.reward, "scope_statistics", None)
+        reward_before = reward_scope() if callable(reward_scope) else {}
+        algorithm_started = time.perf_counter()
         result = run_conditional_is(
             self.backend,
             prompt,
@@ -768,6 +814,31 @@ class ConditionalISRunner:
         )
         algorithm_seconds = time.perf_counter() - algorithm_started
         after = _snapshot(self.backend)
+        reward_after = reward_scope() if callable(reward_scope) else {}
+        reward_diagnostics: dict[str, Any] = {}
+        for key in ("evaluated_sequences", "thinking_sequences", "full_sequences"):
+            if key in reward_after:
+                reward_diagnostics[key] = int(reward_after[key]) - int(
+                    reward_before.get(key, 0)
+                )
+        before_fallback = reward_before.get("fallback_reasons", {})
+        after_fallback = reward_after.get("fallback_reasons", {})
+        if isinstance(after_fallback, Mapping):
+            reward_diagnostics["fallback_reasons"] = {
+                key: int(value)
+                - int(
+                    before_fallback.get(key, 0)
+                    if isinstance(before_fallback, Mapping)
+                    else 0
+                )
+                for key, value in after_fallback.items()
+                if int(value)
+                - int(
+                    before_fallback.get(key, 0)
+                    if isinstance(before_fallback, Mapping)
+                    else 0
+                )
+            }
         finished_at = time.time()
         return CISExecution(
             prompt=prompt,
@@ -776,6 +847,7 @@ class ConditionalISRunner:
             total_seconds=time.perf_counter() - started,
             backend_delta=_counter_delta(before, after),
             stage_events=tuple(stage_events),
+            reward_diagnostics=reward_diagnostics,
             conditional={
                 "candidate_count": conditional.candidate_count,
                 "rollout_count": conditional.rollout_count,

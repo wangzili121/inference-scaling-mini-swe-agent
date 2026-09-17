@@ -23,6 +23,12 @@ CONTAINER_NAME="${CONTAINER_NAME:-cis-dsv4-0731}"
 SHM_SIZE="${SHM_SIZE:-512g}"
 TP="${TP:-8}"
 DP="${DP:-1}"
+if [[ "${ALLOW_NONSTANDARD_ALGORITHM:-no}" != yes ]]; then
+  if [[ "${CANDIDATE_COUNT:-8}" != 8 || "${ROLLOUT_COUNT:-3}" != 3 || "${REWARD_KIND:-consilience}" != consilience ]]; then
+    printf 'This baseline requires C8/R3 + Consilience. Update .env or set ALLOW_NONSTANDARD_ALGORITHM=yes for an explicit control run.\n' >&2
+    exit 2
+  fi
+fi
 MODEL_DIR="$(cd "$MODEL_DIR" && pwd)"
 ARTIFACT_DIR="$(mkdir -p "$ARTIFACT_DIR" && cd "$ARTIFACT_DIR" && pwd)"
 
@@ -65,6 +71,8 @@ common=(--network host --privileged=true --shm-size "$SHM_SIZE"
   -e OMP_PROC_BIND=false
   -e OMP_NUM_THREADS=10
   -e PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+  -e VLLM_PREFIX_CACHE_RETENTION_INTERVAL="${PREFIX_CACHE_RETENTION_INTERVAL:-4096}"
+  -e CIS_ENABLE_JEMALLOC="${ENABLE_JEMALLOC:-true}"
   -e HCCL_BUFFSIZE=1024
   -e TASK_QUEUE_ENABLE=1
   -e HCCL_OP_EXPANSION_MODE=AIV)
@@ -108,14 +116,17 @@ start() {
     --set "vllm.gpu_memory_utilization=${GPU_MEMORY_UTILIZATION:-0.90}"
     --set "vllm.enable_prefix_caching=${ENABLE_PREFIX_CACHING:-true}"
     --set "vllm.enforce_eager=${ENFORCE_EAGER:-false}"
-    --set "conditional_is.candidate_count=${CANDIDATE_COUNT:-4}"
-    --set "conditional_is.rollout_count=${ROLLOUT_COUNT:-2}"
+    --set "conditional_is.candidate_count=${CANDIDATE_COUNT:-8}"
+    --set "conditional_is.rollout_count=${ROLLOUT_COUNT:-3}"
     --set "conditional_is.block_size=${BLOCK_SIZE:-128}"
+    --set "conditional_is.reward_temperature=${REWARD_TEMPERATURE:-2.0}"
+    --set "reward.kind=\"${REWARD_KIND:-consilience}\""
     --set "generation.max_new_tokens=${MAX_NEW_TOKENS:-512}"
+    --set "service.max_completion_tokens=${MAX_COMPLETION_TOKENS:-2048}"
   )
   if [[ "${ENFORCE_EAGER:-false}" == true ]]; then
     overrides+=(--set 'vllm.engine_kwargs.compilation_config={"cudagraph_mode":"NONE"}')
-    overrides+=(--set 'vllm.engine_kwargs.additional_config={"enable_cpu_binding":true,"ascend_compilation_config":{"enable_npugraph_ex":false}}')
+    overrides+=(--set 'vllm.engine_kwargs.additional_config={"enable_cpu_binding":true,"enable_dsa_cp":true,"enable_flashcomm1":true,"multistream_overlap_shared_expert":true,"ascend_compilation_config":{"enable_npugraph_ex":false,"enable_static_kernel":false}}')
   fi
   printf '%s\n' "${overrides[@]}" > "$ARTIFACT_DIR/launch-overrides.txt"
   if ! git -C "$REPO" rev-parse HEAD > "$ARTIFACT_DIR/repo-commit.txt" 2>/dev/null; then
@@ -158,9 +169,22 @@ start() {
   exit 1
 }
 
+verify() {
+  local probe_host="$HOST"
+  [[ "$probe_host" == 0.0.0.0 ]] && probe_host=127.0.0.1
+  python3 "$HERE/openai_smoke.py" \
+    --endpoint "http://$probe_host:$PORT" \
+    --max-tokens "${SMOKE_MAX_TOKENS:-256}"
+}
+
 case "${1:-}" in
   check) check ;;
   start) start ;;
+  launch)
+    start
+    verify
+    ;;
+  verify) verify ;;
   status)
     docker ps --filter "name=^/${CONTAINER_NAME}$"
     docker logs --tail 80 "$CONTAINER_NAME"
@@ -169,5 +193,5 @@ case "${1:-}" in
     docker stop "$CONTAINER_NAME"
     docker rm "$CONTAINER_NAME"
     ;;
-  *) printf 'Usage: %s {check|start|status|stop}\n' "$0" >&2; exit 2 ;;
+  *) printf 'Usage: %s {check|start|launch|verify|status|stop}\n' "$0" >&2; exit 2 ;;
 esac

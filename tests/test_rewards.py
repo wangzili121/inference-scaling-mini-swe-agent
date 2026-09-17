@@ -115,6 +115,7 @@ def test_consilience_reward_uses_initial_and_final_confidence_windows() -> None:
         skip_fraction=0.2,
         initial_penalty=1.0,
         scale=2.0,
+        scope="full",
     )
 
     # Skip the first token, average (8, 4), and compare with final (2, 1).
@@ -133,6 +134,7 @@ def test_consilience_reward_reuses_generation_confidence_trajectory() -> None:
         window_fraction=0.5,
         skip_fraction=0.0,
         initial_penalty=1.0,
+        scope="full",
     )
     statistics = GeneratedSequenceStatistics(
         token_ids=(1, 2, 3, 4),
@@ -161,6 +163,7 @@ def test_consilience_reward_is_batch_order_invariant_and_pointwise() -> None:
         window_fraction=0.5,
         skip_fraction=0.0,
         initial_penalty=1.0,
+        scope="full",
     )
 
     forward = reward.batch((), (first, second))
@@ -186,6 +189,33 @@ def test_consilience_reward_can_isolate_reasoning_before_a_token_marker() -> Non
 
     assert reward((), full) == pytest.approx(-3.0)
     assert backend.requests[0].continuations == (reasoning,)
+
+
+def test_consilience_thinking_scope_falls_back_and_reports_scope() -> None:
+    from inference_scaling.shared.output import ThinkingFormat
+
+    full = (5, 6)
+    thinking = (1, 2)
+    backend = _ConsilienceBackend(
+        {full: (1.0, 3.0), thinking: (4.0, 1.0)}
+    )
+    reward = ConsilienceReward(
+        backend,
+        window_tokens=1,
+        skip_fraction=0.0,
+        initial_penalty=1.0,
+        thinking_format=ThinkingFormat((91,), (90,)),
+    )
+
+    assert reward.batch((), (full, (90, 1, 2, 91, 9))) == pytest.approx(
+        (2.0, -3.0)
+    )
+    assert reward.scope_statistics() == {
+        "evaluated_sequences": 2,
+        "thinking_sequences": 1,
+        "full_sequences": 1,
+        "fallback_reasons": {"absent": 1},
+    }
 
 
 @pytest.mark.parametrize(

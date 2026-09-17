@@ -1,5 +1,6 @@
 [source]
 inference_scaling_sha = "04492fe1e227e7171f9f20c971240c2d5ac3c535"
+upstream_reviewed_sha = "1c3f65d38a7f9176ce9d9897f43515ed52654ce2"
 runtime = "vllm-ascend-v0.26.0rc"
 model = "Eco-Tech/DeepSeek-V4-Flash-0731-w8a8"
 
@@ -15,10 +16,10 @@ temperature = 1.0
 top_p = 1.0
 
 [conditional_is]
-candidate_count = 4
-rollout_count = 2
+candidate_count = 8
+rollout_count = 3
 block_size = 128
-reward_temperature = 1.0
+reward_temperature = 2.0
 active_step_limit = 0
 active_step_admission = "fixed"
 fused_candidate_rollout_paths = false
@@ -26,8 +27,17 @@ engine_fork_candidate_rollouts = false
 stream_candidate_rollouts = false
 
 [reward]
-kind = "sequence_log_probability"
+kind = "consilience"
+scope = "thinking"
+score_temperature = 1.0
+top_k = 5
+window_fraction = 0.2
+skip_fraction = 0.05
+initial_penalty = 3.0
 scale = 1.0
+
+[output]
+thinking_mode = "auto"
 
 [runtime]
 backend = "vllm"
@@ -67,7 +77,7 @@ disable_hybrid_kv_cache_manager = false
 block_size = 128
 model_loader_extra_config = { enable_multithread_load = true, num_threads = 128 }
 compilation_config = { cudagraph_mode = "FULL_DECODE_ONLY" }
-additional_config = { enable_cpu_binding = true, ascend_compilation_config = { enable_npugraph_ex = true, enable_static_kernel = false } }
+additional_config = { enable_cpu_binding = true, enable_dsa_cp = true, enable_flashcomm1 = true, multistream_overlap_shared_expert = true, ascend_compilation_config = { enable_npugraph_ex = true, enable_static_kernel = false } }
 
 [run]
 seed = 20260908
@@ -76,3 +86,4 @@ seed = 20260908
 tool_parser = "deepseek_v4"
 trace_path = "/artifacts/traces/dsv4_model_calls.jsonl"
 idempotency_cache_size = 256
+max_completion_tokens = 2048

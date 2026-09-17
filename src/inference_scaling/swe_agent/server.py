@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
 import json
 import os
 import signal
 import threading
+import time
 import traceback
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -56,6 +59,21 @@ def _handler(runner: ConditionalISRunner) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(encoded)
 
+        def _event_stream(self, payloads: list[dict[str, Any]]) -> None:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for payload in payloads:
+                self.wfile.write(
+                    b"data: "
+                    + json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                    + b"\n\n"
+                )
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+
         def do_GET(self) -> None:
             if self.path == "/healthz":
                 self._json(HTTPStatus.OK, {"status": "ok"})
@@ -65,6 +83,21 @@ def _handler(runner: ConditionalISRunner) -> type[BaseHTTPRequestHandler]:
                     {
                         "instance_id": runner.instance_id,
                         "backend": runner.backend_snapshot(),
+                    },
+                )
+            elif self.path == "/v1/models":
+                self._json(
+                    HTTPStatus.OK,
+                    {
+                        "object": "list",
+                        "data": [
+                            {
+                                "id": "dsv4-cis",
+                                "object": "model",
+                                "created": 0,
+                                "owned_by": "inference-scaling",
+                            }
+                        ],
                     },
                 )
             else:
@@ -93,20 +126,62 @@ def _handler(runner: ConditionalISRunner) -> type[BaseHTTPRequestHandler]:
                     return
                 self._json(HTTPStatus.OK, {"status": status})
                 return
-            if self.path != "/v1/query":
+            if self.path not in {"/v1/query", "/v1/chat/completions"}:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 messages = payload["messages"]
-                request_id = str(payload["request_id"])
-                seed = int(payload["seed"])
+                openai_request = self.path == "/v1/chat/completions"
+                if openai_request:
+                    request_id = str(
+                        payload.get("request_id")
+                        or self.headers.get("X-Request-Id")
+                        or f"chatcmpl-{uuid.uuid4().hex}"
+                    )
+                    configured_seed = int(runner.default_seed)
+                    seed_material = json.dumps(
+                        {
+                            "messages": messages,
+                            "max_tokens": payload.get(
+                                "max_completion_tokens", payload.get("max_tokens")
+                            ),
+                            "model": payload.get("model", "dsv4-cis"),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    default_seed = int.from_bytes(
+                        hashlib.sha256(seed_material.encode("utf-8")).digest()[:8],
+                        "big",
+                    ) ^ configured_seed
+                    seed = int(payload.get("seed", default_seed))
+                    if int(payload.get("n", 1)) != 1:
+                        raise ValueError("Conditional IS supports only n=1")
+                    for name, configured in (
+                        ("temperature", runner.sampling.temperature),
+                        ("top_p", runner.sampling.top_p),
+                    ):
+                        if name in payload and payload[name] is not None:
+                            if abs(float(payload[name]) - float(configured)) > 1e-9:
+                                raise ValueError(
+                                    f"{name} is fixed by the CIS service at {configured}"
+                                )
+                else:
+                    request_id = str(payload["request_id"])
+                    seed = int(payload["seed"])
                 conditional_overrides = payload.get("conditional_is")
                 if conditional_overrides is not None and not isinstance(
                     conditional_overrides, dict
                 ):
                     raise TypeError("conditional_is must be an object")
+                if openai_request:
+                    maximum = payload.get("max_completion_tokens", payload.get("max_tokens"))
+                    if maximum is not None:
+                        conditional_overrides = dict(conditional_overrides or {})
+                        conditional_overrides["total_length"] = int(maximum)
                 result = runner.query(
                     messages,
                     request_id=request_id,
@@ -123,9 +198,85 @@ def _handler(runner: ConditionalISRunner) -> type[BaseHTTPRequestHandler]:
                     {"error": f"{type(error).__name__}: {error}"},
                 )
                 return
+            if self.path == "/v1/query":
+                self._json(
+                    HTTPStatus.OK,
+                    {"message": result.message, "diagnostics": result.diagnostics},
+                )
+                return
+            created = int(time.time())
+            completion_id = request_id if request_id.startswith("chatcmpl-") else f"chatcmpl-{request_id}"
+            raw = result.message.get("extra", {}).get("raw_completion")
+            content = result.message.get("content")
+            if content is None and isinstance(raw, str):
+                content = raw
+            finish_reason = result.diagnostics.get("finish_reason", "stop")
+            if finish_reason == "eos":
+                finish_reason = "stop"
+            usage = {
+                "prompt_tokens": int(result.diagnostics["prompt_tokens"]),
+                "completion_tokens": int(result.diagnostics["completion_tokens"]),
+                "total_tokens": int(result.diagnostics["prompt_tokens"])
+                + int(result.diagnostics["completion_tokens"]),
+            }
+            if bool(payload.get("stream", False)):
+                base = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": str(payload.get("model", "dsv4-cis")),
+                }
+                self._event_stream(
+                    [
+                        {
+                            **base,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "role": "assistant",
+                                        "content": content or "",
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        },
+                        {
+                            **base,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": finish_reason,
+                                }
+                            ],
+                            "usage": usage,
+                            "conditional_is": result.diagnostics,
+                        },
+                    ]
+                )
+                return
             self._json(
                 HTTPStatus.OK,
-                {"message": result.message, "diagnostics": result.diagnostics},
+                {
+                    "id": completion_id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": str(payload.get("model", "dsv4-cis")),
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": content,
+                                "tool_calls": result.message.get("tool_calls", []),
+                            },
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                    "usage": usage,
+                    "conditional_is": result.diagnostics,
+                },
             )
 
         def log_message(self, format: str, *args: Any) -> None:

@@ -7,5 +7,13 @@ if [[ ! -r "$CANN_ENV" ]]; then
   exit 1
 fi
 source "$CANN_ENV"
+if [[ "${CIS_ENABLE_JEMALLOC:-true}" == true ]]; then
+  JEMALLOC=/usr/lib/aarch64-linux-gnu/libjemalloc.so.2
+  if [[ -r "$JEMALLOC" ]]; then
+    export LD_PRELOAD="$JEMALLOC${LD_PRELOAD:+:$LD_PRELOAD}"
+  else
+    printf 'Warning: jemalloc requested but missing at %s; continuing.\n' "$JEMALLOC" >&2
+  fi
+fi
 export PYTHONPATH="/workspace/src${PYTHONPATH:+:$PYTHONPATH}"
 exec python "$@"

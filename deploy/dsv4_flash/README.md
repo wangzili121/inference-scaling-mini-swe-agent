@@ -2,25 +2,45 @@
 
 This package is an **offline, single-node baseline** for the internal host. It
 does not enable the CIS tree scheduler, native KV fork, Forest Attention, DSpark,
-MTP, or a Qwen-specific sampler patch. Do not interpret its default scheduler
-numbers as tuned for DeepSeek-V4-Flash.
+MTP, or a Qwen-specific sampler patch. The source remains based on the imported
+`04492fe` snapshot plus local infrastructure work; the reward behavior was
+reviewed against Chang's `origin/main@1c3f65d` and ports its thinking-scope
+Consilience fallback semantics without replacing the working DSV4 compatibility
+layer wholesale.
+Upstream `conditional_is.py` itself has no diff between those two SHAs; the
+relevant mainline change is reward/output handling plus general model loading.
 
 ## What is included
 
-- One persistent AsyncLLM engine, ordinary Conditional IS inside each `/v1/query`.
+- One persistent AsyncLLM engine, ordinary `C8/R3/B128` Conditional IS inside
+  each `/v1/query` or OpenAI-compatible `/v1/chat/completions` request.
 - Ascend W8A8 quantization, DeepSeek V4 tokenizer and the vLLM DSML parser.
 - Expert parallelism, hybrid KV cache manager, chunked prefill, APC, full-decode
-  NPU Graph and generation-time reward statistics. `ENFORCE_EAGER=true` disables
-  graph for an initial debugging A/B. `ENABLE_PREFIX_CACHING=false` provides an
-  APC-off control if the first model load fails.
+  NPU Graph, DSA context parallelism, FlashComm1, shared-expert multistream
+  overlap, CPU binding, optional jemalloc and generation-time reward statistics.
+- Consilience defaults to top-5, 20% windows, 5% initial skip, initial penalty 3,
+  score temperature 1 and reward temperature 2. Complete recognized thinking is
+  scored; absent, malformed or truncated thinking falls back to the full output
+  and is counted in `diagnostics.reward_execution`.
 - Fixed-workload burst benchmark with raw per-query timing and diagnostics.
+- Standard OpenAI model discovery/chat endpoints so the image's unmodified
+  `vllm bench serve` can generate capacity, Poisson and bursty traffic.
 
 The upstream [v0.26.0rc1 0731 deployment guide](https://docs.vllm.ai/projects/ascend/en/v0.26.0rc1/tutorials/models/DeepSeek-V4-Flash.html)
 uses `--quantization ascend`, `--tokenizer-mode deepseek_v4`, expert parallelism
 and a DeepSeek-specific parser. It recommends multiple deployment topologies;
-our first package uses eight visible NPUs as `TP8/DP1`. `max_model_len=32768`,
-`MNS=32` and `MBT=8192` are conservative startup values for coding calls, **not**
-the guide's 1M-context throughput configuration or a verified CIS optimum.
+our first package uses eight visible NPUs as `TP8/DP1`. `MNS=32`, `MBT=8192`,
+memory utilization `0.90` and block size `128` follow the official eight-card
+starting point. `max_model_len=32768` remains the already validated A2 startup
+cap: this specific run reported only 44,688 KV tokens of runtime capacity, so
+blindly changing it to 133,120 would likely make startup fail. Raise the cap only
+after the service reports enough KV capacity; benchmark prompt length is a
+separate workload property.
+
+The official example disables APC for its generic path. CIS has repeated
+candidate/rollout prefixes, so this package enables APC and initially retains
+the official `VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096`. This is a
+hypothesis to verify with APC-on/off counters, not an assumed result.
 
 ## Internal-host sequence
 
@@ -35,9 +55,11 @@ cp .env.example .env
 # internal host MODEL_DIR=/workspace/models/DeepSeek-V4-Flash-0731-w8a8.
 bash run.sh check
 # Review npu-smi; only then set CONFIRM_DEVICES_FREE=yes in .env.
-bash run.sh start
+# launch performs start + a 256-token OpenAI/CIS smoke in one command. This is
+# long enough to exercise candidate -> rollout -> reward -> resample.
+bash run.sh launch
 bash run.sh status
-python3 smoke.py --endpoint http://127.0.0.1:8123
+python3 smoke.py --endpoint http://127.0.0.1:8123  # optional tool-call smoke
 ```
 
 `check` verifies local image availability, selected device nodes, the container's
@@ -53,6 +75,10 @@ failed container for log inspection. On startup failure it saves the full
 timestamped log to `ARTIFACT_DIR/container-startup.full.log`; `status` shows
 the last 80 log lines.
 The service `/healthz` becomes available only after AsyncLLM/model construction.
+`/v1/models` and `/v1/chat/completions` are compatibility endpoints. Sampling
+temperature and top-p remain fixed by the CIS service; incompatible client
+values are rejected instead of silently changing the algorithm. `max_tokens`
+may vary per request up to `MAX_COMPLETION_TOKENS`.
 
 The first smoke asks for `bash echo cis-ready`. A completed response without an
 action is a **pipeline diagnostic**, not an accuracy verdict. Inspect raw text in
@@ -107,8 +133,8 @@ bash press.sh 16 "$ARTIFACT_DIR/workloads/tune-32.jsonl"
 bash press.sh 32 "$ARTIFACT_DIR/workloads/tune-32.jsonl"
 ```
 
-For the heavier representative algorithm, keep the workload unchanged and set
-`PRESS_CANDIDATE_COUNT=15 PRESS_ROLLOUT_COUNT=3` before `press.sh`. The benchmark
+For another representative algorithm, keep the workload unchanged and set
+`PRESS_CANDIDATE_COUNT`/`PRESS_ROLLOUT_COUNT` before `press.sh`. The benchmark
 writes complete JSON under `ARTIFACT_DIR/pressure/`; it reports jobs/s and Job
 latency distribution, and retains each query's diagnostics. Use `run.sh stop` only
 for this named container when a restart is needed.
@@ -127,3 +153,43 @@ or plugin. Compare with exactly the same image, model snapshot, TP/DP, workload,
 seed, reward, C/R/B/L and non-tree engine options. Keep the same local model
 snapshot; the metadata hash alone does not prove identical weight contents.
 Save both raw benchmark files and traces; only then attribute any gain to the tree.
+
+## Standard vLLM Bench workloads
+
+`vllm bench` custom input is JSONL. Each row contains a distinct coding prompt;
+`output_tokens` is optional because the wrapper also accepts
+`BENCH_OUTPUT_LEN`:
+
+```json
+{"prompt":"Review this Python implementation for a concurrency bug: ...","output_tokens":512}
+{"prompt":"Implement the missing method in this repository excerpt: ...","output_tokens":1024}
+```
+
+Place the file below `ARTIFACT_DIR`, then find the capacity curve:
+
+```bash
+cd deploy/dsv4_flash
+bash benchmark_suite.sh "$ARTIFACT_DIR/vllm-bench/coding-prompts.jsonl"
+```
+
+This runs top-level CIS concurrency `2/4/8/16` with `request-rate=inf`. After the
+saturation jobs/s is known, run steady Poisson and bursty traffic at roughly
+50%, 70% and 85% of it:
+
+```bash
+bash vllm_bench.sh steady "$ARTIFACT_DIR/vllm-bench/coding-prompts.jsonl" 16 RATE
+BENCH_BURSTINESS=0.3 \
+  bash vllm_bench.sh bursty "$ARTIFACT_DIR/vllm-bench/coding-prompts.jsonl" 16 RATE
+```
+
+The wrapper intentionally uses non-streaming E2E latency. Conditional IS cannot
+emit the finally selected answer until candidate/rollout/reward/resample has
+finished, so ordinary token-stream TTFT/TPOT would be misleading. The vLLM result
+provides top-level jobs/s and E2E percentiles; service traces provide internal
+candidate, rollout, reward, KV, preemption and forward-token-slot metrics.
+
+Use standard vLLM Bench for public/synthetic prompts. Use `press.sh` for frozen
+MiniAgent calls because those must preserve the complete message/tool history.
+The production-oriented matrix should include 4-16K interactive prompts,
+16-64K agent turns and 64-128K repository-level calls when the validated context
+cap permits them, with both repeated-prefix and cold-prefix traffic.

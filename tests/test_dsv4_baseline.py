@@ -34,6 +34,22 @@ class DSV4BaselineTests(unittest.TestCase):
             "/artifacts/traces/dsv4_model_calls.jsonl",
         )
         self.assertEqual(config["vllm"]["quantization"], "ascend")
+        self.assertEqual(config["conditional_is"]["candidate_count"], 8)
+        self.assertEqual(config["conditional_is"]["rollout_count"], 3)
+        self.assertEqual(config["reward"]["kind"], "consilience")
+        self.assertEqual(config["reward"]["scope"], "thinking")
+        self.assertEqual(config["conditional_is"]["reward_temperature"], 2.0)
+        self.assertTrue(
+            config["vllm"]["engine_kwargs"]["additional_config"]["enable_dsa_cp"]
+        )
+        self.assertTrue(
+            config["vllm"]["engine_kwargs"]["additional_config"]["enable_flashcomm1"]
+        )
+        self.assertTrue(
+            config["vllm"]["engine_kwargs"]["additional_config"][
+                "multistream_overlap_shared_expert"
+            ]
+        )
         for name in (
             "native_kv_fork", "native_packed_forest_attention",
             "native_parallel_sampling", "native_kv_branch_eviction",
