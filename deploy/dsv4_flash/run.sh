@@ -72,7 +72,7 @@ common=(--network host --privileged=true --shm-size "$SHM_SIZE"
   -v "$ARTIFACT_DIR:/artifacts"
   -e CIS_MODEL_PATH=/models/dsv4
   -e ASCEND_RT_VISIBLE_DEVICES="$DEVICES"
-  -e VLLM_ASCEND_ENABLE_CATEGORICAL_SAMPLE=0
+  -e VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
   -e OMP_PROC_BIND=false
   -e OMP_NUM_THREADS=10
   -e PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
@@ -93,6 +93,15 @@ check() {
     /workspace/deploy/dsv4_flash/container_python.sh \
     -m inference_scaling.swe_agent.dsv4_preflight \
     --model-dir /models/dsv4 --runtime | tee "$ARTIFACT_DIR/runtime-preflight.json"
+  docker run --rm "${common[@]}" --entrypoint bash "$IMAGE" \
+    /workspace/deploy/dsv4_flash/container_python.sh \
+    -m inference_scaling.swe_agent.ascend_device_probe \
+    | tee "$ARTIFACT_DIR/npu-device-probe.json"
+  docker run --rm "${common[@]}" --entrypoint bash "$IMAGE" \
+    -lc 'exec /workspace/deploy/dsv4_flash/container_python.sh \
+      -m torch.distributed.run --standalone --nproc-per-node="$1" \
+      -m inference_scaling.swe_agent.ascend_device_probe --distributed' \
+    bash "$((TP * DP))" | tee "$ARTIFACT_DIR/hccl-probe.log"
   printf 'Inspect NPU occupancy above before setting CONFIRM_DEVICES_FREE=yes.\n'
 }
 

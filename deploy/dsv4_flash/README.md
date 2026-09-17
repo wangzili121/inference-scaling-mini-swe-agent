@@ -105,13 +105,20 @@ python3 smoke.py --endpoint http://127.0.0.1:8123  # optional tool-call smoke
 ```
 
 `check` verifies local image availability, selected device nodes, the container's
-AscendCL Python module (`acl.rt`), complete model
-shard index, vLLM engine arguments, DeepSeek V4 prompt encoding and DSML bash
-parsing **before model loading**. The local image ID and preflight JSON are written
-under `ARTIFACT_DIR`. This is a metadata hash plus shard-existence/size check,
-not a full SHA256 of every large weight file. If the runtime lacks an expected
-API, stop there and send the
-preflight error; don't silently switch the internal image or apply the v0.18 patch.
+AscendCL Python module (`acl.rt`), complete model shard index, vLLM engine
+arguments, DeepSeek V4 prompt encoding and DSML bash parsing **before model
+loading**. It then performs a real single-NPU tensor round trip and a TP-sized
+HCCL all-reduce. The local image ID and preflight output are written under
+`ARTIFACT_DIR`, including `npu-device-probe.json` and `hccl-probe.log`. This is a
+metadata hash plus shard-existence/size check, not a full SHA256 of every large
+weight file. If either device probe fails, the problem is below Conditional IS
+and model loading; stop there and send the small probe log. Do not silently
+switch the internal image or apply the v0.18 patch.
+The Python-library service explicitly uses
+`VLLM_WORKER_MULTIPROC_METHOD=spawn`: unlike `vllm serve`, it constructs
+`AsyncLLM` from a long-lived service process, so the vLLM library default of
+forking accelerator workers is unsafe. Override this only for a controlled
+diagnostic.
 `start` launches a container, waits up to 30 minutes for `/healthz`, and keeps a
 failed container for log inspection. On startup failure it saves the full
 timestamped log to `ARTIFACT_DIR/container-startup.full.log`; `status` shows
