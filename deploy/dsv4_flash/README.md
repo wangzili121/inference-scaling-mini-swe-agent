@@ -119,6 +119,11 @@ The Python-library service explicitly uses
 `AsyncLLM` from a long-lived service process, so the vLLM library default of
 forking accelerator workers is unsafe. Override this only for a controlled
 diagnostic.
+Jemalloc preloading is disabled by default for this embedded service. On some
+Ascend stacks any `LD_PRELOAD` makes FunctionLoader prefer `RTLD_DEFAULT`, which
+can make `aclInit` resolve an incompatible runtime symbol and fail before the
+SoC version is detected. Treat jemalloc as a later performance A/B only after
+the NPU and HCCL probes pass.
 `start` launches a container, waits up to 30 minutes for `/healthz`, and keeps a
 failed container for log inspection. On startup failure it saves the full
 timestamped log to `ARTIFACT_DIR/container-startup.full.log`; `status` shows
