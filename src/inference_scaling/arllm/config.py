@@ -182,6 +182,7 @@ class ConditionalISConfig:
         if self.active_step_admission not in {
             "fixed",
             "peak_token_budget",
+            "pressure_plugin",
             "runtime_kv_budget",
         }:
             raise ValueError("unknown active_step_admission")
@@ -198,7 +199,8 @@ class ConditionalISConfig:
             require_positive("active_step_max_limit", self.active_step_max_limit)
             if (
                 self.active_step_limit is None
-                and self.active_step_admission != "runtime_kv_budget"
+                and self.active_step_admission
+                not in {"pressure_plugin", "runtime_kv_budget"}
             ):
                 raise ValueError("active_step_max_limit requires active_step_limit")
             if (
@@ -209,10 +211,13 @@ class ConditionalISConfig:
                     "active_step_max_limit must not be below active_step_limit"
                 )
         if (
-            self.active_step_admission == "runtime_kv_budget"
+            self.active_step_admission in {"pressure_plugin", "runtime_kv_budget"}
             and self.active_step_max_limit is None
         ):
-            raise ValueError("runtime KV admission requires active_step_max_limit")
+            raise ValueError(
+                "runtime KV or pressure-plugin admission requires "
+                "active_step_max_limit"
+            )
         require_positive(
             "active_step_reference_window", self.active_step_reference_window
         )

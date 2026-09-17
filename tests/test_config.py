@@ -38,6 +38,7 @@ def test_policy_id_preserves_distinct_float_values() -> None:
         lambda: ConditionalISConfig(active_step_admission="unknown"),
         lambda: ConditionalISConfig(active_step_admission="peak_token_budget"),
         lambda: ConditionalISConfig(active_step_admission="runtime_kv_budget"),
+        lambda: ConditionalISConfig(active_step_admission="pressure_plugin"),
         lambda: ConditionalISConfig(active_step_limit=4, active_step_max_limit=3),
         lambda: ConditionalISConfig(active_step_token_budget=0),
         lambda: ConditionalISConfig(active_step_kv_capacity_fraction=0),

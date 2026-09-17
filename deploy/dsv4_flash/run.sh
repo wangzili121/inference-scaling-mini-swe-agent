@@ -23,6 +23,11 @@ CONTAINER_NAME="${CONTAINER_NAME:-cis-dsv4-0731}"
 SHM_SIZE="${SHM_SIZE:-512g}"
 TP="${TP:-8}"
 DP="${DP:-1}"
+SCHEDULER_VARIANT="${SCHEDULER_VARIANT:-baseline}"
+if [[ "$SCHEDULER_VARIANT" != baseline && "$SCHEDULER_VARIANT" != pressure_tree ]]; then
+  printf 'SCHEDULER_VARIANT must be baseline or pressure_tree\n' >&2
+  exit 2
+fi
 if [[ "${ALLOW_NONSTANDARD_ALGORITHM:-no}" != yes ]]; then
   if [[ "${CANDIDATE_COUNT:-8}" != 8 || "${ROLLOUT_COUNT:-3}" != 3 || "${REWARD_KIND:-consilience}" != consilience ]]; then
     printf 'This baseline requires C8/R3 + Consilience. Update .env or set ALLOW_NONSTANDARD_ALGORITHM=yes for an explicit control run.\n' >&2
@@ -124,6 +129,16 @@ start() {
     --set "generation.max_new_tokens=${MAX_NEW_TOKENS:-512}"
     --set "service.max_completion_tokens=${MAX_COMPLETION_TOKENS:-2048}"
   )
+  if [[ "$SCHEDULER_VARIANT" == pressure_tree ]]; then
+    overrides+=(--set 'conditional_is.active_step_admission="pressure_plugin"')
+    overrides+=(--set "conditional_is.active_step_max_limit=${ACTIVE_STEP_MAX_LIMIT:-${MAX_NUM_SEQS:-32}}")
+    overrides+=(--set "conditional_is.active_step_kv_capacity_fraction=${ACTIVE_STEP_KV_FRACTION:-0.80}")
+    overrides+=(--set 'vllm.request_priority_policy="job_fifo"')
+  else
+    overrides+=(--set 'conditional_is.active_step_admission="fixed"')
+    overrides+=(--set 'conditional_is.active_step_limit=0')
+    overrides+=(--set 'vllm.request_priority_policy="none"')
+  fi
   if [[ "${ENFORCE_EAGER:-false}" == true ]]; then
     overrides+=(--set 'vllm.engine_kwargs.compilation_config={"cudagraph_mode":"NONE"}')
     overrides+=(--set 'vllm.engine_kwargs.additional_config={"enable_cpu_binding":true,"enable_dsa_cp":true,"enable_flashcomm1":true,"multistream_overlap_shared_expert":true,"ascend_compilation_config":{"enable_npugraph_ex":false,"enable_static_kernel":false}}')

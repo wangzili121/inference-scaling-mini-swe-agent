@@ -1526,6 +1526,12 @@ class AsyncVLLMBackend(VLLMBackend):
         self._step_priority_lock = threading.Lock()
         self._step_priorities: dict[str, int] = {}
         self._next_step_priority = itertools.count()
+        self._cis_admission_controller: Any | None = None
+
+    def bind_cis_admission_controller(self, controller: Any) -> None:
+        """Let an optional CIS policy gate priority without owning vLLM."""
+
+        self._cis_admission_controller = controller
 
     def set_request_trace_observer(
         self,
@@ -1617,6 +1623,16 @@ class AsyncVLLMBackend(VLLMBackend):
         )
         if metadata is None and match is None:
             return 0
+        controller = self._cis_admission_controller
+        priority_enabled = getattr(controller, "priority_enabled", None)
+        if callable(priority_enabled):
+            claim_id = (
+                metadata.step_key
+                if metadata is not None
+                else f"{match.group('job')}:step:{match.group('step')}"
+            )
+            if not priority_enabled(claim_id):
+                return 0
         if self._request_priority_policy == "job_fifo":
             priority_key = (
                 metadata.job_id if metadata is not None else match.group("job")

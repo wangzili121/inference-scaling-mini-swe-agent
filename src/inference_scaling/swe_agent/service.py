@@ -381,7 +381,31 @@ class ConditionalISRunner:
                 batch_size=self.conditional.rollout_frontier_batch_size,
             )
         )
-        if self.conditional.active_step_admission == "runtime_kv_budget":
+        self.scheduler_plugin: Any | None = None
+        if self.conditional.active_step_admission == "pressure_plugin":
+            if self.conditional.active_step_borrow_limit is not None:
+                raise ValueError(
+                    "pressure-plugin and occupancy-borrow admission are mutually exclusive"
+                )
+            try:
+                from cis_scheduler import CISSchedulerPlugin
+            except ImportError as error:
+                raise ModuleNotFoundError(
+                    "pressure_plugin requires plugins/cis-scheduler/src on PYTHONPATH"
+                ) from error
+            max_active_steps = self.conditional.active_step_max_limit
+            assert max_active_steps is not None
+            self.scheduler_plugin = CISSchedulerPlugin(
+                backend,
+                candidate_count=self.conditional.candidate_count,
+                rollout_count=self.conditional.rollout_count,
+                max_num_seqs=int(config.get("vllm", {}).get("max_num_seqs", 256)),
+                max_active_steps=max_active_steps,
+                capacity_fraction=self.conditional.active_step_kv_capacity_fraction,
+                priority_mode="job_fifo",
+            )
+            self.step_admission_controller = self.scheduler_plugin.admission
+        elif self.conditional.active_step_admission == "runtime_kv_budget":
             if self.conditional.active_step_borrow_limit is not None:
                 raise ValueError(
                     "runtime-KV and occupancy-borrow admission are mutually exclusive"
@@ -605,6 +629,9 @@ class ConditionalISRunner:
         stage_seconds: dict[str, float] = defaultdict(float)
         for event in execution.stage_events:
             stage_seconds[str(event["name"])] += float(event["duration_us"]) / 1e6
+        scheduler_snapshot = None
+        if self.scheduler_plugin is not None:
+            scheduler_snapshot = asdict(self.scheduler_plugin.admission.snapshot())
         diagnostics = {
             "request_id": request_id,
             "seed": seed,
@@ -620,6 +647,7 @@ class ConditionalISRunner:
             "reward": self.reward.describe(),
             "reward_execution": execution.reward_diagnostics,
             "reward_execution_scope": "process_window_not_concurrency_safe",
+            "scheduler_plugin": scheduler_snapshot,
             "instance_id": self.instance_id,
             "stage_seconds": dict(stage_seconds),
             "backend_delta": execution.backend_delta,

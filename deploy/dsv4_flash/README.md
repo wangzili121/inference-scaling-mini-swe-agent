@@ -46,7 +46,49 @@ hypothesis to verify with APC-on/off counters, not an assumed result.
 
 The repo, complete 0731 model snapshot, image and drivers must already be on the
 host. The launcher never pulls an image or weight and never auto-selects cards;
-the operator must confirm that the chosen devices are idle.
+the one-click launcher verifies that every selected card is healthy, has no
+reported process and remains below the configured idle-HBM threshold before it
+sets the launch confirmation internally.
+
+For the first baseline capacity run, review `.env` once and execute:
+
+```bash
+cd /path/to/inference-scaling-mini-swe-agent/deploy/dsv4_flash
+bash one_click.sh baseline
+```
+
+That one command replaces only the named prior test container, checks and locks
+the selected cards, runs the image/model/runtime preflight, starts the service,
+executes a complete CIS smoke, generates 16 distinct mixed 4K/8K/16K coding
+prompts, runs top-level CIS concurrency `2/4/8/16`, and preserves the effective
+environment, raw benchmark files, service diagnostics, container inspect data
+and full logs below `ARTIFACT_DIR/runs/<timestamp>-baseline/`. The service stays
+running after the benchmark. The capacity curve is rendered directly as
+`capacity-summary.{json,csv,md}`. Pass a custom vLLM JSONL workload as the
+second argument when available.
+
+The optional pressure-aware tree comparison imports the exact source snapshot
+from [Muyuan PR 12](https://gitcode.com/openeuler/muyuan/pull/12), commit
+`1a94a4e`. It keeps vLLM as the physical scheduler, uses CIS tree metadata for
+token-budget admission and job priority only after pressure activates, and is
+not enabled in the baseline:
+
+```bash
+bash one_click.sh pressure_tree
+```
+
+Run the two variants with the same workload before attributing a gain. PR 12
+reports Qwen/Ascend results, but explicitly leaves DeepSeek-V4-Flash eight-card
+performance unverified; this package is the first DSV4 A/B rather than a claim
+that the plugin must improve it.
+
+To run that complete same-workload comparison unattended:
+
+```bash
+bash one_click_ab.sh
+```
+
+The individual commands remain available for debugging:
 
 ```bash
 cd /path/to/inference-scaling-mini-swe-agent/deploy/dsv4_flash

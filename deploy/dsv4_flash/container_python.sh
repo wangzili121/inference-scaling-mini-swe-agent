@@ -15,5 +15,5 @@ if [[ "${CIS_ENABLE_JEMALLOC:-true}" == true ]]; then
     printf 'Warning: jemalloc requested but missing at %s; continuing.\n' "$JEMALLOC" >&2
   fi
 fi
-export PYTHONPATH="/workspace/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="/workspace/plugins/cis-scheduler/src:/workspace/src${PYTHONPATH:+:$PYTHONPATH}"
 exec python "$@"

@@ -192,6 +192,31 @@ def test_runner_derives_dynamic_step_budget_from_runtime_kv_capacity(
     assert runner.step_admission_controller.fixed_token_budget
 
 
+def test_runner_loads_muyuan_pressure_scheduler_plugin(tmp_path: Path) -> None:
+    backend = _AgentBackend()
+    backend.kv_cache_geometry = {
+        "num_gpu_blocks": 10,
+        "block_size": 100,
+        "token_capacity": 1000,
+    }
+    bound = []
+    backend.bind_cis_admission_controller = bound.append
+    config = _runner_config(tmp_path / "trace.jsonl")
+    config["vllm"]["max_num_seqs"] = 32
+    config["conditional_is"].update(
+        active_step_admission="pressure_plugin",
+        active_step_max_limit=32,
+        active_step_kv_capacity_fraction=0.8,
+    )
+
+    runner = ConditionalISRunner(backend, config)
+
+    assert runner.scheduler_plugin is not None
+    assert runner.step_admission_controller is runner.scheduler_plugin.admission
+    assert runner.step_admission_controller.token_budget == 800
+    assert bound == [runner.step_admission_controller]
+
+
 def test_runner_coalesces_retry_equivalent_request_ids(tmp_path: Path) -> None:
     trace = tmp_path / "calls.jsonl"
     backend = _AgentBackend()

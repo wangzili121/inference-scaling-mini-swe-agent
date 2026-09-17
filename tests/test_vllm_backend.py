@@ -1296,3 +1296,44 @@ def test_async_vllm_job_fifo_keeps_later_steps_with_their_job() -> None:
         assert backend._step_priorities == {"job-a": 0, "job-b": 1}
     finally:
         backend.close()
+
+
+def test_async_vllm_pressure_plugin_bypasses_priority_below_pressure() -> None:
+    backend = AsyncVLLMBackend(
+        _AsyncEngine(),
+        _Tokenizer(),
+        model_id="fake",
+        parameter_count=100,
+        sampling_params_factory=_SamplingParams,
+        request_priority_policy="job_fifo",
+    )
+
+    class Gate:
+        @staticmethod
+        def priority_enabled(claim_id: str) -> bool:
+            return claim_id.startswith("pressured-job:")
+
+    backend.bind_cis_admission_controller(Gate())
+    try:
+        def request(job: str) -> GenerationRequest:
+            return GenerationRequest(
+                (1,),
+                1,
+                SamplingConfig(),
+                1,
+                f"{job}:step:0:candidate:0",
+                cis=CISRequestMetadata(
+                    job_id=job,
+                    step_index=0,
+                    node_type="candidate",
+                    candidate_index=0,
+                    candidate_count=1,
+                ),
+            )
+
+        assert backend._request_priority(request("low-pressure-job")) == 0
+        assert backend._step_priorities == {}
+        assert backend._request_priority(request("pressured-job")) == 0
+        assert backend._step_priorities == {"pressured-job": 0}
+    finally:
+        backend.close()

@@ -6,7 +6,8 @@ WORKLOAD="${1:?pass a custom JSONL workload under ARTIFACT_DIR}"
 
 # Capacity first. Use its measured jobs/s to choose finite rates for steady and
 # bursty runs; those two are intentionally not guessed here.
-for concurrency in 2 4 8 16; do
+read -r -a concurrencies <<< "${BENCH_CONCURRENCIES:-2 4 8 16}"
+for concurrency in "${concurrencies[@]}"; do
   bash "$HERE/vllm_bench.sh" capacity "$WORKLOAD" "$concurrency"
 done
 

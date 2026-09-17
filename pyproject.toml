@@ -81,7 +81,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
-pythonpath = ["src", "."]
+pythonpath = ["src", ".", "plugins/cis-scheduler/src"]
 testpaths = ["tests"]
 
 [tool.ruff]

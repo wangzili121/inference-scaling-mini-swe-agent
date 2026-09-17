@@ -50,8 +50,14 @@ if [[ "$WORKLOAD" != "$ARTIFACT_DIR/"* ]]; then
 fi
 INSIDE_WORKLOAD="/artifacts/${WORKLOAD#"$ARTIFACT_DIR/"}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-RESULT_DIR="/artifacts/vllm-bench/results/$STAMP-$MODE-c$MAX_CONCURRENCY-r$REQUEST_RATE"
-mkdir -p "$ARTIFACT_DIR/vllm-bench/results"
+RESULT_SUBDIR="${BENCH_RESULT_SUBDIR:-vllm-bench/results}"
+RESULT_SUBDIR="${RESULT_SUBDIR#/}"
+if [[ "$RESULT_SUBDIR" == *..* ]]; then
+  printf 'BENCH_RESULT_SUBDIR cannot contain ..\n' >&2
+  exit 2
+fi
+RESULT_DIR="/artifacts/$RESULT_SUBDIR/$STAMP-$MODE-c$MAX_CONCURRENCY-r$REQUEST_RATE"
+mkdir -p "$ARTIFACT_DIR/$RESULT_SUBDIR"
 
 docker exec "$CONTAINER_NAME" bash -lc \
   'source /usr/local/Ascend/ascend-toolkit/set_env.sh && vllm bench serve --help >/dev/null'
@@ -86,5 +92,5 @@ docker exec "$CONTAINER_NAME" bash -lc "
 "
 
 curl -fsS "http://127.0.0.1:$PORT/v1/diagnostics" \
-  > "$ARTIFACT_DIR/vllm-bench/results/$STAMP-$MODE-c$MAX_CONCURRENCY-r$REQUEST_RATE-diagnostics.json"
+  > "$ARTIFACT_DIR/$RESULT_SUBDIR/$STAMP-$MODE-c$MAX_CONCURRENCY-r$REQUEST_RATE-diagnostics.json"
 printf 'vLLM result directory: %s/%s\n' "$ARTIFACT_DIR" "${RESULT_DIR#/artifacts/}"
