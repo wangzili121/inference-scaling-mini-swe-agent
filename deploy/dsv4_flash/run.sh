@@ -98,7 +98,7 @@ check() {
     -m inference_scaling.swe_agent.ascend_device_probe \
     | tee "$ARTIFACT_DIR/npu-device-probe.json"
   docker run --rm "${common[@]}" --entrypoint bash "$IMAGE" \
-    -lc 'exec /workspace/deploy/dsv4_flash/container_python.sh \
+    -lc 'exec bash /workspace/deploy/dsv4_flash/container_python.sh \
       -m torch.distributed.run --standalone --nproc-per-node="$1" \
       -m inference_scaling.swe_agent.ascend_device_probe --distributed' \
     bash "$((TP * DP))" | tee "$ARTIFACT_DIR/hccl-probe.log"
