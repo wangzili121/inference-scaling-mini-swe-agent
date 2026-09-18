@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import urllib.error
 import urllib.request
 
 
@@ -25,8 +26,12 @@ def main() -> None:
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=args.timeout) as response:
-        result = json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=args.timeout) as response:
+            result = json.load(response)
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"HTTP {error.code} from CIS service: {body}") from error
     print(json.dumps(result, indent=2, ensure_ascii=False))
     actions = result.get("diagnostics", {}).get("actions", [])
     if not actions and not result.get("message", {}).get("tool_calls"):

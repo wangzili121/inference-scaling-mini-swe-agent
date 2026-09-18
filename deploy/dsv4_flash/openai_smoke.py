@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import urllib.error
 import urllib.request
 
 
@@ -35,8 +36,12 @@ def main() -> None:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=args.timeout) as response:
-        result = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=args.timeout) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"HTTP {error.code} from CIS service: {body}") from error
     if result.get("object") != "chat.completion" or not result.get("choices"):
         raise SystemExit("invalid OpenAI-compatible response")
     diagnostics = result.get("conditional_is", {})
