@@ -96,13 +96,13 @@ python3 "$HERE/make_coding_workload.py" \
   --output "$MATRIX_DIR/workloads/tune.jsonl" \
   --count "$TUNE_PROMPTS" \
   --output-tokens 512 \
-  --input-buckets 4096,8192,16384 \
+  --input-buckets 8192,16384,32768 \
   --profile-name tune-mixed
 python3 "$HERE/make_coding_workload.py" \
   --output "$MATRIX_DIR/workloads/coding-medium.jsonl" \
   --count "$FINAL_MEDIUM_PROMPTS" \
   --output-tokens 512 \
-  --input-buckets 4096,4096,8192,8192,16384 \
+  --input-buckets 8192,8192,16384,16384,32768 \
   --profile-name coding-medium
 if ((FINAL_LONG_PROMPTS > 0)); then
   python3 "$HERE/make_coding_workload.py" \

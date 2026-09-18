@@ -259,7 +259,7 @@ load matrix and renders a standalone Chinese HTML report.
 # Fast plumbing check: two deployment candidates, medium-context capacity only.
 bash autotune_matrix.sh quick
 
-# Recommended: MNS/MBT selection, 4K-32K contexts, 512/1024 outputs,
+# Recommended: MNS/MBT selection, 8K-32K contexts, 512/1024 outputs,
 # saturation, steady 70%-of-capacity traffic and bursty traffic.
 bash autotune_matrix.sh standard
 
