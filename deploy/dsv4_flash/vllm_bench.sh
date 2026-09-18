@@ -57,7 +57,9 @@ if [[ "$RESULT_SUBDIR" == *..* ]]; then
   exit 2
 fi
 RESULT_DIR="/artifacts/$RESULT_SUBDIR/$STAMP-$MODE-c$MAX_CONCURRENCY-r$REQUEST_RATE"
-mkdir -p "$ARTIFACT_DIR/$RESULT_SUBDIR"
+HOST_RESULT_DIR="$ARTIFACT_DIR/$RESULT_SUBDIR/$STAMP-$MODE-c$MAX_CONCURRENCY-r$REQUEST_RATE"
+mkdir -p "$HOST_RESULT_DIR"
+BENCH_LOG="$HOST_RESULT_DIR/vllm-bench.stdout.log"
 
 docker exec "$CONTAINER_NAME" bash -lc \
   'source /usr/local/Ascend/ascend-toolkit/set_env.sh && vllm bench serve --help >/dev/null'
@@ -82,6 +84,7 @@ docker exec "$CONTAINER_NAME" bash -lc "
     --max-concurrency '$MAX_CONCURRENCY' \
     --temperature 1.0 \
     --top-p 1.0 \
+    --extra-body '{\"temperature\":1.0,\"top_p\":1.0,\"n\":1}' \
     --no-stream \
     --percentile-metrics e2el \
     --metric-percentiles 50,90,95,99 \
@@ -89,7 +92,17 @@ docker exec "$CONTAINER_NAME" bash -lc "
     --save-detailed \
     --result-dir '$RESULT_DIR' \
     --seed 20260908
-"
+" | tee "$BENCH_LOG"
+
+if grep -Eq '^Successful requests:[[:space:]]+0[[:space:]]*$' "$BENCH_LOG"; then
+  printf 'Benchmark produced zero successful requests; refusing to report it as a performance run.\n' >&2
+  printf 'Inspect the CIS rejection reason with: docker logs --tail 100 %s\n' "$CONTAINER_NAME" >&2
+  exit 1
+fi
+if grep -Eq '^Failed requests:[[:space:]]+[1-9][0-9]*[[:space:]]*$' "$BENCH_LOG"; then
+  printf 'Benchmark contains failed requests; results are invalid. See %s\n' "$BENCH_LOG" >&2
+  exit 1
+fi
 
 curl -fsS "http://127.0.0.1:$PORT/v1/diagnostics" \
   > "$ARTIFACT_DIR/$RESULT_SUBDIR/$STAMP-$MODE-c$MAX_CONCURRENCY-r$REQUEST_RATE-diagnostics.json"

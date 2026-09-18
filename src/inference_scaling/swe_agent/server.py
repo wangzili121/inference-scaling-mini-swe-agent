@@ -8,6 +8,7 @@ import importlib
 import json
 import os
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -153,12 +154,16 @@ def _handler(runner: ConditionalISRunner) -> type[BaseHTTPRequestHandler]:
                         sort_keys=True,
                         separators=(",", ":"),
                     )
-                    default_seed = int.from_bytes(
-                        hashlib.sha256(seed_material.encode("utf-8")).digest()[:8],
-                        "big",
-                    ) ^ configured_seed
+                    default_seed = (
+                        int.from_bytes(
+                            hashlib.sha256(seed_material.encode("utf-8")).digest()[:8],
+                            "big",
+                        )
+                        ^ configured_seed
+                    ) & ((1 << 63) - 1)
                     seed = int(payload.get("seed", default_seed))
-                    if int(payload.get("n", 1)) != 1:
+                    requested_n = payload.get("n")
+                    if requested_n is not None and int(requested_n) != 1:
                         raise ValueError("Conditional IS supports only n=1")
                     for name, configured in (
                         ("temperature", runner.sampling.temperature),
@@ -189,6 +194,21 @@ def _handler(runner: ConditionalISRunner) -> type[BaseHTTPRequestHandler]:
                     conditional_overrides=conditional_overrides,
                 )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                request_id = None
+                payload_keys: list[str] = []
+                if isinstance(locals().get("payload"), dict):
+                    request_id = payload.get("request_id") or self.headers.get(
+                        "X-Request-Id"
+                    )
+                    payload_keys = sorted(str(key) for key in payload)
+                print(
+                    "CIS request rejected: "
+                    f"request_id={request_id!r} "
+                    f"error={type(error).__name__}: {error}; "
+                    f"payload_keys={payload_keys}",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
                 return
             except Exception as error:

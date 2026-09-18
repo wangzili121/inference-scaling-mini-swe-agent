@@ -78,3 +78,46 @@ def test_openai_chat_completion_wraps_a_complete_cis_job() -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_openai_benchmark_payload_accepts_nullable_n_and_bounded_seed() -> None:
+    runner = _Runner()
+    server = ConditionalISHTTPServer(("127.0.0.1", 0), _handler(runner))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        payload = {
+            "model": "dsv4-cis",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "fix it"}],
+                }
+            ],
+            "max_completion_tokens": 64,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "n": None,
+            "stream": False,
+            "stream_options": {"include_usage": True},
+        }
+        request = urllib.request.Request(
+            endpoint + "/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "X-Request-Id": "bench-test-0",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            result = json.loads(response.read())
+        assert result["object"] == "chat.completion"
+        assert runner.calls[0][1] == "bench-test-0"
+        assert 0 <= runner.calls[0][2] <= (1 << 63) - 1
+        assert runner.calls[0][3] == {"total_length": 64}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
