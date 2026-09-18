@@ -77,6 +77,22 @@ def test_public_messages_normalizes_openai_argument_json_for_qwen_template() -> 
     assert original["tool_calls"][0]["function"]["arguments"] == '{"command":"pwd"}'
 
 
+def test_public_messages_flattens_openai_text_parts() -> None:
+    normalized = public_messages(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": " second"},
+                ],
+            }
+        ]
+    )
+
+    assert normalized == [{"role": "user", "content": "first second"}]
+
+
 def test_qwen_tool_call_rejects_non_bash_tool() -> None:
     with pytest.raises(ToolCallParseError, match="expected 'bash'"):
         parse_assistant_text(

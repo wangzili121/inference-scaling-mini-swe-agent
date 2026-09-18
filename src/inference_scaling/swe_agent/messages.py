@@ -34,6 +34,8 @@ def public_messages(
     normalized = []
     for message in messages:
         public = {key: value for key, value in message.items() if key in allowed}
+        if "content" in public:
+            public["content"] = _normalize_content(public["content"])
         tool_calls = public.get("tool_calls")
         if isinstance(tool_calls, list):
             public["tool_calls"] = [
@@ -41,6 +43,30 @@ def public_messages(
             ]
         normalized.append(public)
     return normalized
+
+
+def _normalize_content(content: Any) -> Any:
+    """Flatten OpenAI text parts for text-only model chat templates."""
+
+    if not isinstance(content, list):
+        return content
+    text_parts: list[str] = []
+    for part in content:
+        if not isinstance(part, Mapping):
+            raise ValueError("message content parts must be objects")
+        part_type = part.get("type")
+        if part_type == "text":
+            text = part.get("text")
+        elif part_type == "input_text":
+            text = part.get("text", part.get("input_text"))
+        else:
+            raise ValueError(
+                f"the text-only CIS service does not support content part {part_type!r}"
+            )
+        if not isinstance(text, str):
+            raise ValueError("text content parts must contain a string")
+        text_parts.append(text)
+    return "".join(text_parts)
 
 
 def _normalize_tool_call(tool_call: Any) -> Any:
