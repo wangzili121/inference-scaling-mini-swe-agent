@@ -171,6 +171,25 @@ def test_runner_executes_one_complete_cis_job_and_records_trace(tmp_path: Path) 
     assert len(record["conditional_steps"][0]["candidates"]) == 2
 
 
+def test_runner_direct_ar_uses_one_backend_sequence(tmp_path: Path) -> None:
+    trace = tmp_path / "calls.jsonl"
+    backend = _AgentBackend()
+    runner = ConditionalISRunner(backend, _runner_config(trace))
+
+    result = runner.query_direct(
+        [{"role": "user", "content": "fix it"}],
+        request_id="direct-call-1",
+        seed=17,
+        max_new_tokens=2,
+    )
+
+    assert result.diagnostics["mode"] == "direct_ar"
+    assert result.diagnostics["completion_tokens"] == 2
+    record = json.loads(trace.read_text())
+    assert record["mode"] == "direct_ar"
+    assert "conditional_steps" not in record
+
+
 def test_runner_can_disable_eos_for_fixed_work_performance_runs(
     tmp_path: Path,
 ) -> None:

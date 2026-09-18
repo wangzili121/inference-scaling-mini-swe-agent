@@ -127,14 +127,22 @@ def _handler(runner: ConditionalISRunner) -> type[BaseHTTPRequestHandler]:
                     return
                 self._json(HTTPStatus.OK, {"status": status})
                 return
-            if self.path not in {"/v1/query", "/v1/chat/completions"}:
+            if self.path not in {
+                "/v1/query",
+                "/v1/chat/completions",
+                "/v1/direct/chat/completions",
+            }:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 payload = json.loads(self.rfile.read(length).decode("utf-8"))
                 messages = payload["messages"]
-                openai_request = self.path == "/v1/chat/completions"
+                openai_request = self.path in {
+                    "/v1/chat/completions",
+                    "/v1/direct/chat/completions",
+                }
+                direct_request = self.path == "/v1/direct/chat/completions"
                 if openai_request:
                     request_id = str(
                         payload.get("request_id")
@@ -187,12 +195,25 @@ def _handler(runner: ConditionalISRunner) -> type[BaseHTTPRequestHandler]:
                     if maximum is not None:
                         conditional_overrides = dict(conditional_overrides or {})
                         conditional_overrides["total_length"] = int(maximum)
-                result = runner.query(
-                    messages,
-                    request_id=request_id,
-                    seed=seed,
-                    conditional_overrides=conditional_overrides,
-                )
+                if direct_request:
+                    direct_maximum = int(
+                        maximum
+                        if maximum is not None
+                        else getattr(runner, "maximum", 512)
+                    )
+                    result = runner.query_direct(
+                        messages,
+                        request_id=request_id,
+                        seed=seed,
+                        max_new_tokens=direct_maximum,
+                    )
+                else:
+                    result = runner.query(
+                        messages,
+                        request_id=request_id,
+                        seed=seed,
+                        conditional_overrides=conditional_overrides,
+                    )
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
                 request_id = None
                 payload_keys: list[str] = []

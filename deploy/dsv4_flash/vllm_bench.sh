@@ -13,6 +13,18 @@ REQUEST_RATE="${4:-inf}"
 OUTPUT_LEN="${BENCH_OUTPUT_LEN:-512}"
 NUM_PROMPTS="${BENCH_NUM_PROMPTS:-64}"
 BURSTINESS="${BENCH_BURSTINESS:-1.0}"
+API_MODE="${BENCH_API_MODE:-cis}"
+RUN_LABEL="${BENCH_RUN_LABEL:-$API_MODE}"
+
+case "$API_MODE" in
+  cis) ENDPOINT=/v1/chat/completions ;;
+  direct) ENDPOINT=/v1/direct/chat/completions ;;
+  *) printf 'BENCH_API_MODE must be cis or direct\n' >&2; exit 2 ;;
+esac
+if [[ ! "$RUN_LABEL" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  printf 'BENCH_RUN_LABEL may contain only letters, digits, dot, underscore and dash\n' >&2
+  exit 2
+fi
 
 case "$MODE" in
   capacity)
@@ -56,10 +68,13 @@ if [[ "$RESULT_SUBDIR" == *..* ]]; then
   printf 'BENCH_RESULT_SUBDIR cannot contain ..\n' >&2
   exit 2
 fi
-RESULT_DIR="/artifacts/$RESULT_SUBDIR/$STAMP-$MODE-c$MAX_CONCURRENCY-r$REQUEST_RATE"
-HOST_RESULT_DIR="$ARTIFACT_DIR/$RESULT_SUBDIR/$STAMP-$MODE-c$MAX_CONCURRENCY-r$REQUEST_RATE"
+RESULT_NAME="$STAMP-$RUN_LABEL-$MODE-c$MAX_CONCURRENCY-r$REQUEST_RATE"
+RESULT_DIR="/artifacts/$RESULT_SUBDIR/$RESULT_NAME"
+HOST_RESULT_DIR="$ARTIFACT_DIR/$RESULT_SUBDIR/$RESULT_NAME"
 mkdir -p "$HOST_RESULT_DIR"
 BENCH_LOG="$HOST_RESULT_DIR/vllm-bench.stdout.log"
+curl -fsS "http://127.0.0.1:$PORT/v1/diagnostics" \
+  > "$HOST_RESULT_DIR/service-diagnostics.before.json"
 
 docker exec "$CONTAINER_NAME" bash -lc \
   'source /usr/local/Ascend/ascend-toolkit/set_env.sh && vllm bench serve --help >/dev/null'
@@ -70,13 +85,14 @@ docker exec "$CONTAINER_NAME" bash -lc "
     --backend openai-chat \
     --host 127.0.0.1 \
     --port '$PORT' \
-    --endpoint /v1/chat/completions \
+    --endpoint '$ENDPOINT' \
     --model dsv4-cis \
     --tokenizer /models/dsv4 \
     --tokenizer-mode deepseek_v4 \
     --trust-remote-code \
     --dataset-name custom \
     --dataset-path '$INSIDE_WORKLOAD' \
+    --disable-shuffle \
     --custom-output-len '$OUTPUT_LEN' \
     --num-prompts '$NUM_PROMPTS' \
     --request-rate '$REQUEST_RATE' \
@@ -105,5 +121,8 @@ if grep -Eq '^Failed requests:[[:space:]]+[1-9][0-9]*[[:space:]]*$' "$BENCH_LOG"
 fi
 
 curl -fsS "http://127.0.0.1:$PORT/v1/diagnostics" \
-  > "$ARTIFACT_DIR/$RESULT_SUBDIR/$STAMP-$MODE-c$MAX_CONCURRENCY-r$REQUEST_RATE-diagnostics.json"
+  > "$HOST_RESULT_DIR/service-diagnostics.after.json"
+cat > "$HOST_RESULT_DIR/run-metadata.json" <<EOF
+{"api_mode":"$API_MODE","label":"$RUN_LABEL","workload_profile":"${BENCH_WORKLOAD_PROFILE:-unknown}","arrival":"$MODE","scheduler_variant":"${SCHEDULER_VARIANT:-unknown}","max_concurrency":$MAX_CONCURRENCY,"request_rate":"$REQUEST_RATE","output_tokens":$OUTPUT_LEN,"num_prompts":$NUM_PROMPTS,"max_num_seqs":${MAX_NUM_SEQS:-null},"max_num_batched_tokens":${MAX_NUM_BATCHED_TOKENS:-null},"max_model_len":${MAX_MODEL_LEN:-null},"gpu_memory_utilization":${GPU_MEMORY_UTILIZATION:-null}}
+EOF
 printf 'vLLM result directory: %s/%s\n' "$ARTIFACT_DIR" "${RESULT_DIR#/artifacts/}"

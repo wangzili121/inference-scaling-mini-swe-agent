@@ -247,3 +247,68 @@ MiniAgent calls because those must preserve the complete message/tool history.
 The production-oriented matrix should include 4-16K interactive prompts,
 16-64K agent turns and 64-128K repository-level calls when the validated context
 cap permits them, with both repeated-prefix and cold-prefix traffic.
+
+## Automatic deployment and workload matrix
+
+`autotune_matrix.sh` compares ordinary AR, flat Conditional IS and the CIS
+pressure/tree scheduler on the same persistent model engine and frozen prompt
+files. It first performs successive deployment selection, then runs the final
+load matrix and renders a standalone Chinese HTML report.
+
+```bash
+# Fast plumbing check: two deployment candidates, medium-context capacity only.
+bash autotune_matrix.sh quick
+
+# Recommended: MNS/MBT selection, 4K-32K contexts, 512/1024 outputs,
+# saturation, steady 70%-of-capacity traffic and bursty traffic.
+bash autotune_matrix.sh standard
+
+# Wider MNS/MBT and concurrency boundaries. This can take many hours.
+bash autotune_matrix.sh full
+```
+
+The default deployment candidates are paired instead of forming an expensive
+Cartesian product:
+
+```text
+quick:    32/8192, 64/16384
+standard: 32/8192, 64/16384, 128/32768
+full:     32/8192, 64/16384, 128/32768, 256/65536
+```
+
+Override them without editing the script. An optional third field sets memory
+utilization:
+
+```bash
+AUTOTUNE_ENGINE_PROFILES="32:8192:0.90 64:16384:0.94 128:32768:0.94" \
+  bash autotune_matrix.sh standard
+```
+
+Use `AUTOTUNE_MAX_MODEL_LEN=131072` after the 64K suite is stable. Real custom
+JSONL workloads can replace the generated prompts:
+
+```bash
+AUTOTUNE_MEDIUM_WORKLOAD=/path/to/frozen-medium.jsonl \
+AUTOTUNE_LONG_WORKLOAD=/path/to/frozen-long.jsonl \
+  bash autotune_matrix.sh standard
+```
+
+The report is written to:
+
+```text
+$ARTIFACT_DIR/autotune/<timestamp>-<suite>/autotune-report.html
+```
+
+That directory also contains JSON/CSV summaries, raw vLLM results, stdout,
+pre/post service diagnostics, workload manifests, effective environments and
+container logs. Synthetic prompts are for capacity selection; repeat the
+winning configuration with frozen real MiniAgent calls before final claims.
+
+The service exposes two benchmark-compatible routes:
+
+```text
+/v1/chat/completions         one complete Conditional IS job
+/v1/direct/chat/completions  one ordinary AR generation on the same engine
+```
+
+Set `BENCH_API_MODE=direct|cis` when invoking `vllm_bench.sh` directly.

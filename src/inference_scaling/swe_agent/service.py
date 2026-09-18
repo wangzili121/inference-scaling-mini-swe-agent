@@ -31,6 +31,7 @@ from inference_scaling.arllm.rewards import (
     ConsilienceReward,
     SequenceLogProbabilityReward,
 )
+from inference_scaling.arllm.types import GenerationRequest
 from inference_scaling.shared.metrics import importance_effective_sample_size
 from inference_scaling.shared.rng import SeedStream
 from inference_scaling.swe_agent.messages import BASH_TOOL, public_messages
@@ -738,6 +739,96 @@ class ConditionalISRunner:
 
     def backend_snapshot(self) -> dict[str, Any]:
         return _snapshot(self.backend)
+
+    def query_direct(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        *,
+        request_id: str,
+        seed: int,
+        max_new_tokens: int,
+    ) -> QueryResult:
+        """Run one ordinary AR request on the same persistent model engine."""
+
+        if max_new_tokens <= 0 or max_new_tokens > self.request_maximum:
+            raise ValueError(
+                f"requested generation length {max_new_tokens} must lie in "
+                f"[1, {self.request_maximum}]"
+            )
+        fingerprint = sha256(
+            json.dumps(
+                {
+                    "mode": "direct_ar",
+                    "messages": list(messages),
+                    "seed": seed,
+                    "max_new_tokens": max_new_tokens,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        def execute_direct() -> QueryResult:
+            started = time.perf_counter()
+            prompt = self._prompt_tokens(messages)
+            configured_max = self.config.get("vllm", {}).get("max_model_len")
+            if configured_max is not None and len(prompt) + max_new_tokens > int(
+                configured_max
+            ):
+                raise ValueError(
+                    f"prompt ({len(prompt)}) plus generation ({max_new_tokens}) "
+                    f"exceeds max_model_len={configured_max}"
+                )
+            before = _snapshot(self.backend)
+            sample = self.backend.sample_batch(
+                (
+                    GenerationRequest(
+                        prefix=prompt,
+                        max_new_tokens=max_new_tokens,
+                        sampling=self.sampling,
+                        seed=seed,
+                        request_id=f"{request_id}:direct",
+                    ),
+                )
+            )[0]
+            after = _snapshot(self.backend)
+            text = self.backend.decode(sample.token_ids, skip_special_tokens=False)
+            diagnostics = {
+                "mode": "direct_ar",
+                "request_id": request_id,
+                "seed": seed,
+                "prompt_tokens": len(prompt),
+                "completion_tokens": len(sample.token_ids),
+                "total_seconds": time.perf_counter() - started,
+                "steps": 0,
+                "stage_seconds": {"direct_generation": time.perf_counter() - started},
+                "backend_delta": _counter_delta(before, after),
+                "backend_delta_scope": "process_window_not_concurrency_safe",
+                "instance_id": self.instance_id,
+                "finish_reason": sample.finish_reason,
+            }
+            message = {
+                "role": "assistant",
+                "content": text or None,
+                "tool_calls": [],
+                "extra": {"raw_completion": text, "direct_ar": diagnostics},
+            }
+            if self.trace_writer is not None:
+                self.trace_writer.append(
+                    {
+                        "schema_version": 2,
+                        "mode": "direct_ar",
+                        "request_id": request_id,
+                        "messages": list(messages),
+                        "prompt_token_ids": prompt,
+                        "message": message,
+                        "diagnostics": diagnostics,
+                    }
+                )
+            return QueryResult(message=message, diagnostics=diagnostics)
+
+        return self.query_cache.execute(request_id, fingerprint, execute_direct)
 
     def start_profile(self, profile_prefix: str | None = None) -> None:
         callback = getattr(self.backend, "start_profile", None)

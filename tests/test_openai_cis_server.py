@@ -41,6 +41,23 @@ class _Runner:
             diagnostics=diagnostics,
         )
 
+    def query_direct(self, messages, *, request_id, seed, max_new_tokens):
+        self.calls.append((messages, request_id, seed, {"direct": max_new_tokens}))
+        return QueryResult(
+            message={
+                "role": "assistant",
+                "content": "direct answer",
+                "tool_calls": [],
+                "extra": {"raw_completion": "direct answer"},
+            },
+            diagnostics={
+                "mode": "direct_ar",
+                "prompt_tokens": 12,
+                "completion_tokens": max_new_tokens,
+                "finish_reason": "length",
+            },
+        )
+
 
 def test_openai_chat_completion_wraps_a_complete_cis_job() -> None:
     runner = _Runner()
@@ -117,6 +134,39 @@ def test_openai_benchmark_payload_accepts_nullable_n_and_bounded_seed() -> None:
         assert runner.calls[0][1] == "bench-test-0"
         assert 0 <= runner.calls[0][2] <= (1 << 63) - 1
         assert runner.calls[0][3] == {"total_length": 64}
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_openai_direct_endpoint_bypasses_conditional_is() -> None:
+    runner = _Runner()
+    server = ConditionalISHTTPServer(("127.0.0.1", 0), _handler(runner))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        payload = {
+            "model": "dsv4-cis",
+            "messages": [{"role": "user", "content": "fix it"}],
+            "max_completion_tokens": 32,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "stream": False,
+            "request_id": "direct-test",
+        }
+        request = urllib.request.Request(
+            endpoint + "/v1/direct/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            result = json.loads(response.read())
+        assert result["choices"][0]["message"]["content"] == "direct answer"
+        assert result["conditional_is"]["mode"] == "direct_ar"
+        assert runner.calls[0][3] == {"direct": 32}
     finally:
         server.shutdown()
         server.server_close()

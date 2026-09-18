@@ -53,10 +53,21 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--count", type=int, default=16)
     parser.add_argument("--output-tokens", type=int, default=512)
+    parser.add_argument(
+        "--input-buckets",
+        default="4096,4096,4096,4096,8192,8192,8192,16384",
+        help="comma-separated target prompt-token buckets",
+    )
+    parser.add_argument("--profile-name", default="coding-mixed")
     args = parser.parse_args()
     if args.count <= 0 or args.output_tokens <= 0:
         raise SystemExit("count and output-tokens must be positive")
-    buckets = (4096, 4096, 4096, 4096, 8192, 8192, 8192, 16384)
+    try:
+        buckets = tuple(int(value) for value in args.input_buckets.split(","))
+    except ValueError as error:
+        raise SystemExit("input buckets must be comma-separated integers") from error
+    if not buckets or any(value <= 0 for value in buckets):
+        raise SystemExit("input buckets must be positive")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256()
     lengths = []
@@ -76,6 +87,7 @@ def main() -> None:
     manifest = {
         "schema_version": 1,
         "kind": "synthetic_coding_capacity",
+        "profile_name": args.profile_name,
         "count": args.count,
         "target_input_tokens": lengths,
         "output_tokens": args.output_tokens,
