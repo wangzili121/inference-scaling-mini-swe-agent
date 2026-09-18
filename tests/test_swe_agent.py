@@ -167,6 +167,23 @@ def test_runner_can_disable_eos_for_fixed_work_performance_runs(
     assert runner.sampling.eos_token_id is None
 
 
+def test_runner_consilience_reuses_generation_policy_statistics(
+    tmp_path: Path,
+) -> None:
+    backend = _AgentBackend()
+    config = _runner_config(tmp_path / "trace.jsonl")
+    config["reward"] = {
+        "kind": "consilience",
+        "scope": "full",
+        "score_temperature": 1.0,
+        "top_k": 2,
+    }
+
+    runner = ConditionalISRunner(backend, config)
+
+    assert runner.reward.sampling == runner.sampling
+
+
 def test_runner_derives_dynamic_step_budget_from_runtime_kv_capacity(
     tmp_path: Path,
 ) -> None:

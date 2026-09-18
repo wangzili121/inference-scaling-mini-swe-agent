@@ -489,7 +489,10 @@ class ConditionalISRunner:
             )
         elif reward_kind == "consilience":
             reward_sampling = SamplingConfig(
-                temperature=float(reward.get("score_temperature", 1.0))
+                temperature=float(reward.get("score_temperature", 1.0)),
+                top_p=self.sampling.top_p,
+                top_k=self.sampling.top_k,
+                eos_token_id=self.sampling.eos_token_id,
             )
             scope = str(reward.get("scope", "thinking"))
             self.reward = ConsilienceReward(
