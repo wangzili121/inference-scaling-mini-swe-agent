@@ -333,6 +333,15 @@ fi
 printf '{"max_num_seqs":%s,"max_num_batched_tokens":%s,"gpu_memory_utilization":%s,"tuning_jobs_per_second":%s}\n' \
   "$BEST_MNS" "$BEST_MBT" "$BEST_MEMORY" "$BEST_RATE" > "$MATRIX_DIR/best-deployment.json"
 
+if [[ "${AUTOTUNE_TUNING_ONLY:-no}" == yes ]]; then
+  stop_own_container
+  render_report
+  printf '{"status":"ok","suite":"%s","phase":"tuning_only","artifacts":"%s"}\n' \
+    "$SUITE" "$MATRIX_DIR" | tee "$MATRIX_DIR/result.json"
+  printf 'Deployment tuning complete. Report: %s/autotune-report.html\n' "$MATRIX_DIR"
+  exit 0
+fi
+
 run_final_mode() {
   local variant="$1" api_mode="$2" label="$3"
   local deployment_name="final-$variant"
