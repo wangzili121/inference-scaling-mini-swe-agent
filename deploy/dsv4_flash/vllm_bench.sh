@@ -123,6 +123,6 @@ fi
 curl -fsS "http://127.0.0.1:$PORT/v1/diagnostics" \
   > "$HOST_RESULT_DIR/service-diagnostics.after.json"
 cat > "$HOST_RESULT_DIR/run-metadata.json" <<EOF
-{"api_mode":"$API_MODE","label":"$RUN_LABEL","workload_profile":"${BENCH_WORKLOAD_PROFILE:-unknown}","arrival":"$MODE","scheduler_variant":"${SCHEDULER_VARIANT:-unknown}","max_concurrency":$MAX_CONCURRENCY,"request_rate":"$REQUEST_RATE","output_tokens":$OUTPUT_LEN,"num_prompts":$NUM_PROMPTS,"max_num_seqs":${MAX_NUM_SEQS:-null},"max_num_batched_tokens":${MAX_NUM_BATCHED_TOKENS:-null},"max_model_len":${MAX_MODEL_LEN:-null},"gpu_memory_utilization":${GPU_MEMORY_UTILIZATION:-null}}
+{"api_mode":"$API_MODE","label":"$RUN_LABEL","workload_profile":"${BENCH_WORKLOAD_PROFILE:-unknown}","arrival":"$MODE","scheduler_variant":"${SCHEDULER_VARIANT:-unknown}","max_concurrency":$MAX_CONCURRENCY,"request_rate":"$REQUEST_RATE","output_tokens":$OUTPUT_LEN,"num_prompts":$NUM_PROMPTS,"max_num_seqs":${MAX_NUM_SEQS:-null},"max_num_batched_tokens":${MAX_NUM_BATCHED_TOKENS:-null},"max_model_len":${MAX_MODEL_LEN:-null},"gpu_memory_utilization":${GPU_MEMORY_UTILIZATION:-null},"cudagraph_capture_sizes":"${CUDAGRAPH_CAPTURE_SIZES:-default}"}
 EOF
 printf 'vLLM result directory: %s/%s\n' "$ARTIFACT_DIR" "${RESULT_DIR#/artifacts/}"

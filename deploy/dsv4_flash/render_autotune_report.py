@@ -85,6 +85,17 @@ def collect(root: Path) -> list[dict[str, Any]]:
             "maximum_in_flight_requests",
         ):
             row[f"backend_{key}"] = delta.get(key)
+        duration = result.get("duration")
+        if isinstance(duration, (int, float)) and duration > 0:
+            generated = delta.get("generated_tokens")
+            forward_slots = delta.get("generation_forward_token_slots")
+            prefill = delta.get("prefill_tokens")
+            if isinstance(generated, (int, float)):
+                row["backend_generated_tokens_per_second"] = generated / duration
+            if isinstance(forward_slots, (int, float)):
+                row["backend_forward_token_slots_per_second"] = forward_slots / duration
+            if isinstance(prefill, (int, float)):
+                row["backend_prefill_tokens_per_second"] = prefill / duration
         rows.append(row)
     for path in sorted(root.rglob("failure.json")):
         value = load_json(path)
@@ -218,6 +229,9 @@ def render(root: Path, rows: list[dict[str, Any]]) -> str:
             f"<td>{row.get('max_num_seqs')}</td><td>{row.get('max_num_batched_tokens')}</td>"
             f"<td>{row.get('max_concurrency')}</td>"
             f"<td>{number(row.get('request_throughput'), 4)}</td>"
+            f"<td>{number(row.get('output_throughput'), 1)}</td>"
+            f"<td>{number(row.get('backend_generated_tokens_per_second'), 1)}</td>"
+            f"<td>{number(row.get('backend_forward_token_slots_per_second'), 1)}</td>"
             f"<td>{number(row.get('mean_e2el_ms'), 0)}</td>"
             f"<td>{number(row.get('p95_e2el_ms'), 0)}</td>"
             f"<td>{number(row.get('backend_generation_forward_token_slots'), 0)}</td>"
@@ -276,9 +290,11 @@ table{{border-collapse:collapse;width:100%;white-space:nowrap}} th,td{{border-bo
 <header><h1>DSV4 Conditional IS 自动调优报告</h1><p>普通 AR、原始 CIS 与树信息调度的同模型同 workload 对照</p></header>
 <main><div class="cards">{cards}</div>{warning}
 {bar_chart(rows, 'request_throughput', '完整请求吞吐 jobs/s')}
+{bar_chart(rows, 'output_throughput', 'API 最终输出吞吐 token/s')}
+{bar_chart(rows, 'backend_generated_tokens_per_second', '引擎实际生成吞吐 token/s（CIS 包含 candidate/rollout）')}
 {bar_chart(rows, 'p95_e2el_ms', '端到端 P95 延迟 ms（越短越好）')}
 <section><h2>模式对照</h2><table><thead><tr><th>workload</th><th>到达</th><th>并发</th><th>CIS mean 相对 AR</th><th>Tree 吞吐相对 CIS</th><th>Tree P95 改善</th></tr></thead><tbody>{''.join(comparison_html) or '<tr><td colspan=6>尚无完整三模式对照</td></tr>'}</tbody></table></section>
-<section><h2>全部实验</h2><table><thead><tr><th>状态</th><th>workload</th><th>模式</th><th>到达</th><th>MNS</th><th>MBT</th><th>并发</th><th>jobs/s</th><th>mean ms</th><th>P95 ms</th><th>forward slots</th><th>preempt</th><th>原始结果</th></tr></thead><tbody>{''.join(table_rows)}</tbody></table></section>
+<section><h2>全部实验</h2><table><thead><tr><th>状态</th><th>workload</th><th>模式</th><th>到达</th><th>MNS</th><th>MBT</th><th>并发</th><th>jobs/s</th><th>最终输出 tok/s</th><th>引擎生成 tok/s</th><th>forward slots/s</th><th>mean ms</th><th>P95 ms</th><th>forward slots</th><th>preempt</th><th>原始结果</th></tr></thead><tbody>{''.join(table_rows)}</tbody></table></section>
 </main></body></html>"""
 
 

@@ -139,6 +139,13 @@ start() {
     --set "generation.max_new_tokens=${MAX_NEW_TOKENS:-512}"
     --set "service.max_completion_tokens=${MAX_COMPLETION_TOKENS:-2048}"
   )
+  if [[ -n "${CUDAGRAPH_CAPTURE_SIZES:-}" ]]; then
+    if [[ ! "$CUDAGRAPH_CAPTURE_SIZES" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+      printf 'CUDAGRAPH_CAPTURE_SIZES must be a comma-separated list of integers.\n' >&2
+      exit 2
+    fi
+    overrides+=(--set "vllm.engine_kwargs.compilation_config={\"cudagraph_mode\":\"FULL_DECODE_ONLY\",\"cudagraph_capture_sizes\":[${CUDAGRAPH_CAPTURE_SIZES}]}")
+  fi
   if [[ "$SCHEDULER_VARIANT" == pressure_tree ]]; then
     overrides+=(--set 'conditional_is.active_step_admission="pressure_plugin"')
     overrides+=(--set "conditional_is.active_step_max_limit=${ACTIVE_STEP_MAX_LIMIT:-${MAX_NUM_SEQS:-32}}")

@@ -104,6 +104,12 @@ bash run.sh status
 python3 smoke.py --endpoint http://127.0.0.1:8123  # optional tool-call smoke
 ```
 
+`CUDAGRAPH_CAPTURE_SIZES` optionally pins the decode graph buckets independently
+of `MAX_NUM_SEQS`. This is useful when a larger scheduler limit would otherwise
+reserve too much graph memory and leave insufficient HBM for KV cache. Requests
+larger than the highest captured bucket fall back to the runtime path and must be
+validated with the benchmark suite.
+
 `check` verifies local image availability, selected device nodes, the container's
 AscendCL Python module (`acl.rt`), complete model shard index, vLLM engine
 arguments, DeepSeek V4 prompt encoding and DSML bash parsing **before model
