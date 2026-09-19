@@ -99,7 +99,8 @@ check() {
     | tee "$ARTIFACT_DIR/npu-device-probe.json"
   docker run --rm "${common[@]}" --entrypoint bash "$IMAGE" \
     -lc 'exec bash /workspace/deploy/dsv4_flash/container_python.sh \
-      -m torch.distributed.run --standalone --nproc-per-node="$1" \
+      -m torch.distributed.run --master-addr=127.0.0.1 --master-port=29501 \
+      --nproc-per-node="$1" \
       -m inference_scaling.swe_agent.ascend_device_probe --distributed' \
     bash "$((TP * DP))" | tee "$ARTIFACT_DIR/hccl-probe.log"
   printf 'Inspect NPU occupancy above before setting CONFIRM_DEVICES_FREE=yes.\n'

@@ -52,6 +52,7 @@ set +a
 : "${CONTAINER_NAME:?set CONTAINER_NAME}"
 
 ENGINE_PROFILES="${AUTOTUNE_ENGINE_PROFILES:-$ENGINE_PROFILES_DEFAULT}"
+MEMORY_PROFILES="${AUTOTUNE_MEMORY_PROFILES:-0.90 0.94 0.98}"
 MAX_MODEL_LEN_SUITE="${AUTOTUNE_MAX_MODEL_LEN:-65536}"
 ROOT_ARTIFACT_DIR="$(mkdir -p "$ARTIFACT_DIR" && cd "$ARTIFACT_DIR" && pwd)"
 MATRIX_ID="$(date -u +%Y%m%dT%H%M%SZ)-$SUITE"
@@ -280,6 +281,39 @@ if [[ -z "$BEST_MNS" ]]; then
   printf 'All deployment candidates failed. See %s\n' "$TUNE_RESULTS" >&2
   exit 1
 fi
+
+# Memory utilization changes KV capacity, but testing it together with MNS/MBT
+# would confound the first-stage comparison. Rescan only the winning shape.
+for memory in $MEMORY_PROFILES; do
+  if [[ "$memory" == "$BEST_MEMORY" ]]; then
+    continue
+  fi
+  name="tune-mns${BEST_MNS}-mbt${BEST_MBT}-mem${memory//./}"
+  if ! deployment="$(launch_deployment "$name" baseline "$BEST_MNS" "$BEST_MBT" "$memory")"; then
+    printf '%s\t%s\t%s\t\tlaunch_failed\t%s\n' \
+      "$BEST_MNS" "$BEST_MBT" "$memory" "$name" >> "$TUNE_RESULTS"
+    continue
+  fi
+  env_file="$deployment/effective.env"
+  label="tune-mns${BEST_MNS}-mbt${BEST_MBT}-mem${memory//./}"
+  if run_bench "$deployment" "$env_file" "$MATRIX_DIR/workloads/tune.jsonl" \
+      tune-mixed cis "$label" capacity 4 inf "$TUNE_PROMPTS" 512; then
+    read -r rate _concurrency < <(latest_throughput "$deployment" "$label")
+    printf '%s\t%s\t%s\t%s\tok\t%s\n' \
+      "$BEST_MNS" "$BEST_MBT" "$memory" "$rate" "$name" >> "$TUNE_RESULTS"
+    if python3 - "$rate" "$BEST_RATE" <<'PY'
+import sys
+raise SystemExit(0 if float(sys.argv[1]) > float(sys.argv[2]) else 1)
+PY
+    then
+      BEST_RATE="$rate"; BEST_MEMORY="$memory"
+    fi
+  else
+    printf '%s\t%s\t%s\t\tbenchmark_failed\t%s\n' \
+      "$BEST_MNS" "$BEST_MBT" "$memory" "$name" >> "$TUNE_RESULTS"
+  fi
+done
+
 printf '{"max_num_seqs":%s,"max_num_batched_tokens":%s,"gpu_memory_utilization":%s,"tuning_jobs_per_second":%s}\n' \
   "$BEST_MNS" "$BEST_MBT" "$BEST_MEMORY" "$BEST_RATE" > "$MATRIX_DIR/best-deployment.json"
 
