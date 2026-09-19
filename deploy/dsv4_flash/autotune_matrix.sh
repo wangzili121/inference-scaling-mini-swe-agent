@@ -55,7 +55,7 @@ ENGINE_PROFILES="${AUTOTUNE_ENGINE_PROFILES:-$ENGINE_PROFILES_DEFAULT}"
 MEMORY_PROFILES="${AUTOTUNE_MEMORY_PROFILES:-0.90 0.94 0.98}"
 MAX_MODEL_LEN_SUITE="${AUTOTUNE_MAX_MODEL_LEN:-65536}"
 ROOT_ARTIFACT_DIR="$(mkdir -p "$ARTIFACT_DIR" && cd "$ARTIFACT_DIR" && pwd)"
-MATRIX_ID="$(date -u +%Y%m%dT%H%M%SZ)-$SUITE"
+MATRIX_ID="${AUTOTUNE_MATRIX_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$SUITE}"
 MATRIX_DIR="$ROOT_ARTIFACT_DIR/autotune/$MATRIX_ID"
 mkdir -p "$MATRIX_DIR/workloads" "$MATRIX_DIR/deployments"
 printf '%s\n' "$MATRIX_ID" > "$MATRIX_DIR/matrix-id.txt"
@@ -209,6 +209,7 @@ run_bench() {
   local prompts="${10}" output_tokens="${11}"
   local workload
   workload="$(copy_workload "$deployment" "$workload_source")"
+  local status=0
   BENCH_API_MODE="$api_mode" \
   BENCH_RUN_LABEL="$label" \
   BENCH_WORKLOAD_PROFILE="$profile" \
@@ -216,8 +217,10 @@ run_bench() {
   BENCH_OUTPUT_LEN="$output_tokens" \
   BENCH_RESULT_SUBDIR=results \
   CIS_ENV_FILE="$env_file" \
-    bash "$HERE/vllm_bench.sh" "$arrival" "$workload" "$concurrency" "$rate"
+    bash "$HERE/vllm_bench.sh" "$arrival" "$workload" "$concurrency" "$rate" \
+    || status=$?
   render_report
+  return "$status"
 }
 
 latest_throughput() {
@@ -245,13 +248,25 @@ PY
 }
 
 TUNE_RESULTS="$MATRIX_DIR/tuning.tsv"
-printf 'mns\tmbt\tmemory\tjobs_per_second\tstatus\tdeployment\n' > "$TUNE_RESULTS"
 BEST_RATE=""
 BEST_MNS=""
 BEST_MBT=""
 BEST_MEMORY=""
 
-for profile in $ENGINE_PROFILES; do
+if [[ "${AUTOTUNE_SKIP_TUNING:-no}" == yes ]]; then
+  : "${AUTOTUNE_BEST_MNS:?set AUTOTUNE_BEST_MNS when skipping tuning}"
+  : "${AUTOTUNE_BEST_MBT:?set AUTOTUNE_BEST_MBT when skipping tuning}"
+  : "${AUTOTUNE_BEST_MEMORY:?set AUTOTUNE_BEST_MEMORY when skipping tuning}"
+  BEST_MNS="$AUTOTUNE_BEST_MNS"
+  BEST_MBT="$AUTOTUNE_BEST_MBT"
+  BEST_MEMORY="$AUTOTUNE_BEST_MEMORY"
+  BEST_RATE="${AUTOTUNE_BEST_RATE:-0}"
+  if [[ ! -f "$TUNE_RESULTS" ]]; then
+    printf 'mns\tmbt\tmemory\tjobs_per_second\tstatus\tdeployment\n' > "$TUNE_RESULTS"
+  fi
+else
+  printf 'mns\tmbt\tmemory\tjobs_per_second\tstatus\tdeployment\n' > "$TUNE_RESULTS"
+  for profile in $ENGINE_PROFILES; do
   IFS=: read -r mns mbt memory <<< "$profile"
   memory="${memory:-0.90}"
   name="tune-mns${mns}-mbt${mbt}-mem${memory//./}"
@@ -275,16 +290,16 @@ PY
   else
     printf '%s\t%s\t%s\t\tbenchmark_failed\t%s\n' "$mns" "$mbt" "$memory" "$name" >> "$TUNE_RESULTS"
   fi
-done
+  done
 
-if [[ -z "$BEST_MNS" ]]; then
-  printf 'All deployment candidates failed. See %s\n' "$TUNE_RESULTS" >&2
-  exit 1
-fi
+  if [[ -z "$BEST_MNS" ]]; then
+    printf 'All deployment candidates failed. See %s\n' "$TUNE_RESULTS" >&2
+    exit 1
+  fi
 
-# Memory utilization changes KV capacity, but testing it together with MNS/MBT
-# would confound the first-stage comparison. Rescan only the winning shape.
-for memory in $MEMORY_PROFILES; do
+  # Memory utilization changes KV capacity, but testing it together with MNS/MBT
+  # would confound the first-stage comparison. Rescan only the winning shape.
+  for memory in $MEMORY_PROFILES; do
   if [[ "$memory" == "$BEST_MEMORY" ]]; then
     continue
   fi
@@ -312,7 +327,8 @@ PY
     printf '%s\t%s\t%s\t\tbenchmark_failed\t%s\n' \
       "$BEST_MNS" "$BEST_MBT" "$memory" "$name" >> "$TUNE_RESULTS"
   fi
-done
+  done
+fi
 
 printf '{"max_num_seqs":%s,"max_num_batched_tokens":%s,"gpu_memory_utilization":%s,"tuning_jobs_per_second":%s}\n' \
   "$BEST_MNS" "$BEST_MBT" "$BEST_MEMORY" "$BEST_RATE" > "$MATRIX_DIR/best-deployment.json"
